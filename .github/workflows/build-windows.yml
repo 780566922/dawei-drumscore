@@ -2,8 +2,9 @@
 # 构建 Windows 版 VST3 插件（GitHub Actions）
 #
 # 触发：推送到 main/master，或在 Actions 页面手动运行（workflow_dispatch）。
-# 产物：Actions 运行页底部的 Artifacts → DaweiDrumScore-Windows-x64
-#       （解压后是 DaweiDrumScore.vst3，安装方式见仓库里的 Windows 安装说明）
+# 产物：Actions 运行页底部的 Artifacts
+#   - DaweiDrumScore-Windows-x64     原始 .vst3 bundle（绿色版）
+#   - DaweiDrumScore-Setup-Windows-x64  Inno Setup 安装器（双击即装）
 #==============================================================================
 name: 构建 Windows 版
 
@@ -62,10 +63,36 @@ jobs:
           Get-ChildItem -Path build -Recurse -Filter *.vst3 |
             ForEach-Object { Write-Host "找到：$($_.FullName)" }
 
-      # 6) 上传
+      # 6) 上传原始 bundle（绿色版：解压后手动放进 VST3 目录即可）
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: DaweiDrumScore-Windows-x64
           path: build/**/*.vst3
+          if-no-files-found: error
+
+      # 7) 打 Windows 安装器（Inno Setup）。镜像通常预装 Inno，找不到才装。
+      - name: 制作安装器（Inno Setup）
+        shell: pwsh
+        run: |
+          $iscc = (Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1).FullName
+          if (-not $iscc) {
+            Write-Host "未预装 Inno Setup，尝试安装…"
+            choco install innosetup -y --no-progress
+            $iscc = (Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" |
+                     Select-Object -First 1).FullName
+          }
+          Write-Host "ISCC = $iscc"
+          & $iscc "installer\windows\setup.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 失败，退出码 $LASTEXITCODE" }
+          Get-ChildItem build\setup-out |
+            ForEach-Object { Write-Host ("生成安装器：{0}  {1:N0} 字节" -f $_.Name, $_.Length) }
+
+      # 8) 上传安装器
+      - name: 上传安装器
+        uses: actions/upload-artifact@v4
+        with:
+          name: DaweiDrumScore-Setup-Windows-x64
+          path: build/setup-out/*.exe
           if-no-files-found: error
