@@ -1,0 +1,105 @@
+#==============================================================================
+# 构建 Linux 版 VST3 插件（GitHub Actions）
+#
+# 触发：推送到 main/master，或在 Actions 页面手动运行（workflow_dispatch）。
+# 产物：Actions 运行页底部的 Artifacts → DaweiDrumScore-Linux-x64.tar.gz
+#       （内含 .vst3 bundle + install.sh）
+#
+# 本地复现（Debian/Ubuntu）：
+#   sudo apt install build-essential cmake pkg-config libx11-dev libxft-dev
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build --target DaweiDrumScore --parallel
+#==============================================================================
+name: 构建 Linux 版
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'dist/**'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) 我们的源码
+      - name: 检出插件源码
+        uses: actions/checkout@v4
+
+      # 2) VST3 SDK（含子模块）
+      - name: 拉取 VST3 SDK
+        uses: actions/checkout@v4
+        with:
+          repository: steinbergmedia/vst3sdk
+          path: vst3sdk
+          submodules: recursive
+
+      # 3) 依赖：X11 + Xft（界面）。（解码用的是仓库内 vendored 的 dr_libs，
+      #    不需要任何音频开发库 —— 插件自带编解码器，用户端零依赖。）
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libx11-dev libxft-dev libfreetype-dev
+
+      # 4) 诊断一下环境，出问题时一眼能看到版本
+      - name: 环境诊断
+        run: |
+          cmake --version | head -1
+          gcc --version | head -1
+          pkg-config --modversion x11 xft
+
+      - name: 配置 CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      # 5) 只构建本插件（跳过 SDK 自带示例）
+      - name: 编译
+        run: cmake --build build --config Release --target DaweiDrumScore --parallel
+
+      # 6) 校验：结构 / 导出符号 / 模块元数据（不能只信"编译成功"）
+      - name: 校验产物
+        run: |
+          set -e
+          BUNDLE=$(find build -name "DaweiDrumScore.vst3" -type d | head -1)
+          if [ -z "$BUNDLE" ]; then echo "✗ 没找到 .vst3 bundle"; exit 1; fi
+          echo "bundle = $BUNDLE"
+          echo "---- 结构 ----"
+          find "$BUNDLE" -print
+
+          SO=$(find "$BUNDLE" -name "*.so" | head -1)
+          echo "---- 文件类型 ----"
+          file "$SO"
+
+          echo "---- 导出符号 ----"
+          nm -D --defined-only "$SO" | grep -E "GetPluginFactory|bundleEntry|bundleExit"
+
+          echo "---- moduleinfo.json ----"
+          cat "$BUNDLE/Contents/Resources/moduleinfo.json"
+
+      # 7) 打包成 tar.gz（含一键安装脚本）
+      - name: 打包
+        run: |
+          set -e
+          BUNDLE=$(find build -name "DaweiDrumScore.vst3" -type d | head -1)
+          STAGE=/tmp/dawei-linux
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R "$BUNDLE" "$STAGE/"
+          cp installer/linux/install.sh "$STAGE/"
+          chmod +x "$STAGE/install.sh"
+          tar -C "$STAGE" -czf build/DaweiDrumScore-Linux-x64.tar.gz .
+          echo "---- 包内容 ----"
+          tar -tzf build/DaweiDrumScore-Linux-x64.tar.gz
+          ls -la build/DaweiDrumScore-Linux-x64.tar.gz
+
+      # 8) 上传
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DaweiDrumScore-Linux-x64
+          path: build/DaweiDrumScore-Linux-x64.tar.gz
+          if-no-files-found: error

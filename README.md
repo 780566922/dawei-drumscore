@@ -1,6 +1,6 @@
 # 大伟鼓谱 · MuseScore 音频播放器
 
-> 给 MuseScore 4 补上「边看谱、边听伴奏」的能力 —— 一款跨平台 VST3 音频播放器插件。
+> 给 MuseScore 4 补上「边看谱、边听伴奏」的能力 —— 一款跨平台 VST3 音频播放器插件（macOS / Windows / Linux）。
 
 MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形式挂进 MuseScore 的混音器，
 把 mp3 / wav / m4a 等音频文件直接拖进插件窗口，就能在**谱面滚动的同时**播放伴奏，
@@ -12,14 +12,15 @@ MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形�
 
 ## 功能特性
 
-- 🎵 **拖拽即播**：把音频文件拖进插件窗口即可加载，支持 mp3 / wav / m4a / aac / flac 等
+- 🎵 **拖拽即播**：把音频文件拖进插件窗口即可加载
+  （macOS / Windows：mp3 / wav / m4a / aac / flac 等；Linux：mp3 / wav / flac）
 - 📈 **波形 + 小节网格**：显示音频波形与按拍号推算的小节线、小节号（可独立开关）
 - 🔴 **播放位置映射**：红线标记音频当前播放位置在谱面上的对应位置
 - ↔️ **免裁剪对齐（偏移）**：音频与谱面起点不一致时，用偏移对齐，无需裁剪音频
 - ⏯️ **跟随宿主播放状态**：插件音频严格跟随 MuseScore 的播放 / 暂停 / 定位
 - 🔍 **缩放 / 全览 / 回到谱面**：长音频也能快速定位
 - ⏱️ **BPM 手动输入**：用于小节线换算（MuseScore 不向插件提供 tempo）
-- 🧱 **跨平台**：macOS 与 Windows 同一份源码
+- 🧱 **跨平台**：macOS / Windows / Linux 同一份源码
 
 ---
 
@@ -52,6 +53,19 @@ MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形�
 >
 > Windows 版本目前**未经充分实机测试**，如遇问题请提 [Issue](../../issues)。
 
+### Linux
+
+1. 到本仓库 [Releases](../../releases) 页面下载 `DaweiDrumScore-*-Linux-x64.tar.gz`
+2. 解压后进入目录，执行：`./install.sh`
+3. 重启 MuseScore
+
+装到的是用户目录 `~/.vst3/`，**不需要 sudo**，也不影响系统里其它用户。
+
+> **格式支持**：Linux 版支持 **MP3 / WAV / FLAC**。m4a / aac 在 Linux 上没有零依赖的解码方案，
+> 为保「下载即用、零运行时依赖」故未支持 —— 请先转成 MP3 或 WAV。
+>
+> Linux 版本目前**未经实机测试**，如遇问题请提 [Issue](../../issues)。
+
 ### 在 MuseScore 里启用
 
 混音器 → 任一轨道的 **Sound** 列 → 选择 **大伟鼓谱MuseScore音频播放器**。
@@ -67,6 +81,7 @@ MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形�
 - **VST3 SDK 3.8.1**（Steinberg 官方）
 - macOS：Xcode Command Line Tools（clang++）
 - Windows：Visual Studio 2019+（MSVC）或 CMake + MSVC
+- Linux：GCC / Clang + X11 / Xft 开发包（`libx11-dev libxft-dev`）
 - 通用：CMake 3.20+
 
 下载 VST3 SDK 并解压到任意目录（默认约定为 `~/WorkBuddy/vst3sdk`）：
@@ -101,10 +116,24 @@ cmake --build build --config Release --parallel
 可选：用 [Inno Setup](https://jrsoftware.org/isinfo.php) 编译 `installer/windows/setup.iss`
 生成双击即装的安装器（CI 中已自动完成）。
 
+### Linux
+
+```bash
+sudo apt install build-essential cmake pkg-config libx11-dev libxft-dev
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVST3_SDK_DIR=/path/to/vst3sdk
+cmake --build build --target DaweiDrumScore --parallel
+```
+
+产物：`build/VST3/Release/DaweiDrumScore.vst3`
+
+> 解码不依赖任何音频开发库 —— 三个单文件解码库（dr_wav / dr_mp3 / dr_flac）
+> 已 vendored 在 `source/linux/third_party/`，随插件一起编译。
+
 ### 通用 CMake
 
-`-DVST3_SDK_DIR=<SDK 路径>` 两个平台通用；Windows 在 CI 上自动构建
-（见 `.github/workflows/build-windows.yml`）。
+`-DVST3_SDK_DIR=<SDK 路径>` 三平台通用；Windows 与 Linux 在 CI 上自动构建
+（见 `.github/workflows/`）。
 
 ---
 
@@ -120,14 +149,21 @@ source/
 ├── gui.mm                # macOS 界面实现（AppKit）
 ├── audiofile.mm          # macOS 音频解码（AVFoundation）
 ├── crashguard.mm/.h      # 崩溃取证
-└── win/                  # Windows 平台实现
-    ├── gui_win.cpp       #   Win32 自绘界面
-    ├── audiofile_win.cpp #   Media Foundation 解码
-    └── crashguard_win.cpp#   SEH + DbgHelp 崩溃取证
+├── win/                  # Windows 平台实现
+│   ├── gui_win.cpp       #   Win32 自绘界面
+│   ├── audiofile_win.cpp #   Media Foundation 解码
+│   └── crashguard_win.cpp#   SEH + DbgHelp 崩溃取证
+└── linux/                # Linux 平台实现
+    ├── gui_linux.cpp     #   X11 + Xft 自绘界面
+    ├── audiofile_linux.cpp  # dr_libs 解码（零系统依赖）
+    ├── crashguard_linux.cpp # signal + backtrace 崩溃取证
+    ├── dr_libs_impl.cpp  #   三个单文件解码库的实现单元
+    └── third_party/      #   dr_wav.h / dr_mp3.h / dr_flac.h
 
 build.sh                  # macOS 构建脚本（含验证）
 make_pkg.sh               # macOS PKG 打包脚本
 installer/windows/        # Windows 安装器（Inno Setup）
+installer/linux/          # Linux 安装脚本
 CMakeLists.txt            # 跨平台 CMake 构建
 validate.cpp              # 插件结构与接口自动验证
 ```
@@ -149,7 +185,13 @@ MuseScore 的 VST3 接口不向插件提供 tempo / 拍号（实测 tempo 事件
 
 **Q：剪切板 / 拖动音频时卡顿？**
 波形计算在 GUI 线程，解码在音频线程，已做锁优化；如仍卡顿请提 Issue 并附日志
-（macOS：`~/Library/Logs/DaweiDrumScore.log`）。
+（macOS：`~/Library/Logs/DaweiDrumScore.log`、Windows：`%USERPROFILE%\DaweiDrumScore.log`、
+Linux：`$HOME/DaweiDrumScore.log`）。
+
+**Q：Linux 版为什么打不开 m4a / aac？**
+Linux 没有像 AVFoundation / Media Foundation 那样的系统级零依赖解码方案。
+为了「下载即用、装完零运行时依赖」，Linux 版把 MP3 / WAV / FLAC 三个解码器直接编进了插件；
+m4a / aac 需要额外引入 FFmpeg 一类依赖，会让用户安装变复杂，故暂不支持 —— 转成 MP3 即可。
 
 ---
 
@@ -168,4 +210,5 @@ VST 是 Steinberg Media Technologies GmbH 的商标。本项目与 Steinberg、M
 ## 致谢
 
 - [Steinberg VST 3 SDK](https://github.com/steinbergmedia/vst3sdk)
+- [dr_libs](https://github.com/mackron/dr_libs)（Linux 版解码库，公共领域 / MIT-0）
 - 献给所有边看谱边练鼓的朋友 🥁

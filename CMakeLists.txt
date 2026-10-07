@@ -2,12 +2,17 @@
 # CMakeLists.txt — 跨平台构建「大伟鼓谱 MuseScore 音频播放器」
 #
 # macOS 本地开发仍可用 ./build.sh（含 6 项验证）；
-# 本文件主要用于 Windows（MSVC）构建，同时也能构建 macOS 版。
+# 本文件用于 Windows（MSVC）与 Linux（GCC + X11）构建，也能构建 macOS 版。
 #
 # 用法（Windows）：
 #   git clone --recurse-submodules https://github.com/steinbergmedia/vst3sdk.git vst3sdk
 #   cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 #   cmake --build build --config Release
+#
+# 用法（Linux）：
+#   sudo apt install libx11-dev libxft-dev
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVST3_SDK_DIR=./vst3sdk
+#   cmake --build build --parallel
 #
 # 产物：build/**/DaweiDrumScore.vst3
 #==============================================================================
@@ -81,8 +86,20 @@ elseif(WIN32)
         source/win/audiofile_win.cpp   # 解码（Media Foundation）
         source/win/crashguard_win.cpp  # 崩溃取证（SEH + DbgHelp）
         source/win/gui_win.cpp)        # 界面（Win32）
+elseif(UNIX)
+    # Linux：界面走 X11 + Xft；解码用 vendored dr_libs（插件自带编解码器，用户零依赖）
+    list(APPEND AP_SOURCES
+        source/linux/audiofile_linux.cpp    # 解码（dr_wav / dr_mp3 / dr_flac）
+        source/linux/crashguard_linux.cpp   # 崩溃取证（signal + backtrace）
+        source/linux/gui_linux.cpp          # 界面（X11 + Xft）
+        source/linux/dr_libs_impl.cpp)      # 三个单文件解码库的实现单元
+
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(X11 REQUIRED x11)
+    pkg_check_modules(XFT REQUIRED xft)
+    find_package(Threads REQUIRED)
 else()
-    message(FATAL_ERROR "当前仅支持 macOS 与 Windows")
+    message(FATAL_ERROR "当前仅支持 macOS / Windows / Linux")
 endif()
 
 #------------------------------------------------------------------------------
@@ -121,4 +138,16 @@ elseif(APPLE)
         "-framework Foundation"
         "-framework AppKit"
         "-framework Cocoa")
+elseif(UNIX)
+    # X11（窗口/绘制）+ Xft（中文与抗锯齿字体）+ 线程
+    target_include_directories(DaweiDrumScore PRIVATE
+        ${X11_INCLUDE_DIRS} ${XFT_INCLUDE_DIRS})
+    target_link_directories(DaweiDrumScore PRIVATE
+        ${X11_LIBRARY_DIRS} ${XFT_LIBRARY_DIRS})
+    target_link_libraries(DaweiDrumScore PRIVATE
+        ${X11_LIBRARIES} ${XFT_LIBRARIES} Threads::Threads)
+
+    # 第三方单文件解码库：屏蔽它自身的编译警告，别淹没我们自己的日志
+    set_source_files_properties(source/linux/dr_libs_impl.cpp
+        PROPERTIES COMPILE_OPTIONS "-w")
 endif()
