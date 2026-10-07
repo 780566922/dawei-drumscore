@@ -32,9 +32,24 @@ jobs:
           path: vst3sdk
           submodules: recursive
 
-      # 3) 配置（VS 2022 / x64）
+      # 3) 诊断 runner 上的 Visual Studio，并配置 CMake。
+      #    刻意【不写死】generator 版本：windows-latest 镜像会随年份升级 VS
+      #    （写死 "Visual Studio 17 2022" 曾在找不到 VS 2022 的镜像上直接配置失败）。
+      - name: 环境诊断
+        shell: pwsh
+        run: |
+          cmake --version
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            Write-Host "== 已安装的 Visual Studio =="
+            & $vswhere -products * -format value -property displayName
+            & $vswhere -products * -format value -property installationVersion
+          } else {
+            Write-Host "未找到 vswhere（可能未安装 Visual Studio）"
+          }
+
       - name: 配置 CMake
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -A x64
 
       # 4) 编译 Release（只构建本插件，跳过 SDK 自带示例，快很多）
       - name: 编译
