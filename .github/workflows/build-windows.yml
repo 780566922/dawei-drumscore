@@ -1,0 +1,56 @@
+==============================================================================
+# 构建 Windows 版 VST3 插件（GitHub Actions）
+#
+# 触发：推送到 main/master，或在 Actions 页面手动运行（workflow_dispatch）。
+# 产物：Actions 运行页底部的 Artifacts → DaweiDrumScore-Windows-x64
+#       （解压后是 DaweiDrumScore.vst3，安装方式见仓库里的 Windows 安装说明）
+#==============================================================================
+name: 构建 Windows 版
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'dist/**'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      # 1) 我们的源码
+      - name: 检出插件源码
+        uses: actions/checkout@v4
+
+      # 2) VST3 SDK（含子模块）。需要固定版本时可加 ref: v3.8.1_build-84
+      - name: 拉取 VST3 SDK
+        uses: actions/checkout@v4
+        with:
+          repository: steinbergmedia/vst3sdk
+          path: vst3sdk
+          submodules: recursive
+
+      # 3) 配置（VS 2022 / x64）
+      - name: 配置 CMake
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      # 4) 编译 Release（只构建本插件，跳过 SDK 自带示例，快很多）
+      - name: 编译
+        run: cmake --build build --config Release --target DaweiDrumScore --parallel
+
+      # 5) 列出产物，方便排查
+      - name: 定位产物
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path build -Recurse -Filter *.vst3 |
+            ForEach-Object { Write-Host "找到：$($_.FullName)" }
+
+      # 6) 上传
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DaweiDrumScore-Windows-x64
+          path: build/**/*.vst3
+          if-no-files-found: error

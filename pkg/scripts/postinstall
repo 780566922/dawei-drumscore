@@ -1,0 +1,29 @@
+#!/bin/bash
+#==============================================================================
+# postinstall — 安装后清理旧版本残留
+#
+# 由 macOS 安装器以 root 身份运行。作用：
+#   1. 移除同一目录下改名前/旧命名的插件（APLAY.vst3 / DaweiDrumScore.vst3），
+#      避免 MuseScore 里出现重复或陈旧条目。
+#   2. 清掉插件包的下载隔离属性（quarantine），保证宿主可正常加载。
+# 只操作 /Library/Audio/Plug-Ins/VST3 下我们自己的插件，不碰用户其它文件。
+#==============================================================================
+set -u
+
+DEST="/Library/Audio/Plug-Ins/VST3"
+CUR="$DEST/大伟鼓谱MuseScore音频播放器.vst3"
+
+# 清掉旧命名残留（改名前叫 APLAY，中间一版叫 DaweiDrumScore）
+for OLD in "APLAY.vst3" "DaweiDrumScore.vst3"; do
+    if [ -d "$DEST/$OLD" ]; then
+        rm -rf "$DEST/$OLD"
+        echo "已移除旧版本：$OLD"
+    fi
+done
+
+# 去除下载隔离属性，避免宿主加载被 Gatekeeper 拦
+if [ -d "$CUR" ]; then
+    xattr -dr com.apple.quarantine "$CUR" 2>/dev/null || true
+fi
+
+exit 0

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+         font-size: 12px; color: #1d1d1f; margin: 0; padding: 4px 2px; line-height: 1.55; }
+  h2 { font-size: 14px; margin: 14px 0 4px 0; }
+  h2:first-child { margin-top: 0; }
+  ol, ul { margin: 4px 0 0 0; padding-left: 18px; }
+  li { margin: 2px 0; }
+  code { font-family: Menlo, monospace; font-size: 11px; background: #f5f5f7;
+         padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+  <h2>装好后怎么用</h2>
+  <ol>
+    <li>完全退出 MuseScore（<b>⌘Q</b>），再重新打开乐谱</li>
+    <li>按 <b>F10</b> 打开混音器</li>
+    <li>找一个不用的乐器轨道（比如 Finger Snap，不用给它写音符）；
+        也可以按 <code>I</code> 新增一个乐器</li>
+    <li>这一轨的 <b>Sound</b> 列 → 下拉 → 选
+        <b>大伟鼓谱MuseScore音频播放器</b></li>
+    <li>点 <b>Sound 那一格</b>，弹出插件界面</li>
+    <li>把音频文件拖进窗口（或点「打开音频…」按钮）</li>
+  </ol>
+
+  <h2>对齐音频和谱面</h2>
+  <ul>
+    <li><b>拖动</b>波形 = 定位播放头</li>
+    <li><b>⌘拖动 / ⌥拖动</b> = 改起始偏移（配合 ⇧ 变 0.1 倍微调）</li>
+    <li>滚轮 = 平移视野；⌥/⌘滚轮、双指捏合 = 缩放；双击 = 回到全览</li>
+    <li><b>速度（BPM）</b> 要填对——网格小节线才会和谱面真实小节对齐
+        （MuseScore 不向插件提供速度，默认按 120 画）</li>
+    <li><b>拍号</b> 按 N/M 填，如 4/4、12/8</li>
+    <li><b>回到谱面</b> 一键把音频播放头跳回谱面当前位置</li>
+  </ul>
+
+  <h2>常见问题</h2>
+  <ul>
+    <li>混音器里看不到插件？→ 必须 <b>⌘Q 完全退出</b> MuseScore 再重开</li>
+    <li>音频和谱子对不上？→ 放大波形，用 ⌥拖动网格让线条落在鼓点上</li>
+    <li>插件操作后宿主崩了？→ 看日志
+        <code>~/Library/Logs/DaweiDrumScore.log</code></li>
+  </ul>
+
+  <h2>卸载</h2>
+  <p>删除下面这个文件夹，然后重启 MuseScore 即可：</p>
+  <p><code>/Library/Audio/Plug-Ins/VST3/大伟鼓谱MuseScore音频播放器.vst3</code></p>
+</body>
+</html>

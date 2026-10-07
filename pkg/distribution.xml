@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>大伟鼓谱 · MuseScore 音频播放器</title>
+    <organization>com.dawei.drumscore</organization>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <options customize="never" require-scripts="false" rootVolumeOnly="false"/>
+
+    <welcome    file="welcome.html"    mime-type="text/html"/>
+    <readme     file="readme.html"     mime-type="text/html"/>
+    <license    file="license.txt"     mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.dawei.drumscore"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.dawei.drumscore" visible="false">
+        <pkg-ref id="com.dawei.drumscore"/>
+    </choice>
+    <pkg-ref id="com.dawei.drumscore" version="1.0.0" onConclusion="none">component.pkg</pkg-ref>
+</installer-gui-script>
