@@ -998,6 +998,35 @@ extern "C"
         return true;
     }
 
+#if SMTG_OS_LINUX
+    //------------------------------------------------------------------
+    // Linux 的 VST3 模块入口。宿主（以及 SDK 的 moduleinfotool / validator）
+    // 会用 dlsym 找这三个符号：
+    //   ModuleEntry / ModuleExit / GetPluginFactory
+    // 缺 ModuleEntry 时 moduleinfotool 直接报
+    //   "The shared library does not export the required 'ModuleEntry' function"
+    // 它是 POST_BUILD 步骤，一失败就 gmake Error 1 并把 .so 删掉 ——
+    // 表面看像"链接失败"，其实链接早就成功了。
+    //
+    // 为什么入口要自己写：SDK 的 smtg_target_add_library_main() 只在
+    // public_sdk_SOURCE_DIR 变量可见时才把 linuxmain.cpp 加进 target，
+    // 而那个变量定义在 SDK 自己的 directory scope，不会传回父作用域，
+    // 所以在我们的 CMakeLists 里它是空的（macOS 的 bundleEntry/bundleExit
+    // 同样是这个原因才自己提供）。
+    //------------------------------------------------------------------
+    SMTG_EXPORT_SYMBOL bool PLUGIN_API ModuleEntry (void* sharedLibraryHandle)
+    {
+        (void) sharedLibraryHandle;
+        ap::installCrashGuard ();   // 与 macOS 的 bundleEntry 对齐
+        return true;
+    }
+
+    SMTG_EXPORT_SYMBOL bool PLUGIN_API ModuleExit ()
+    {
+        return true;
+    }
+#endif // SMTG_OS_LINUX
+
     SMTG_EXPORT_SYMBOL Steinberg::IPluginFactory* PLUGIN_API GetPluginFactory ()
     {
         static APlayFactory* gFactory = nullptr;

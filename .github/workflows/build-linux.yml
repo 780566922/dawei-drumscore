@@ -95,7 +95,15 @@ jobs:
           file "$SO"
 
           echo "---- 导出符号 ----"
-          nm -D --defined-only "$SO" | grep -E "GetPluginFactory|bundleEntry|bundleExit"
+          # Linux 的 VST3 模块入口是 ModuleEntry / ModuleExit（不是 macOS 的 bundle*）。
+          # 缺一个宿主就拒绝加载；moduleinfotool 也会在 POST_BUILD 阶段报错。
+          for SYM in ModuleEntry ModuleExit GetPluginFactory; do
+            if nm -D --defined-only "$SO" | grep -qw "$SYM"; then
+              echo "  ✓ $SYM"
+            else
+              echo "  ✗ 缺少导出符号 $SYM"; exit 1
+            fi
+          done
 
           echo "---- moduleinfo.json ----"
           cat "$BUNDLE/Contents/Resources/moduleinfo.json"

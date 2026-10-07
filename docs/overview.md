@@ -1,6 +1,76 @@
 # 大伟鼓谱 MuseScore 音频播放器（VST3）— 交付概览
 
-## 本轮（2026-10-08）：安装程序（Mac PKG + Win 安装器）+ 跨平台 + 开源上线
+## 本轮（2026-10-08）：三平台齐活 —— 新增 Linux 版
+
+### 四、Linux 版 🚧 构建中
+
+- **同一份源码**，平台实现再开一个目录：`source/linux/*.cpp`（对 `source/*.mm` / `source/win/*.cpp`）
+- 新写三件套（约 2000 行）：
+  | 模块 | 文件 | 方案 |
+  |---|---|---|
+  | 解码 | `audiofile_linux.cpp` | **vendored dr_libs**（dr_wav / dr_mp3 / dr_flac，单文件库） |
+  | 崩溃取证 | `crashguard_linux.cpp` | `sigaction(SA_SIGINFO)` + 架构寄存器现场 + `backtrace` |
+  | 界面 | `gui_linux.cpp` | **X11 + Xft 全自绘**（宿主集成走 `X11EmbedWindowID`） |
+
+- **为什么不用系统库解码**：libsndfile 1.1.0+ 才支持 MP3，而 Ubuntu 22.04 自带 1.0.31；
+  各发行版版本不一，用户还得额外装运行时。改把三个单文件解码库编进插件 →
+  **用户端零依赖**。代价：不支持 m4a/aac（Linux 上无对应免依赖解码器）。
+- **为什么不用 GTK/zenity 选文件**：同理，避免给用户加依赖。改为自绘文件浏览器
+  （`opendir`/`readdir`）+ **XDND 拖放**（`text/uri-list`）。
+- **线程模型**：不依赖宿主 `IRunLoop`（Linux 宿主实现差异大），改
+  `XInitThreads()` + 后台线程独占 X 事件与 30Hz 重绘；主线程只在 resize/destroy
+  时短暂 `XLockDisplay`。
+- 分发：`installer/linux/install.sh` 装到用户级 `~/.vst3`（免 sudo），CI 打成
+  `DaweiDrumScore-Linux-x64.tar.gz`。
+- 遗留：**未实机测试**（本机是 Mac）。
+
+#### 本轮踩的坑（Linux CI 前两轮失败）
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 配置阶段报 `Package 'xcb-util' not found` | CMakeLists 里写的 SDK 开关名 `SMTG_ADD_VSTGUI` **在 SDK 3.8.1 中不存在**，CMake 对未定义变量不报错、只静默失效 → `vstgui4` 仍被 `add_subdirectory`，它强制探测 xcb-util / xcb-cursor / wayland / cairo / pango 一大堆 | 改真实开关名 `SMTG_ENABLE_VSTGUI_SUPPORT=OFF`；工作流另加**守卫断言**，日后 SDK 升级若再引入 vstgui 会明确报错 |
+| 2 | 编译到 100% 报 `'uintptr_t' does not name a type` | `crashguard_linux.cpp` 用 `uintptr_t` 打印寄存器现场却没 `#include <cstdint>`（macOS 上被其它头间接带出，Linux/GCC 不成立） | 补 `<cstdint>` / `<cstddef>` |
+
+> 教训：**改 CMake 开关后必须验证它真的生效**。「设了个不存在的变量」是最阴的一类错——
+> 不报错、不警告，症状出现在几千行之外的第三方依赖探测里。
+
+#### 本机验证 Linux 代码的办法（本轮建立）
+
+macOS 上没有 X11 头文件，但可以直接**从 Ubuntu 镜像拉 dev 包解出头文件树**，
+再用 `clang++ -fsyntax-only -D__linux__` 检查：
+
+```bash
+# 1) 从 dists/noble/main/binary-amd64/Packages.xz 解析出精确 deb 路径
+# 2) 下载并两步解包（.deb = ar 包着 data.tar.xz）
+#    libx11-dev / libxft-dev / libxrender-dev / libfontconfig-dev /
+#    libfreetype-dev / xorgproto(x11proto-dev) / libxau-dev / libxdmcp-dev / ...
+# 3) 检查
+clang++ -std=c++17 -fsyntax-only -D__linux__ \
+  -I source -I "$SDK" \
+  -I /tmp/linuxinc/usr/include -I /tmp/linuxinc/usr/include/freetype2 \
+  source/linux/gui_linux.cpp
+```
+
+这套办法本轮**真的抓到了一个产品代码 bug**（Xft 的 `Visual*` 不能传 `const Visual*`），
+比等 CI 迭代快得多。结果：`gui_linux.cpp` / `audiofile_linux.cpp` 0 错误；
+`crashguard_linux.cpp` 的 x86_64 / aarch64 两个分支按 glibc 布局核对也是 0 错误。
+
+### 五、三平台对照
+
+| | macOS | Windows | Linux |
+|---|---|---|---|
+| 状态 | ✅ 已发布（PKG） | ✅ 已发布（Setup.exe），未实机测试 | 🚧 CI 构建中，未实机测试 |
+| 本地构建 | `./build.sh`（6 项验证全绿） | 不需要 | 可 `cmake`，但本机无 X11 头 |
+| 云端构建 | 不需要 | GitHub Actions（全绿） | GitHub Actions |
+| 解码 | AVFoundation | Media Foundation | vendored dr_libs（**零依赖**） |
+| 界面 | AppKit | Win32 | X11 + Xft |
+| 崩溃取证 | signal + backtrace | SEH + DbgHelp | signal + 寄存器现场 |
+| 安装位置 | 系统域 `/Library/…/VST3` | `C:\Program Files\Common Files\VST3` | 用户级 `~/.vst3`（免 sudo） |
+| 放行 | Gatekeeper（右键打开） | SmartScreen（更多信息→仍要运行） | 无（未签名也不拦） |
+
+---
+
+## 上一轮（2026-10-08）：安装程序（Mac PKG + Win 安装器）+ 跨平台 + 开源上线
 
 ### 一、macOS 安装包 ✅ 已发布
 - `./make_pkg.sh` → `dist/*.pkg`（约 338 KB）→ 已上传 Release 附件
@@ -23,7 +93,7 @@
 - Release `v1.0.0`：`DaweiDrumScore-1.0.0-macOS.pkg` + `DaweiDrumScore-1.0.0-Windows-Setup.exe`
 - README（安装 / 构建 / FAQ / 许可）+ LICENSE（GPL-3.0，因 VST3 SDK 双许可）
 
-### 关键结论
+### 关键结论（当轮快照，此时尚未做 Linux 版）
 | | macOS | Windows |
 |---|---|---|
 | 状态 | ✅ 已发布（PKG） | ✅ 已发布（Setup.exe），未实机测试 |
