@@ -38,8 +38,9 @@ using Steinberg::ViewRect;
 using Steinberg::IPlugFrame;
 using Steinberg::IPlugView;
 
-class PlugView : public Steinberg::FUnknown,
-                 public IPlugView
+// 注意：不要显式再继承 Steinberg::FUnknown —— IPlugView 已经继承它，
+// 重复继承会触发 MSVC C4584（base-class already a base-class）。
+class PlugView : public IPlugView
 {
 public:
     // 需要操作的处理器（在 plugin.cpp 里传入）

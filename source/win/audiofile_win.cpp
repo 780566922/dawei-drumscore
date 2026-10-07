@@ -22,6 +22,12 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 
+// 个别版本的 Windows SDK 未定义这个属性常量（其值固定为 0x10）。
+// 缺失时补上，否则 MSVC 报 C2065 undeclared identifier。
+#ifndef MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING
+#define MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING 0x00000010
+#endif
+
 #include <algorithm>
 #include <cstring>
 #include <string>

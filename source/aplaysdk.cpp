@@ -673,7 +673,7 @@ void APlayProcessor::waveformPeaks (std::vector<float>& out, int buckets,
     m_player.withAudio ([&] (const ap::AudioData& d)
     {
         const size_t n = d.numFrames ();
-        const uint ch = d.numChannels;
+        const uint32 ch = d.numChannels;
         if (n == 0 || ch == 0 || d.sampleRate == 0) return;
 
         // 取样区间：调用方（波形视图）给的是「当前可见的时间段」。

@@ -33,6 +33,11 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 
+// Win32 的鼠标按键掩码里【没有 Alt 位】——只有 MK_CONTROL / MK_SHIFT /
+// MK_LBUTTON 等，并不存在 MK_ALT（MSVC 会报 C2065 undeclared identifier）。
+// 这里自定义一个不与系统冲突的位，由 modsNow() 用 GetKeyState(VK_MENU) 填充。
+#define AP_MK_ALT 0x8000
+
 namespace {
 
 const int kPanelW = 340;      ///< 面板宽（与 macOS 版一致）
@@ -121,7 +126,7 @@ int modsNow ()
 {
     int m = 0;
     if (::GetKeyState (VK_CONTROL) < 0) m |= MK_CONTROL;
-    if (::GetKeyState (VK_MENU)    < 0) m |= MK_ALT;
+    if (::GetKeyState (VK_MENU)    < 0) m |= AP_MK_ALT;
     if (::GetKeyState (VK_SHIFT)   < 0) m |= MK_SHIFT;
     return m;
 }
@@ -605,7 +610,7 @@ void WinView::onMouseDown (int x, int y, int mods)
     ::SetCapture (m_wave);
     m_dragging = true;
     m_dragStartX = x;
-    m_dragOffset = ((mods & MK_CONTROL) != 0) || ((mods & MK_ALT) != 0);
+    m_dragOffset = ((mods & MK_CONTROL) != 0) || ((mods & AP_MK_ALT) != 0);
     m_dragStartVal = m_dragOffset ? m_backend->offsetSec () : 0.0;
 
     if (!m_dragOffset)
@@ -654,7 +659,7 @@ void WinView::onMouseWheel (int delta, int mods)
     if (!m_backend || !m_backend->hasAudio ())
         return;
 
-    if (mods & (MK_CONTROL | MK_ALT))
+    if (mods & (MK_CONTROL | AP_MK_ALT))
     {
         zoomBy (delta > 0 ? 0.8 : 1.25, m_backend->positionSec ());
     }
