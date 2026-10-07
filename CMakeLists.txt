@@ -10,9 +10,18 @@
 #   cmake --build build --config Release
 #
 # 用法（Linux）：
-#   sudo apt install libx11-dev libxft-dev
+#   sudo apt install libx11-dev libxft-dev      # Ubuntu 20.04 上会自动带上 libfreetype6-dev
 #   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVST3_SDK_DIR=./vst3sdk
 #   cmake --build build --parallel
+#
+# ⚠ 构建底座的 glibc 版本 = 产物要求的 glibc 下限。
+#   官方 CI 在 **Ubuntu 20.04**（glibc 2.31 / GCC 9）里构建，产物可跑在
+#   Ubuntu 20.04+ / Debian 11+ / RHEL 9+。
+#   若在更新的发行版上构建，产物的 GLIBC_* 符号需求会被顶高：
+#   例如 Ubuntu 24.04（glibc 2.39 + GCC 13）会因 -std=gnu++17 隐含 _GNU_SOURCE
+#   → 打开 _ISOC23_SOURCE → glibc 把 sscanf 宏重定向到 __isoc23_sscanf
+#   → 产物硬性要求 GLIBC_2.38，Ubuntu 22.04 / Debian 12 直接加载失败。
+#   CI 里有断言守住这一条（见 .github/workflows/build-linux.yml）。
 #
 # 产物：build/**/DaweiDrumScore.vst3
 #==============================================================================
@@ -158,6 +167,19 @@ elseif(UNIX)
         ${X11_LIBRARY_DIRS} ${XFT_LIBRARY_DIRS})
     target_link_libraries(DaweiDrumScore PRIVATE
         ${X11_LIBRARIES} ${XFT_LIBRARIES} Threads::Threads)
+
+    # GCC 9 / 10 的 libstdc++ 还没把 std::filesystem 的实现并进主库
+    # （GCC 11 才并进去），需要单独链 libstdc++fs。
+    # SDK 的 public.sdk/source/vst/hosting/module_linux.cpp 用了 <filesystem>，
+    # 它经 sdk_hosting 传进来；Ubuntu 20.04 自带的 GCC 9 少了这一步会报
+    # undefined reference to `std::filesystem::...`。
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+        find_library(STDCXXFS_LIB stdc++fs)
+        if(STDCXXFS_LIB)
+            target_link_libraries(DaweiDrumScore PRIVATE ${STDCXXFS_LIB})
+            message(STATUS "GCC ${CMAKE_CXX_COMPILER_VERSION}：补链 libstdc++fs（std::filesystem）")
+        endif()
+    endif()
 
     # 第三方单文件解码库：屏蔽它自身的编译警告，别淹没我们自己的日志
     set_source_files_properties(source/linux/dr_libs_impl.cpp

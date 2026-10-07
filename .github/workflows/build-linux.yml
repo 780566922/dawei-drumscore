@@ -2,13 +2,27 @@
 # 构建 Linux 版 VST3 插件（GitHub Actions）
 #
 # 触发：推送到 main/master，或在 Actions 页面手动运行（workflow_dispatch）。
-# 产物：Actions 运行页底部的 Artifacts → DaweiDrumScore-Linux-x64.tar.gz
-#       （内含 .vst3 bundle + install.sh）
+# 产物：Actions 运行页底部的 Artifacts → DaweiDrumScore-Linux-x64
+#         DaweiDrumScore-<ver>-Linux-x86_64.tar.gz   解压 + install.sh，全发行版通用
+#         DaweiDrumScore-<ver>-Linux-x86_64.deb      Debian / Ubuntu 系安装包
+#         DaweiDrumScore-<ver>-Linux-x86_64.rpm      Fedora / RHEL / openSUSE 系安装包
 #
-# 本地复现（Debian/Ubuntu）：
+# ⚠ 为什么跑在 ubuntu:20.04 容器里，而不是 ubuntu-latest？
+#   **构建底座的 glibc 版本 = 产物的 glibc 下限。** 在 Ubuntu 24.04
+#   （glibc 2.39 + GCC 13）上构建时，GCC 13 配 -std=gnu++17 会隐含
+#   _GNU_SOURCE → 打开 _ISOC23_SOURCE → glibc 头把 sscanf 宏重定向到
+#   __isoc23_sscanf → 产物硬性要求 GLIBC_2.38，于是 Ubuntu 22.04 / Debian 12 /
+#   RHEL 9 的用户加载插件时直接失败（动态链接器版本校验不通过，MuseScore
+#   里连插件都不出现）。20.04 底座 = glibc 2.31，覆盖
+#   Ubuntu 20.04+ / Debian 11+ / RHEL 9+。Python 生态的 manylinux 也是这个思路。
+#   步骤「断言 glibc 兼容性」会守住这条线。
+#
+# 本地复现（Debian/Ubuntu，需 CMake ≥ 3.25；20.04 自带的 3.16 不够）：
 #   sudo apt install build-essential cmake pkg-config libx11-dev libxft-dev
-#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVST3_SDK_DIR=./vst3sdk
 #   cmake --build build --target DaweiDrumScore --parallel
+#   sh installer/linux/make_packages.sh \
+#      build/VST3/Release/DaweiDrumScore.vst3 1.0.0 dist
 #==============================================================================
 name: 构建 Linux 版
 
@@ -20,11 +34,29 @@ on:
       - 'dist/**'
   workflow_dispatch:
 
+env:
+  # 产物允许要求的最高 glibc。与 make_packages.sh 里 .deb 的 Depends 对应。
+  GLIBC_MIN: "2.31"
+  # Ubuntu 20.04 自带的 CMake 是 3.16，而 VST3 SDK 3.8.1 要求 ≥ 3.25
+  CMAKE_VER: "3.31.6"
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    # 钉住底座：这个镜像决定了产物的 glibc 下限（见文件头注释）
+    container: ubuntu:20.04
 
     steps:
+      # 0) ubuntu:20.04 基础镜像里没有 git / curl，checkout 之前先补上
+      - name: 容器基础工具
+        run: |
+          set -e
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils git
+          # 容器里 checkout 出来的工作区属主与 runner 不一致，放行
+          git config --global --add safe.directory '*'
+
       # 1) 我们的源码
       - name: 检出插件源码
         uses: actions/checkout@v4
@@ -37,22 +69,40 @@ jobs:
           path: vst3sdk
           submodules: recursive
 
-      # 3) 依赖：X11 + Xft（界面）。（解码用的是仓库内 vendored 的 dr_libs，
+      # 3) 新版 CMake（官方预编译包，静态链接、只需 glibc 2.17+）
+      - name: 安装 CMake ${{ env.CMAKE_VER }}
+        run: |
+          set -e
+          curl -fsSL -o /tmp/cmake.tar.gz \
+            "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz"
+          mkdir -p /opt/cmake
+          tar -xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
+          echo "/opt/cmake/bin" >> "$GITHUB_PATH"
+          /opt/cmake/bin/cmake --version | head -1
+
+      # 4) 依赖：X11 + Xft（界面）。（解码用的是仓库内 vendored 的 dr_libs，
       #    不需要任何音频开发库 —— 插件自带编解码器，用户端零依赖。）
-      #    注意：这里**故意不装** xcb-util / cairo / pango / wayland 那一堆包。
-      #    那些是 SDK 的 VSTGUI 才需要的；我们在 CMakeLists.txt 里已把
-      #    SMTG_ENABLE_VSTGUI_SUPPORT 关掉。若某天这里报 "xcb-util not found"，
-      #    说明 SDK 升级后 VSTGUI 又被拉进来了，去看下一节的守卫断言。
+      #    ※ 20.04 上 freetype 的开发包叫 libfreetype6-dev（较新发行版才叫
+      #      libfreetype-dev），libxft-dev 也会把它带进来，这里显式写靠得住。
+      #    ※ 另装 dpkg-dev 与 rpm：只为了产出 .deb / .rpm 安装包。
+      #    ※ 这里**故意不装** xcb-util / cairo / pango / wayland 那一堆包。
+      #      那些是 SDK 的 VSTGUI 才需要的；我们在 CMakeLists.txt 里已把
+      #      SMTG_ENABLE_VSTGUI_SUPPORT 关掉。若某天这里报 "xcb-util not found"，
+      #      说明 SDK 升级后 VSTGUI 又被拉进来了，去看下面的守卫断言。
       - name: 安装依赖
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config \
-            libx11-dev libxft-dev libfreetype-dev
+          set -e
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config file \
+            libx11-dev libxft-dev libfreetype6-dev \
+            dpkg-dev rpm
 
-      # 4) 诊断一下环境，出问题时一眼能看到版本
+      # 5) 诊断一下环境，出问题时一眼能看到版本
       - name: 环境诊断
         run: |
+          set -e
+          echo "底座发行版：$(. /etc/os-release; echo "$PRETTY_NAME")"
+          ldd --version | head -1
           cmake --version | head -1
           gcc --version | head -1
           pkg-config --modversion x11 xft
@@ -60,7 +110,7 @@ jobs:
       - name: 配置 CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-      # 4.5) 守卫：确认 SDK 的 VSTGUI 层没被引入。
+      # 5.5) 守卫：确认 SDK 的 VSTGUI 层没被引入。
       #      它一旦被 add_subdirectory，就会强制探测 xcb-util / wayland / cairo / pango，
       #      在没装这些包的 runner 上会以一句很难懂的 "FindPkgConfig ... xcb-util not found" 挂掉。
       #      在这里显式断言，把这类回归变成明确报错。
@@ -76,11 +126,11 @@ jobs:
           echo "---- 我们关心的目标 ----"
           cmake --build build --target help | grep -E "DaweiDrumScore|moduleinfotool"
 
-      # 5) 只构建本插件（跳过 SDK 自带示例）
+      # 6) 只构建本插件（跳过 SDK 自带示例）
       - name: 编译
         run: cmake --build build --config Release --target DaweiDrumScore --parallel
 
-      # 6) 校验：结构 / 导出符号 / 模块元数据（不能只信"编译成功"）
+      # 7) 校验：结构 / 导出符号 / 模块元数据（不能只信"编译成功"）
       - name: 校验产物
         run: |
           set -e
@@ -108,26 +158,65 @@ jobs:
           echo "---- moduleinfo.json ----"
           cat "$BUNDLE/Contents/Resources/moduleinfo.json"
 
-      # 7) 打包成 tar.gz（含一键安装脚本）
-      - name: 打包
+      # 8) 断言 glibc 下限：产物的 GLIBC_* 符号需求不得超过构建底座。
+      #    这一条防的是「底座悄悄变新」——比如哪天把上面 container 那行去掉、
+      #    或 Actions 把 ubuntu-latest 升到更新的镜像，产物就会突然要求
+      #    GLIBC_2.38+，而 Ubuntu 22.04 / Debian 12 的用户会毫无征兆地加载失败。
+      - name: 断言 glibc 兼容性
         run: |
           set -e
-          BUNDLE=$(find build -name "DaweiDrumScore.vst3" -type d | head -1)
-          STAGE=/tmp/dawei-linux
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          cp -R "$BUNDLE" "$STAGE/"
-          cp installer/linux/install.sh "$STAGE/"
-          chmod +x "$STAGE/install.sh"
-          tar -C "$STAGE" -czf build/DaweiDrumScore-Linux-x64.tar.gz .
-          echo "---- 包内容 ----"
-          tar -tzf build/DaweiDrumScore-Linux-x64.tar.gz
-          ls -la build/DaweiDrumScore-Linux-x64.tar.gz
+          SO=$(find build -name "DaweiDrumScore.so" | head -1)
+          echo "---- 动态依赖（NEEDED）----"
+          objdump -p "$SO" | grep NEEDED
+          echo "---- 产物要求的 GLIBC 符号版本 ----"
+          readelf --version-info "$SO" \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tr '\n' ' '; echo
+          MAX=$(readelf --version-info "$SO" \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+          HIGHEST=$(printf '%s\n' "GLIBC_${GLIBC_MIN}" "$MAX" | sort -V | tail -1)
+          if [ "$HIGHEST" != "GLIBC_${GLIBC_MIN}" ]; then
+            echo "✗ 产物要求 $MAX，高于预期的 GLIBC_${GLIBC_MIN}"
+            echo "  说明构建底座变新了（例如 container 那行被改掉或去掉了）。"
+            echo "  常见元凶：新底座上 -std=gnu++17 隐含 _GNU_SOURCE → _ISOC23_SOURCE"
+            echo "  → glibc 把 sscanf 重定向到 __isoc23_sscanf，硬性要求 GLIBC_2.38。"
+            exit 1
+          fi
+          echo "✓ 最高需求 $MAX ≤ GLIBC_${GLIBC_MIN}（可跑在 Ubuntu 20.04+ / Debian 11+ / RHEL 9+）"
 
-      # 8) 上传
+      # 9) 打包三种安装包（脚本本身也能在本地跑）
+      - name: 打包 tar.gz / .deb / .rpm
+        run: |
+          set -e
+          VERSION=$(grep -oE 'project\(DaweiDrumScore VERSION [0-9]+\.[0-9]+\.[0-9]+' CMakeLists.txt \
+                    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "版本号 = $VERSION"
+          BUNDLE=$(find build -name "DaweiDrumScore.vst3" -type d | head -1)
+          sh installer/linux/make_packages.sh "$BUNDLE" "$VERSION" build/pkgs
+          echo "---- 产物清单 ----"
+          ls -la build/pkgs
+
+      # 10) 核对安装包元数据（依赖声明错了会在用户机器上装不上/装完跑不了）
+      - name: 核对安装包
+        run: |
+          set -e
+          DEB=$(ls build/pkgs/*.deb | head -1)
+          echo "======== .deb 控制信息 ========"
+          dpkg-deb -I "$DEB"
+          echo "======== .deb 文件清单 ========"
+          dpkg-deb -c "$DEB"
+
+          RPM=$(ls build/pkgs/*.rpm | head -1)
+          echo "======== .rpm 信息 ========"
+          rpm -qip "$RPM"
+          echo "======== .rpm 依赖（rpmbuild 自动生成）========"
+          rpm -qpR "$RPM"
+          echo "======== .rpm 文件清单 ========"
+          rpm -qlp "$RPM"
+
+      # 11) 上传
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: DaweiDrumScore-Linux-x64
-          path: build/DaweiDrumScore-Linux-x64.tar.gz
+          path: build/pkgs/*
           if-no-files-found: error
