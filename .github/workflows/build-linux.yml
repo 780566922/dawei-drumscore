@@ -47,12 +47,26 @@ jobs:
     container: ubuntu:20.04
 
     steps:
-      # 0) ubuntu:20.04 基础镜像里没有 git / curl，checkout 之前先补上
+      # 0) ubuntu:20.04 基础镜像里没有 git / curl，checkout 之前先补上。
+      #    ※ runner 跑在 Azure 内网，换 Azure 官方镜像源比 archive.ubuntu.com
+      #      稳得多 —— 后者偶发 "Connection failed"（表现为只拉到 updates/
+      #      backports、主仓库索引缺失），会让后面的依赖解析莫名其妙地失败
+      #      （如 "curl : Depends: libcurl4 ... not going to be installed"）。
+      #    ※ 仍然保留重试 + 自动回退原始源两道保险。
       - name: 容器基础工具
         run: |
           set -e
-          apt-get update
-          apt-get install -y --no-install-recommends \
+          cp /etc/apt/sources.list /tmp/sources.list.bak
+          sed -i \
+            -e 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+            -e 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list
+          if ! apt-get -o Acquire::Retries=5 update; then
+            echo "::warning::Azure 镜像源不可用，回退到原始源重试"
+            cp /tmp/sources.list.bak /etc/apt/sources.list
+            apt-get -o Acquire::Retries=5 update
+          fi
+          apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             ca-certificates curl xz-utils git
           # 容器里 checkout 出来的工作区属主与 runner 不一致，放行
           git config --global --add safe.directory '*'
@@ -92,7 +106,7 @@ jobs:
       - name: 安装依赖
         run: |
           set -e
-          apt-get install -y --no-install-recommends \
+          apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             build-essential pkg-config file \
             libx11-dev libxft-dev libfreetype6-dev \
             dpkg-dev rpm

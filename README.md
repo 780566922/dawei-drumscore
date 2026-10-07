@@ -55,11 +55,37 @@ MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形�
 
 ### Linux
 
-1. 到本仓库 [Releases](../../releases) 页面下载 `DaweiDrumScore-*-Linux-x64.tar.gz`
-2. 解压后进入目录，执行：`./install.sh`
-3. 重启 MuseScore
+Release 页面提供三种包，按你的发行版挑一个：
 
-装到的是用户目录 `~/.vst3/`，**不需要 sudo**，也不影响系统里其它用户。
+**① 通用压缩包 —— 任何发行版都能用（含 Arch / Gentoo / NixOS）**
+
+1. 下载 `DaweiDrumScore-*-Linux-x86_64.tar.gz`
+2. 解压后进入目录，执行：`./install.sh`
+3. 重启 MuseScore 4
+
+装到用户目录 `~/.vst3/`，**不需要 sudo**，也不影响系统里其它用户。
+
+**② Debian / Ubuntu / Mint / Pop!_OS 系**
+
+```bash
+sudo apt install ./DaweiDrumScore-*-Linux-x86_64.deb
+```
+
+也可以直接在文件管理器里双击，走图形化软件中心安装。
+
+**③ Fedora / RHEL / Rocky / openSUSE 系**
+
+```bash
+sudo dnf install ./DaweiDrumScore-*-Linux-x86_64.rpm
+```
+
+②③ 装到系统级 `/usr/lib/vst3/`（VST3 在 Linux 的标准路径），需要管理员权限。
+
+**运行要求**：glibc ≥ 2.31，即 Ubuntu 20.04+ / Debian 11+ / RHEL 9+；
+依赖 `libX11` 与 `libXft`（桌面发行版默认都装了）。
+
+> 插件本身**零额外运行时依赖** —— MP3 / WAV / FLAC 三个解码器直接编进了 .so，
+> 不需要 FFmpeg、libsndfile 之类任何东西。
 
 > **格式支持**：Linux 版支持 **MP3 / WAV / FLAC**。m4a / aac 在 Linux 上没有零依赖的解码方案，
 > 为保「下载即用、零运行时依赖」故未支持 —— 请先转成 MP3 或 WAV。
@@ -82,7 +108,8 @@ MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形�
 - macOS：Xcode Command Line Tools（clang++）
 - Windows：Visual Studio 2019+（MSVC）或 CMake + MSVC
 - Linux：GCC / Clang + X11 / Xft 开发包（`libx11-dev libxft-dev`）
-- 通用：CMake 3.20+
+- 通用：CMake 3.25+（VST3 SDK 3.8.1 自身的要求；Ubuntu 20.04 自带的 3.16 不够，
+  需另装官方 CMake）
 
 下载 VST3 SDK 并解压到任意目录（默认约定为 `~/WorkBuddy/vst3sdk`）：
 
@@ -127,8 +154,23 @@ cmake --build build --target DaweiDrumScore --parallel
 
 产物：`build/VST3/Release/DaweiDrumScore.vst3`
 
+打包成三种安装包（脚本也可在本地跑，缺 dpkg-deb / rpmbuild 时自动跳过对应格式）：
+
+```bash
+sh installer/linux/make_packages.sh build/VST3/Release/DaweiDrumScore.vst3 1.0.0 dist
+```
+
 > 解码不依赖任何音频开发库 —— 三个单文件解码库（dr_wav / dr_mp3 / dr_flac）
 > 已 vendored 在 `source/linux/third_party/`，随插件一起编译。
+
+> ⚠ **构建底座的 glibc 版本 = 产物的 glibc 下限。**
+> 官方在 **Ubuntu 20.04** 容器（glibc 2.31 / GCC 9）里构建，产物可跑在
+> Ubuntu 20.04+ / Debian 11+ / RHEL 9+。若在更新的发行版上构建，产物的
+> `GLIBC_*` 符号需求会被顶高（例如 Ubuntu 24.04 + GCC 13 会因
+> `-std=gnu++17` 隐含 `_GNU_SOURCE` → `_ISOC23_SOURCE`，导致 `sscanf` 被
+> 重定向到 `__isoc23_sscanf`，硬性要求 GLIBC_2.38），于是 Ubuntu 22.04 /
+> Debian 12 的用户加载插件时会被动态链接器直接拒掉。CI 里有断言守住这条线，
+> 详见 `docs/overview.md`。
 
 ### 通用 CMake
 
