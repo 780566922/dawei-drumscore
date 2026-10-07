@@ -71,6 +71,15 @@
 | `.deb` | 系统级 `/usr/lib/vst3` | `Depends: libc6 (>= 2.31), libstdc++6, libgcc-s1, libx11-6, libxft2`；带 postinst / prerm 提示 |
 | `.rpm` | 系统级 `/usr/lib/vst3` | **不手写 Requires**，交给 rpmbuild 自动生成（读 ELF 的 NEEDED 与 GLIBC 符号版本来定），避开 Fedora(`libX11`) 与 openSUSE(`libX11-6`) 包名不一致的坑 |
 
+**CI 结果**：全绿（1m20s，17 步）。产物核对（下载后独立解包验证，不只看 CI 日志）：
+
+- 三个包结构标准 —— tar.gz（bundle + install.sh）、.deb（`debian-binary` + `control.tar.xz` + `data.tar.xz`）、
+  .rpm（lead 魔数 `edabeedb` + gzip cpio payload）
+- `.so` 的最高符号需求 **GLIBC_2.17 / GLIBCXX_3.4.21** —— 比声明的 2.31 还低，覆盖面留有富余
+- `.deb` 内 `.so` 导出 `ModuleEntry` / `ModuleExit` / `GetPluginFactory` 三项齐全（共 344 个全局符号）
+- `.rpm` 的 Requires 由 rpmbuild 自动生成（`libc.so.6(GLIBC_2.x)(64bit)`、`libstdc++.so.6(GLIBCXX_3.4.x)(64bit)` 等规范形式）
+- Release `v1.0.0` 已换为三个 Linux 资产（旧的单个 `-Linux-x64.tar.gz` 已删除）
+
 #### 本轮踩的坑（Linux CI 前两轮失败）
 
 | # | 现象 | 根因 | 修法 |
