@@ -10,7 +10,7 @@ GitHub 的云端机器（免费的 `windows-latest`）自动编译，你不需�
 在项目目录里执行（把 `你的用户名` 换成你的 GitHub 用户名）：
 
 ```bash
-cd /Users/youwei/WorkBuddy/2026-10-07-02-16-48/vst3-audio-player
+cd /path/to/vst3-audio-player
 
 git init
 git add .
