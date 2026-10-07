@@ -8,7 +8,8 @@
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SDK="$HOME/WorkBuddy/vst3sdk"
+# VST3 SDK 路径：可用环境变量覆盖，默认查找 ~/WorkBuddy/vst3sdk
+SDK="${VST3_SDK_DIR:-$HOME/WorkBuddy/vst3sdk}"
 SRC="$HERE/source"
 OUT="$HERE/build"
 BUNDLE="$OUT/大伟鼓谱MuseScore音频播放器.vst3"
@@ -46,8 +47,8 @@ $CXX $COMMON -c "$SRC/player.cpp" -o "$OUT/player.o"
 # 必须编进来：AudioEffect / EditControllerEx1 / CPluginFactory 的实现都在这里。
 # 之前手写基类时缺了这些，MuseScore 判定插件不兼容。
 SDKLIB="$SDK/public.sdk/source"
-SDK_INC="-I$SRC -I/Users/youwei/WorkBuddy -I$SDK"
-SDK_FLAGS="-std=c++17 -O2 -DNDEBUG=1 -mmacosx-version-min=11.0 -fPIC -I$SRC -I/Users/youwei/WorkBuddy -I$SDK"
+SDK_INC="-I$SRC -I$SDK"
+SDK_FLAGS="-std=c++17 -O2 -DNDEBUG=1 -mmacosx-version-min=11.0 -fPIC -I$SRC -I$SDK"
 
 # public.sdk 源文件位置不固定（有些在 pluginterfaces/base，有些在 public.sdk/source），
 # 用 find 动态定位，避免写死路径导致 "no such file" 中断构建
@@ -108,7 +109,7 @@ for ARCH in x86_64 arm64; do
        -I"$SRC" -I"$SDK" -c "$SRC/gui.mm"      -o "$OUT/gui_$ARCH.o"      $FRAMEWORKS
   # aplaysdk 是纯 C++（不含 ObjC），按普通 C++ 编译 —— 与 Windows 端共用同一份源码
   $CXX -std=c++17 -O2 -DNDEBUG=1 $AFLAGS -mmacosx-version-min=11.0 -fPIC \
-       -I"$SRC" -I/Users/youwei/WorkBuddy -I"$SDK" -c "$SRC/aplaysdk.cpp" -o "$OUT/plugin_$ARCH.o" $FRAMEWORKS
+       -I"$SRC" -I"$SDK" -c "$SRC/aplaysdk.cpp" -o "$OUT/plugin_$ARCH.o" $FRAMEWORKS
 done
 
 # 合并必须在循环外 —— 放循环内会被下一轮的单架构 .o 覆盖
@@ -207,9 +208,9 @@ build_test () {
 
 echo "==> 编译验证器"
 build_test "$OUT/validate" -std=c++17 -O1 -arch arm64 "$HERE/validate.cpp" \
-           -I"$SDK" -I/Users/youwei/WorkBuddy $SDK_OBJS_ARM64 $FRAMEWORKS
+           -I"$SDK" $SDK_OBJS_ARM64 $FRAMEWORKS
 build_test "$OUT/e2e_test" -std=c++17 -O1 -arch arm64 "$HERE/e2e_test.cpp" \
-           -I"$SDK" -I/Users/youwei/WorkBuddy $SDK_OBJS_ARM64 $FRAMEWORKS
+           -I"$SDK" $SDK_OBJS_ARM64 $FRAMEWORKS
 
 echo "==> 验证 1：VST3 接口生命周期"
 if "$OUT/validate" "$BUNDLE/Contents/MacOS/$EXEC_NAME" > "$OUT/validate.log" 2>&1; then
@@ -305,7 +306,7 @@ fi
 echo "==> 验证 5：界面生命周期（点开音频 / 拖入文件）"
 if [ -n "$TEST_AUDIO" ] && [ -f "$TEST_AUDIO" ]; then
   build_test "$OUT/gui_repro" -x objective-c++ -std=c++17 -O1 -DNDEBUG=1 -arch arm64 \
-             -mmacosx-version-min=11.0 -I"$SRC" -I"$SDK" -I/Users/youwei/WorkBuddy \
+             -mmacosx-version-min=11.0 -I"$SRC" -I"$SDK" \
              "$HERE/gui_repro.mm" \
              -x none "$OUT/gui_arm64.o" "$OUT/player.o" "$OUT/crashguard_arm64.o" \
              "$OUT/audiofile_arm64.o" $SDK_OBJS_ARM64 $FRAMEWORKS

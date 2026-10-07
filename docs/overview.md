@@ -1,6 +1,36 @@
 # 大伟鼓谱 MuseScore 音频播放器（VST3）— 交付概览
 
-## 最新一轮：查清菜单显示名的真正来源 = bundle 文件名（2026-10-08 00:10）
+## 本轮（2026-10-08）：安装程序 + Windows 跨平台
+
+### 一、macOS 安装包（已完成，可分发）
+- `./make_pkg.sh` → `dist/大伟鼓谱MuseScore音频播放器-1.0.0.pkg`（约 338 KB）
+- 装到**系统域** `/Library/Audio/Plug-Ins/VST3/`：双击 → 输密码 → 完成（VST 插件标准做法）
+- 含欢迎页 / 使用说明 / 许可 / 完成页（B 站引流在欢迎页与页脚）
+- postinstall：自动清理旧命名残留（APLAY.vst3 / DaweiDrumScore.vst3）+ 去除下载隔离属性
+- **验证**：解包比对，包内二进制与源 bundle **md5 逐字节一致**；Info.plist 字段正确
+- 因未购买开发者证书，首次打开会被 Gatekeeper 拦 →
+  随包附 `dist/安装说明-请先读.txt`（教「右键 → 打开」放行）
+
+### 二、Windows 版（跨平台化已完成，待 CI 编译）
+- 架构：**同一份源码**，平台实现分目录（`source/*.mm` 对 `source/win/*.cpp`）
+- 直接复用：`player.cpp`、`aplaysdk.cpp`（零 ObjC）、`PlugView::Backend` 纯虚接口
+- 新写：Media Foundation 解码、SEH + DbgHelp 崩溃守卫、Win32 自绘界面
+- 构建：`CMakeLists.txt`（**已在本机验证 Mac 端可出包**）+ `.github/workflows/build-windows.yml`
+- 操作手册：`Windows版-发布指引.md`（git push → Actions 出包 → 安装位置）
+
+### 关键结论
+| | macOS | Windows |
+|---|---|---|
+| 状态 | ✅ 可用（含 PKG 安装包） | ⏳ 代码完成，待 CI 编译验证 |
+| 本地构建 | `./build.sh`（6 项验证全绿） | 不需要 |
+| 云端构建 | 不需要 | GitHub Actions |
+| 解码 | AVFoundation | Media Foundation |
+| 界面 | AppKit | Win32 |
+| 崩溃取证 | signal + backtrace | SEH + DbgHelp |
+
+---
+
+## 上一轮：查清菜单显示名的真正来源 = bundle 文件名（2026-10-08 00:10）
 
 **用户反馈**：菜单两级还都是英文。并复述层级 —— `VST` → 一级菜单（应是英文）→
 二级菜单（插件本体，可以是中文）。
