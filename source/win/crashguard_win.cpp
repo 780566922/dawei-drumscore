@@ -151,7 +151,8 @@ LONG WINAPI unhandledFilter (EXCEPTION_POINTERS* ep)
                                                            : sizeof hdr - 1);
 
     writeStackTrace ();
-    writeRaw ("=== 现场记录结束 ===\n", 24);
+    writeRaw ("=== 现场记录结束 ===\n",
+              sizeof ("=== 现场记录结束 ===\n") - 1);
 
     // 交给系统默认处理，保持原有的崩溃上报行为
     return EXCEPTION_EXECUTE_HANDLER;

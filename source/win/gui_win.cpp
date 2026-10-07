@@ -268,7 +268,7 @@ bool WinView::create (HWND parent, int w, int h)
     lf.lfHeight = -13;
     lf.lfCharSet = DEFAULT_CHARSET;
     lf.lfQuality = CLEARTYPE_QUALITY;
-    ::wcscpy_s (lf.lfFaceName, L"Microsoft YaHei UI");
+    ::wcscpy_s (lf.lfFaceName, LF_FACESIZE, L"Microsoft YaHei UI");
     m_font = ::CreateFontIndirectW (&lf);
 
     lf.lfHeight = -11;

@@ -22,12 +22,6 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 
-// 个别版本的 Windows SDK 未定义这个属性常量（其值固定为 0x10）。
-// 缺失时补上，否则 MSVC 报 C2065 undeclared identifier。
-#ifndef MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING
-#define MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING 0x00000010
-#endif
-
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -80,11 +74,11 @@ bool ensureMfStarted ()
 //------------------------------------------------------------------------------
 HRESULT createReader (const std::wstring& wpath, IMFSourceReader** out)
 {
-    // 关掉视频处理，插件只关心音频
+    // 显式允许 Source Reader 自动插入解码器 + 格式转换器
+    // （MF_READWRITE_DISABLE_CONVERTERS 默认即为 FALSE，此处声明意图，便于日后排查）
     IMFAttributes* attrs = nullptr;
     if (SUCCEEDED (::MFCreateAttributes (&attrs, 1)) && attrs)
     {
-        attrs->SetUINT32 (MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING, TRUE);
         attrs->SetUINT32 (MF_READWRITE_DISABLE_CONVERTERS, FALSE);
     }
 
