@@ -24,6 +24,8 @@
 #include <csignal>
 #include <signal.h>     // sigaction / SA_SIGINFO 的全局声明
 #include <cstdarg>
+#include <cstddef>      // size_t
+#include <cstdint>      // uintptr_t（打印寄存器现场时用）
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

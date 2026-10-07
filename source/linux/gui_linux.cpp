@@ -35,6 +35,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>      // size_t
+#include <cstdint>      // uintptr_t（宿主传进来的 X11 Window 句柄还原）
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
