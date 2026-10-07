@@ -27,7 +27,7 @@ MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形�
 
 ### macOS（推荐：PKG 安装包）
 
-1. 到本仓库 [Releases](../../releases) 页面下载 `大伟鼓谱MuseScore音频播放器-*.pkg`
+1. 到本仓库 [Releases](../../releases) 页面下载 `DaweiDrumScore-*-macOS.pkg`
 2. 双击安装，按提示输入管理员密码
 3. 重启 MuseScore
 
@@ -37,13 +37,19 @@ MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形�
 
 装到的是系统目录 `/Library/Audio/Plug-Ins/VST3/`，对所有账号与所有支持 VST3 的宿主生效。
 
-### Windows
+### Windows（推荐：安装器）
 
-1. 到 [Releases](../../releases) 下载 Windows 版压缩包
-2. 解压得到 `大伟鼓谱MuseScore音频播放器.vst3`
-3. 复制到 `C:\Program Files\Common Files\VST3\`
+1. 到本仓库 [Releases](../../releases) 页面下载 `DaweiDrumScore-*-Windows-Setup.exe`
+2. 双击运行；若 SmartScreen 提示「Windows 已保护你的电脑」→ **更多信息 → 仍要运行**
+   （安装器未做代码签名，手动放行一次即可）
+3. 一路「下一步」完成安装（安装器向导为英文，插件本身是中文）
 4. 重启 MuseScore
 
+装到系统目录 `C:\Program Files\Common Files\VST3\`，对所有账号与所有支持 VST3 的宿主生效。
+
+> 也可从仓库 [Actions](../../actions) 页面的构建产物中下载裸 bundle（`DaweiDrumScore-Windows-x64`），
+> 手动把 `DaweiDrumScore.vst3` 文件夹放进上述 VST3 目录。
+>
 > Windows 版本目前**未经充分实机测试**，如遇问题请提 [Issue](../../issues)。
 
 ### 在 MuseScore 里启用
@@ -90,7 +96,10 @@ cmake -S . -B build -DVST3_SDK_DIR=C:/path/to/vst3sdk
 cmake --build build --config Release --parallel
 ```
 
-产物：`build/VST3/Release/大伟鼓谱MuseScore音频播放器.vst3`
+产物：`build/VST3/Release/DaweiDrumScore.vst3`
+
+可选：用 [Inno Setup](https://jrsoftware.org/isinfo.php) 编译 `installer/windows/setup.iss`
+生成双击即装的安装器（CI 中已自动完成）。
 
 ### 通用 CMake
 
@@ -118,6 +127,7 @@ source/
 
 build.sh                  # macOS 构建脚本（含验证）
 make_pkg.sh               # macOS PKG 打包脚本
+installer/windows/        # Windows 安装器（Inno Setup）
 CMakeLists.txt            # 跨平台 CMake 构建
 validate.cpp              # 插件结构与接口自动验证
 ```
