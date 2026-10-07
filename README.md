@@ -205,7 +205,9 @@ source/
 build.sh                  # macOS 构建脚本（含验证）
 make_pkg.sh               # macOS PKG 打包脚本
 installer/windows/        # Windows 安装器（Inno Setup）
-installer/linux/          # Linux 安装脚本
+installer/linux/          # Linux 安装脚本 + 打包脚本
+├── install.sh            #   用户级安装到 ~/.vst3（免 sudo）
+└── make_packages.sh      #   打 tar.gz / .deb / .rpm 三种包
 CMakeLists.txt            # 跨平台 CMake 构建
 validate.cpp              # 插件结构与接口自动验证
 ```
@@ -234,6 +236,18 @@ Linux：`$HOME/DaweiDrumScore.log`）。
 Linux 没有像 AVFoundation / Media Foundation 那样的系统级零依赖解码方案。
 为了「下载即用、装完零运行时依赖」，Linux 版把 MP3 / WAV / FLAC 三个解码器直接编进了插件；
 m4a / aac 需要额外引入 FFmpeg 一类依赖，会让用户安装变复杂，故暂不支持 —— 转成 MP3 即可。
+
+**Q：Linux 版能在我的发行版上跑吗？**
+能跑的条件是 **glibc ≥ 2.31**：Ubuntu 20.04+ / Debian 11+ / RHEL 9+ / Fedora 32+ 及更新的桌面发行版都满足。
+运行时只依赖 `libX11` 与 `libXft`（桌面发行版默认都有），不需要 FFmpeg / libsndfile 之类任何东西。
+
+如果 MuseScore 里根本看不到插件、且 `$HOME/DaweiDrumScore.log` 是空的，多半是动态链接器
+在加载阶段就把插件拒了（`.so` 的 glibc 需求高于系统）——可以这样确认：
+
+```bash
+readelf --version-info ~/.vst3/DaweiDrumScore.vst3/Contents/x86_64-linux/*.so | grep GLIBC_ | sort -uV
+ldd -r ~/.vst3/DaweiDrumScore.vst3/Contents/x86_64-linux/*.so
+```
 
 ---
 

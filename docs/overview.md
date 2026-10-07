@@ -31,6 +31,46 @@
 - 已上架 Release `v1.0.0`：`DaweiDrumScore-1.0.0-Linux-x64.tar.gz`
 - 遗留：**未实机测试**（本机是 Mac）。
 
+#### 后续补齐：glibc 兼容性 + .deb / .rpm（同日稍晚）
+
+**发现的问题**：扒产物 ELF 符号表，最高需求是 `GLIBC_2.38`（元凶 `__isoc23_sscanf`）。
+动态链接器在加载阶段就做版本校验，找不到符号直接拒绝加载 ——
+**Ubuntu 22.04 / Debian 12（当前 stable）/ RHEL 9 的用户，插件在 MuseScore 里
+连出现都不出现，而且没有任何提示。**
+
+根因：CI 原来跑在 `ubuntu-latest`（＝24.04，glibc 2.39 + GCC 13）。GCC 13 配
+`-std=gnu++17` 会隐含 `_GNU_SOURCE` → 打开 `_ISOC23_SOURCE` → glibc 头文件把
+`sscanf` 宏重定向到 `__isoc23_sscanf`。SDK 的 header 里有 sscanf 调用，
+于是这个符号被编进了产物。
+
+> 关键认知：**构建底座的 glibc 版本 = 产物的 glibc 下限**，没法用编译选项"降级"
+> （你用的就是那个版本的头文件与符号版本）。业界标准做法是钉一个老底座 ——
+> Python 生态的 manylinux 就是这么干的。
+
+修法：CI 改用 `container: ubuntu:20.04` → glibc 2.31 / GCC 9，
+覆盖 **Ubuntu 20.04+ / Debian 11+ / RHEL 9+**。
+
+| 配套踩到的坑 | 修法 |
+|---|---|
+| 20.04 自带 CMake 3.16 < SDK 要求的 3.25 | 下载官方 CMake 3.31.6 预编译包（静态链接，只需 glibc 2.17+） |
+| 20.04 的 freetype 开发包叫 `libfreetype6-dev` | 换包名（较新发行版才叫 `libfreetype-dev`） |
+| SDK 的 `module_linux.cpp` 用了 `<filesystem>`，而 GCC 9/10 的 libstdc++ 尚未把它的实现并进主库 | CMakeLists 里按编译器版本补链 `libstdc++fs` |
+| 基础镜像里没有 git / curl | 第一个步骤先 apt 装 |
+| `archive.ubuntu.com` 抽风：主仓库 InRelease 拉不到（updates/backports 却成功）→ 索引不全 → 依赖解析崩 | 换 Azure 官方镜像 + `Acquire::Retries=5` + update 失败自动回退原源 |
+
+**新增 CI 断言**：产物的 `GLIBC_*` 需求必须 ≤ 2.31。它防的是"底座悄悄变新"
+（哪天把 `container:` 那行去掉、或 Actions 把 `ubuntu-latest` 升到更新的镜像），
+届时会明确报错，而不是在用户环境下无声失败。
+
+**新增 .deb / .rpm**：`installer/linux/make_packages.sh` 一键出三种包，
+本地可跑、CI 直接调用（缺 dpkg-deb / rpmbuild 时自动跳过对应格式）。
+
+| 包 | 装到 | 说明 |
+|---|---|---|
+| `.tar.gz` | 用户级 `~/.vst3` | 免 sudo；**Arch / Gentoo / NixOS 这类没有 deb/rpm 的发行版也通吃** |
+| `.deb` | 系统级 `/usr/lib/vst3` | `Depends: libc6 (>= 2.31), libstdc++6, libgcc-s1, libx11-6, libxft2`；带 postinst / prerm 提示 |
+| `.rpm` | 系统级 `/usr/lib/vst3` | **不手写 Requires**，交给 rpmbuild 自动生成（读 ELF 的 NEEDED 与 GLIBC 符号版本来定），避开 Fedora(`libX11`) 与 openSUSE(`libX11-6`) 包名不一致的坑 |
+
 #### 本轮踩的坑（Linux CI 前两轮失败）
 
 | # | 现象 | 根因 | 修法 |
@@ -70,17 +110,18 @@ clang++ -std=c++17 -fsyntax-only -D__linux__ \
 
 | | macOS | Windows | Linux |
 |---|---|---|---|
-| 状态 | ✅ 已发布（PKG） | ✅ 已发布（Setup.exe），未实机测试 | ✅ 已发布（tar.gz），未实机测试 |
+| 状态 | ✅ 已发布（PKG） | ✅ 已发布（Setup.exe），未实机测试 | ✅ 已发布（tar.gz + .deb + .rpm），未实机测试 |
 | 本地构建 | `./build.sh`（6 项验证全绿） | 不需要 | 可 `cmake`，但本机无 X11 头 |
-| 云端构建 | 不需要 | GitHub Actions（全绿） | GitHub Actions（全绿，47s） |
+| 云端构建 | 不需要 | GitHub Actions（全绿） | GitHub Actions（全绿，**ubuntu:20.04 容器**） |
+| **glibc 下限** | —（系统自带） | —（系统自带） | **2.31**（Ubuntu 20.04+ / Debian 11+ / RHEL 9+） |
 | 解码 | AVFoundation | Media Foundation | vendored dr_libs（**零依赖**） |
 | 支持格式 | mp3/wav/m4a/aac/flac… | 同 macOS | **mp3/wav/flac**（无 m4a/aac） |
 | 界面 | AppKit | Win32 | X11 + Xft |
 | 崩溃取证 | signal + backtrace | SEH + DbgHelp | signal + 寄存器现场 |
 | 模块入口符号 | `bundleEntry`/`bundleExit` | `GetPluginFactory`（`InitDll`/`ExitDll` 可选） | `ModuleEntry`/`ModuleExit`/`GetPluginFactory` |
-| 安装位置 | 系统域 `/Library/…/VST3` | `C:\Program Files\Common Files\VST3` | 用户级 `~/.vst3`（免 sudo） |
+| 安装位置 | 系统域 `/Library/…/VST3` | `C:\Program Files\Common Files\VST3` | tar.gz→ `~/.vst3`（免 sudo）；deb/rpm→ `/usr/lib/vst3` |
 | 放行 | Gatekeeper（右键打开） | SmartScreen（更多信息→仍要运行） | 无（未签名也不拦） |
-| Release 资产 | `…-macOS.pkg` | `…-Windows-Setup.exe` | `…-Linux-x64.tar.gz` |
+| Release 资产 | `…-macOS.pkg` | `…-Windows-Setup.exe` | `…-Linux-x86_64.{tar.gz,deb,rpm}` |
 
 ---
 

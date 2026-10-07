@@ -39,6 +39,12 @@ env:
   GLIBC_MIN: "2.31"
   # Ubuntu 20.04 自带的 CMake 是 3.16，而 VST3 SDK 3.8.1 要求 ≥ 3.25
   CMAKE_VER: "3.31.6"
+  # ⚠ ubuntu:20.04 基础镜像里，tzdata 等包的 debconf 会退化到 Readline 前端，
+  #   在无 TTY 的 CI 里会**永久阻塞**在 "Geographic area:" 提示上（实测卡了 22 分钟，
+  #   日志只有一行 "Geographic area: " 然后不动了）。这不是网络慢。
+  #   noninteractive + 预设 TZ 是所有 Debian 系 CI 的标准做法。
+  DEBIAN_FRONTEND: noninteractive
+  TZ: Etc/UTC
 
 jobs:
   build-linux:
