@@ -59,12 +59,24 @@ if(NOT EXISTS "${VST3_SDK_DIR}/pluginterfaces")
         "https://github.com/steinbergmedia/vst3sdk.git vst3sdk")
 endif()
 
-# 只构建我们需要的部分，跳过示例 / VSTGUI / 验证器，加快 CI
-set(SMTG_ADD_VSTGUI               OFF CACHE BOOL "" FORCE)
-set(SMTG_ADD_VST3_HOSTING_SAMPLES OFF CACHE BOOL "" FORCE)
-set(SMTG_ADD_VST3_PLUGINS_SAMPLES OFF CACHE BOOL "" FORCE)
-set(SMTG_CREATE_PLUGIN_LINK       OFF CACHE BOOL "" FORCE)
-set(SMTG_RUN_VST_VALIDATOR        OFF CACHE BOOL "" FORCE)
+# 只构建我们需要的部分，跳过 VSTGUI / 示例 / 校验器，加快 CI。
+#
+# ⚠ 选项名必须与 SDK 顶层 CMakeLists.txt 中 option() 声明的完全一致。
+#   CMake 对「设置了不存在的变量」不报错，只会静默失效 —— 我们曾把
+#   VSTGUI 开关写成 SMTG_ADD_VSTGUI，结果 vstgui4 照旧被 add_subdirectory，
+#   它在 Linux 上会强制 find_package(Wayland/X11/Freetype) + pkg_check_modules(
+#   xcb xcb-util xcb-cursor xcb-keysyms xcb-xkb xkbcommon xkbcommon-x11
+#   glib-2.0 cairo pangocairo pangoft2 fontconfig)，CI 直接卡在配置阶段。
+#   下面的名字取自 SDK/CMakeLists.txt:10-13 与 cmake/modules/*.cmake。
+set(SMTG_ENABLE_VSTGUI_SUPPORT        OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES  OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_WAYLAND_SUPPORT       OFF CACHE BOOL "" FORCE)
+set(SMTG_CREATE_PLUGIN_LINK           OFF CACHE BOOL "" FORCE)
+set(SMTG_RUN_VST_VALIDATOR            OFF CACHE BOOL "" FORCE)
+# moduleinfotool 在 public.sdk/samples/vst-utilities 里，我们要它生成 moduleinfo.json
+set(SMTG_ADD_VST3_UTILITIES           ON  CACHE BOOL "" FORCE)
+set(SMTG_CREATE_MODULE_INFO           ON  CACHE BOOL "" FORCE)
 
 add_subdirectory("${VST3_SDK_DIR}" "${CMAKE_BINARY_DIR}/vst3sdk")
 

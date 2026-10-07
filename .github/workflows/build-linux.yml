@@ -39,6 +39,10 @@ jobs:
 
       # 3) 依赖：X11 + Xft（界面）。（解码用的是仓库内 vendored 的 dr_libs，
       #    不需要任何音频开发库 —— 插件自带编解码器，用户端零依赖。）
+      #    注意：这里**故意不装** xcb-util / cairo / pango / wayland 那一堆包。
+      #    那些是 SDK 的 VSTGUI 才需要的；我们在 CMakeLists.txt 里已把
+      #    SMTG_ENABLE_VSTGUI_SUPPORT 关掉。若某天这里报 "xcb-util not found"，
+      #    说明 SDK 升级后 VSTGUI 又被拉进来了，去看下一节的守卫断言。
       - name: 安装依赖
         run: |
           sudo apt-get update
@@ -55,6 +59,22 @@ jobs:
 
       - name: 配置 CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      # 4.5) 守卫：确认 SDK 的 VSTGUI 层没被引入。
+      #      它一旦被 add_subdirectory，就会强制探测 xcb-util / wayland / cairo / pango，
+      #      在没装这些包的 runner 上会以一句很难懂的 "FindPkgConfig ... xcb-util not found" 挂掉。
+      #      在这里显式断言，把这类回归变成明确报错。
+      - name: 守卫断言（VSTGUI 必须未被引入）
+        run: |
+          set -e
+          if cmake --build build --target help 2>/dev/null | grep -qE '^\s*\S*\s+vstgui'; then
+            echo "✗ SDK 的 vstgui 目标被引入了 —— CMakeLists.txt 里的 SMTG_ENABLE_VSTGUI_SUPPORT 开关可能失效了"
+            cmake --build build --target help | grep -i vstgui
+            exit 1
+          fi
+          echo "✓ 未引入 vstgui（选项名有效）"
+          echo "---- 我们关心的目标 ----"
+          cmake --build build --target help | grep -E "DaweiDrumScore|moduleinfotool"
 
       # 5) 只构建本插件（跳过 SDK 自带示例）
       - name: 编译
