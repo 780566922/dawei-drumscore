@@ -5,7 +5,7 @@
 //   - 波形预览 + 可拖动播放头
 //   - 带符号起始偏移（在波形上按住 Ctrl / Alt 拖动）
 //   - 小节网格（BPM + 拍号）
-//   - 播放状态灯、音量、回到谱面
+//   - 播放状态灯、音量、回到播放头、使用指南
 //   - 拖入音频文件 / 点按钮选文件
 //
 // 与宿主的关系：VST3 在 Windows 上通过 kPlatformTypeHWND 传父窗口句柄，
@@ -51,6 +51,12 @@ const int kPanelH = 384;      ///< 面板高（含底部 B 站署名）
 const int kWaveW  = 320;      ///< 波形区宽
 const int kWaveH  = 118;      ///< 波形区高
 
+// 分家检测阈值（秒）：正常播放时「音频实际位置」与「谱面位置 + 偏移」只差一个
+// 音频缓冲的量级（几十毫秒）。超过这个值就认为跟随出了问题，波形区右上角会亮
+// 出红色错位徽标，提示用户点「回到播放头」一键修复。
+// 与 macOS / Linux 端取同一个值，别各写各的。
+const double kDivergenceWarnSec = 0.25;
+
 // 控件 ID
 enum : int
 {
@@ -58,7 +64,7 @@ enum : int
     IDC_ZOOM_OUT,
     IDC_ZOOM_IN,
     IDC_ZOOM_FIT,
-    IDC_BACK_TO_SCORE,
+    IDC_BACK_TO_SCORE,      // 按钮文案＝「回到播放头」（ID 保留原名，避免大范围改名）
     IDC_GRID_CHECK,
     IDC_NUM_CHECK,
     IDC_BPM_EDIT,
@@ -66,12 +72,14 @@ enum : int
     IDC_BPM_DOWN,
     IDC_TIMESIG_COMBO,
     IDC_VOLUME_SLIDER,
+    IDC_HELP,
     IDC_BRAND = 1100,
     IDC_TIMER_UI = 1200
 };
 
 const wchar_t* kMainClass = L"DaweiDrumScoreMainView";
 const wchar_t* kWaveClass = L"DaweiDrumScoreWaveView";
+const wchar_t* kHelpClass = L"DaweiDrumScoreHelpView";   ///< 使用指南覆盖层
 
 // 拍号选项（与 macOS 端一致）
 struct TimeSig { const wchar_t* label; int beats; int denom; };
@@ -230,6 +238,13 @@ public:
     void resize (int w, int h);
 
     void paint (HDC dc, const RECT& rc);
+    /// 使用指南覆盖层自绘（由覆盖层窗口的 WM_PAINT 调用）。dc 的原点即覆盖层左上角。
+    void paintHelp (HDC dc);
+    /// 显示/隐藏使用指南覆盖层。
+    void toggleHelp ();
+    /// 关闭使用指南（覆盖层被点击时回调）。
+    void hideHelp ();
+    bool helpVisible () const { return m_helpVisible; }
     void onMouseDown (int x, int y, int mods);
     void onMouseMove (int x, int y, int mods);
     void onMouseUp ();
@@ -258,6 +273,8 @@ private:
     void applyBpmFromEdit ();
     void zoomBy (double factor, double centerSec);
     void zoomFit ();
+    /// 把视野挪到 sec（播放头落在画面 25% 处）。用于「回到播放头」。
+    void centerViewOn (double sec);
     void clampView ();
     void afterLoad ();
     double xToSec (int x) const;
@@ -267,8 +284,13 @@ private:
 
     HWND m_hwnd = nullptr;
     HWND m_wave = nullptr;
+    // 使用指南覆盖层：一个铺满面板的子窗口，创建顺序在所有控件之后 → 位于 z 序
+    // 最上层。做成独立窗口而不是「隐藏所有控件再在父窗口上画」，是为了不碰
+    // 那二十来个控件窗口的显示状态（隐藏/恢复期间容易出现焦点和重绘的边角问题）。
+    HWND m_help = nullptr;
+    bool m_helpVisible = false;
     HWND m_openBtn = nullptr, m_zoomOut = nullptr, m_zoomIn = nullptr, m_zoomFit = nullptr;
-    HWND m_backBtn = nullptr, m_gridCheck = nullptr, m_numCheck = nullptr;
+    HWND m_backBtn = nullptr, m_helpBtn = nullptr, m_gridCheck = nullptr, m_numCheck = nullptr;
     HWND m_bpmEdit = nullptr, m_bpmUp = nullptr, m_bpmDown = nullptr;
     HWND m_timesig = nullptr, m_volSlider = nullptr;
     HWND m_timeLabel = nullptr, m_offsetLabel = nullptr, m_srcLabel = nullptr;
@@ -310,6 +332,7 @@ namespace {
 
 LRESULT CALLBACK waveProc (HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK mainProc (HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK helpProc (HWND, UINT, WPARAM, LPARAM);
 
 WinView* viewOf (HWND hwnd)
 {
@@ -344,6 +367,16 @@ void ensureClasses ()
     wv.hbrBackground = reinterpret_cast<HBRUSH> (::GetStockObject (BLACK_BRUSH));
     wv.lpszClassName = kWaveClass;
     ::RegisterClassExW (&wv);
+
+    // 使用指南覆盖层：背景全自绘，所以不给 hbrBackground（WM_ERASEBKGND 返回 1）。
+    WNDCLASSEXW wh = {};
+    wh.cbSize = sizeof wh;
+    wh.style = CS_HREDRAW | CS_VREDRAW;
+    wh.lpfnWndProc = helpProc;
+    wh.hInstance = hinst;
+    wh.hCursor = ::LoadCursorW (nullptr, IDC_ARROW);
+    wh.lpszClassName = kHelpClass;
+    ::RegisterClassExW (&wh);
 }
 
 } // namespace
@@ -385,7 +418,7 @@ void WinView::deleteFonts ()
 
 void WinView::applyFontsToChildren ()
 {
-    const HWND normal[] = { m_openBtn, m_zoomOut, m_zoomIn, m_zoomFit, m_backBtn,
+    const HWND normal[] = { m_openBtn, m_helpBtn, m_zoomOut, m_zoomIn, m_zoomFit, m_backBtn,
                             m_gridCheck, m_numCheck, m_bpmEdit, m_bpmUp, m_bpmDown,
                             m_timesig, m_volSlider };
     for (HWND c : normal)
@@ -469,10 +502,15 @@ bool WinView::create (HWND parent, int w, int h)
         ::SetWindowLongPtrW (m_wave, GWLP_USERDATA, reinterpret_cast<LONG_PTR> (this));
 
     m_openBtn   = mk (L"BUTTON", L"打开音频…", BS_PUSHBUTTON, IDC_OPEN);
+    // 「？帮助」：唤出使用指南覆盖层。有用户反馈不知道怎么用，说明书必须能在
+    // 界面上直接点开，不能只躺在安装目录的 readme 里。
+    m_helpBtn   = mk (L"BUTTON", L"？帮助", BS_PUSHBUTTON, IDC_HELP);
     m_zoomOut   = mk (L"BUTTON", L"缩小", BS_PUSHBUTTON, IDC_ZOOM_OUT);
     m_zoomIn    = mk (L"BUTTON", L"放大", BS_PUSHBUTTON, IDC_ZOOM_IN);
     m_zoomFit   = mk (L"BUTTON", L"全览", BS_PUSHBUTTON, IDC_ZOOM_FIT);
-    m_backBtn   = mk (L"BUTTON", L"回到谱面", BS_PUSHBUTTON, IDC_BACK_TO_SCORE);
+    // 原名「回到谱面」→「回到播放头」：用户想干的是「把我送回播放位置」，
+    // 新名字直说结果，不需要先理解「谱面」和「音频」的关系。
+    m_backBtn   = mk (L"BUTTON", L"回到播放头", BS_PUSHBUTTON, IDC_BACK_TO_SCORE);
     m_gridCheck = mk (L"BUTTON", L"网格", BS_AUTOCHECKBOX, IDC_GRID_CHECK);
     m_numCheck  = mk (L"BUTTON", L"小节号", BS_AUTOCHECKBOX, IDC_NUM_CHECK);
     ::SendMessageW (m_gridCheck, BM_SETCHECK, BST_CHECKED, 0);
@@ -511,6 +549,13 @@ bool WinView::create (HWND parent, int w, int h)
     m_brand       = mk (L"STATIC", L"♪ B 站「大伟鼓谱」· 欢迎关注，鼓谱 / 教学 / 伴奏持续更新",
                         SS_LEFT, IDC_BRAND);
 
+    // ⚠ 使用指南覆盖层必须【最后创建】：同层子窗口的 z 序 = 创建顺序，
+    //   最后建的才盖得住前面所有控件。不加 WS_VISIBLE —— 默认隐藏。
+    m_help = ::CreateWindowExW (0, kHelpClass, L"", WS_CHILD,
+                                0, 0, w, h, m_hwnd, nullptr, hi, nullptr);
+    if (m_help)
+        ::SetWindowLongPtrW (m_help, GWLP_USERDATA, reinterpret_cast<LONG_PTR> (this));
+
     applyFontsToChildren ();
 
     ::DragAcceptFiles (m_hwnd, TRUE);
@@ -527,9 +572,11 @@ void WinView::destroy ()
     if (m_hwnd)
     {
         ::KillTimer (m_hwnd, IDC_TIMER_UI);
-        ::DestroyWindow (m_hwnd);
+        ::DestroyWindow (m_hwnd);    // 子窗口（含覆盖层）随之销毁
         m_hwnd = nullptr;
     }
+    m_wave = nullptr;
+    m_help = nullptr;
     deleteFonts ();
     if (m_bgBrush)
         ::DeleteObject (m_bgBrush);
@@ -555,6 +602,7 @@ void WinView::layoutChildren ()
     };
 
     move (m_openBtn,    240,   6,  90, 24);
+    move (m_helpBtn,    172,   6,  62, 24);
     move (m_wave,        10,  34, kWaveW, kWaveH);
 
     move (m_timeLabel,   10, 158,  92, 18);
@@ -583,6 +631,9 @@ void WinView::layoutChildren ()
     move (m_fmtLabel,   140, 300, 190, 18);
 
     move (m_brand,       10, 358, 320, 18);
+
+    // 使用指南覆盖层：铺满整个面板（0,0 起，整块面板尺寸），必须最后摆放。
+    move (m_help,         0,   0, kPanelW, kPanelH);
 }
 
 //------------------------------------------------------------------------------
@@ -779,6 +830,46 @@ void WinView::paint (HDC target, const RECT& rc)
                 ::DeleteObject (ob);
             }
         }
+
+        // ---- 分家检测徽标 ----
+        // 只在「播放中、且不在首尾过渡区」判定：
+        //   · 起播头 0.3 秒音频还在追，差值天然偏大 → 不算；
+        //   · 音频比乐谱短时尾端必然拉开 → 不算（那不是 bug）。
+        // 命中就亮一个红底徽标，把「用户肉眼看不出来的分家」变成一句明确指令。
+        {
+            const double dur = m_backend->durationSec ();
+            const double pos = m_backend->positionSec ();
+            const bool mid = (pos > 0.30 && pos < dur - 0.30);
+            if (tl0.playing && tl0.playheadValid && dur > 0.60 && mid)
+            {
+                const double diff = pos - (tl0.playheadSec + offset);
+                if (std::fabs (diff) > kDivergenceWarnSec)
+                {
+                    wchar_t warn[128];
+                    std::swprintf (warn, 128, L"与谱面错位 %.2f 秒 · 点「回到播放头」",
+                                   std::fabs (diff));
+
+                    ::SelectObject (dc, m_fontSmall);
+                    ::SetBkMode (dc, TRANSPARENT);
+                    SIZE sz = {};
+                    ::GetTextExtentPoint32W (dc, warn,
+                                             static_cast<int> (std::wcslen (warn)), &sz);
+
+                    RECT box = { W - sz.cx - px (16), px (4),
+                                 W - px (4), px (4) + sz.cy + px (6) };
+                    if (box.left < 0) box.left = 0;
+                    HBRUSH bw = ::CreateSolidBrush (RGB (208, 64, 50));
+                    ::FillRect (dc, &box, bw);
+                    ::DeleteObject (bw);
+
+                    ::SetTextColor (dc, RGB (255, 255, 255));
+                    RECT tr = box;
+                    tr.left += px (4);
+                    ::DrawTextW (dc, warn, -1, &tr,
+                                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                }
+            }
+        }
     }
 
     // ⚠️ 顺序绝不能反：BitBlt 读的是 DC 【当前选中】的那张位图。
@@ -789,6 +880,109 @@ void WinView::paint (HDC target, const RECT& rc)
     ::SelectObject (dc, oldBmp);
     ::DeleteObject (bmp);
     ::DeleteDC (dc);
+}
+
+//------------------------------------------------------------------------------
+// 使用指南覆盖层
+//
+// 面板只有 340x384，完整说明书塞不进常驻布局（挤掉的会是波形区）。所以做成
+// 「？帮助」唤出的覆盖层：铺满整块面板、点任意处关闭。
+//
+// 实现上它是一个独立的子窗口（kHelpClass），而不是「隐藏所有控件 + 在父窗口上
+// 画」—— 后者要来回切换二十来个控件窗口的显示状态，容易在焦点与重绘上留下
+// 边角问题；独立窗口还能天然盖住所有兄弟控件（创建顺序最后 = z 序最上）。
+//------------------------------------------------------------------------------
+void WinView::toggleHelp ()
+{
+    m_helpVisible = !m_helpVisible;
+    if (!m_help)
+        return;
+
+    if (m_helpVisible)
+    {
+        // 显式抬到 z 序最上层再显示：DPI 变化时窗口会被重排，不能只靠创建顺序。
+        ::SetWindowPos (m_help, HWND_TOP, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        ::ShowWindow (m_help, SW_SHOW);
+        ::InvalidateRect (m_help, nullptr, TRUE);
+    }
+    else
+    {
+        ::ShowWindow (m_help, SW_HIDE);
+    }
+}
+
+void WinView::hideHelp ()
+{
+    if (!m_helpVisible)
+        return;
+    m_helpVisible = false;
+    if (m_help)
+        ::ShowWindow (m_help, SW_HIDE);
+}
+
+void WinView::paintHelp (HDC dc)
+{
+    // 行首 "#" = 小标题；其余为正文。文案与 macOS / Linux 端保持一致。
+    static const wchar_t* kGuide[] = {
+        L"#1  载入：点「打开音频」，或把文件拖进窗口。",
+        L"     支持 MP3 / WAV / M4A / AAC / FLAC / OGG",
+        L"",
+        L"#2  对齐：绿线「谱面」=乐谱播到哪，",
+        L"     红线「音频」=音频播到哪。两线重合即对齐。",
+        L"     不重合就按住 Ctrl/Alt 在波形上左右拖动网格，",
+        L"     拖到两线贴合为止。偏移值见「偏移」一栏。",
+        L"",
+        L"#3  播放：在乐谱里按空格，插件自动跟着出声。",
+        L"     插件不能反向控制宿主，播放/暂停请用宿主。",
+        L"",
+        L"#4  视图：滚轮/拖动=平移　Ctrl/Alt+滚轮=缩放",
+        L"     双击波形=全览；视野会自动跟着播放头走。",
+        L"",
+        L"#5  速度：默认自动跟随乐谱；乐谱没给速度时",
+        L"     手填 BPM 与拍号，网格小节线才对得上。",
+        L"",
+        L"#6  乱了：点「回到播放头」跳回播放位置并对齐。",
+    };
+    const int n = static_cast<int> (sizeof (kGuide) / sizeof (kGuide[0]));
+
+    RECT full = { 0, 0, px (kPanelW), px (kPanelH) };
+    HBRUSH bg = ::CreateSolidBrush (RGB (23, 25, 33));
+    ::FillRect (dc, &full, bg);
+    ::DeleteObject (bg);
+
+    ::SetBkMode (dc, TRANSPARENT);
+
+    // 标题行
+    ::SelectObject (dc, m_font);
+    ::SetTextColor (dc, RGB (140, 217, 140));
+    ::TextOutW (dc, px (12), px (8), L"使用指南", 4);
+
+    ::SelectObject (dc, m_fontSmall);
+    ::SetTextColor (dc, RGB (133, 133, 133));
+    ::TextOutW (dc, px (62), px (10), L"（点任意处关闭）", 8);
+
+    RECT sep = { px (12), px (26), px (kPanelW - 12), px (27) };
+    HBRUSH sp = ::CreateSolidBrush (RGB (77, 77, 77));
+    ::FillRect (dc, &sep, sp);
+    ::DeleteObject (sp);
+
+    const int lh = px (15);
+    int y = px (34);
+
+    for (int i = 0; i < n; ++i)
+    {
+        const wchar_t* line = kGuide[i];
+        if (line[0] != L'\0')
+        {
+            const bool head = (line[0] == L'#');
+            ::SelectObject (dc, head ? m_font : m_fontSmall);
+            ::SetTextColor (dc, head ? RGB (140, 217, 140) : RGB (224, 224, 232));
+            const wchar_t* text = head ? line + 1 : line;
+            ::TextOutW (dc, px (12), y, text, static_cast<int> (std::wcslen (text)));
+        }
+        y += lh;
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -806,7 +1000,7 @@ void WinView::onMouseDown (int x, int y, int mods)
     m_dragStartVal = m_dragOffset ? m_backend->offsetSec () : m_viewStart;
 
     // 不再有「点击 / 拖动 = 定位播放头」：音频位置完全由宿主驱动，
-    // 手动把它拽走只会和谱面播放头分家，还得再点一次「回到谱面」才能恢复。
+    // 手动把它拽走只会和谱面播放头分家，还得再点一次「回到播放头」才能恢复。
 
     refreshLabels ();
     ::InvalidateRect (m_wave, nullptr, FALSE);
@@ -900,6 +1094,20 @@ void WinView::clampView ()
         m_viewStart = 0.0;
     if (dur > 0.0 && m_viewStart > dur)
         m_viewStart = dur;
+}
+
+// 把视野挪到 sec 处 —— 播放头落在画面 25% 的位置（与 macOS 端同一套规则）。
+// 「回到播放头」除了重新对齐，还要把画面也带回去：只对齐不挪视野，用户会看到
+// 「显示已对齐，但画面里什么都没有」，比不对齐还困惑。
+void WinView::centerViewOn (double sec)
+{
+    const double dur = m_backend ? m_backend->durationSec () : 0.0;
+    if (m_viewSpan <= 0.0)
+        return;
+    if (dur > 0.0 && m_viewSpan >= dur)
+        return;                 // 全览：整段都在画面里，无需滚动
+    m_viewStart = sec - m_viewSpan * 0.25;
+    clampView ();
 }
 
 void WinView::onTimer ()
@@ -1056,14 +1264,25 @@ void WinView::onCommand (int id, int notify)
             ::InvalidateRect (m_wave, nullptr, FALSE);
             break;
         case IDC_BACK_TO_SCORE:
-            if (m_backend)
+            if (m_backend && m_backend->hasAudio ())
             {
                 const PlugView::Backend::HostTimeline tl = m_backend->hostTimeline ();
                 if (tl.playheadValid)
-                    m_backend->seekTo (tl.playheadSec);
-                refreshLabels ();
-                ::InvalidateRect (m_wave, nullptr, FALSE);
+                {
+                    // ⚠ 必须带上起始偏移：谱面 0 秒 = 音频 offset 秒。
+                    //   旧代码写的是 seekTo (tl.playheadSec)，漏了这个偏移 ——
+                    //   点一次就把两条播放头按偏移量错开，恰好和这个按钮
+                    //   「修复分家」的职责相反。（macOS 端一直是带偏移的。）
+                    const double target = tl.playheadSec + m_backend->offsetSec ();
+                    m_backend->seekTo (target);
+                    centerViewOn (target);      // 视野也回到播放位置
+                }
             }
+            refreshLabels ();
+            ::InvalidateRect (m_wave, nullptr, FALSE);
+            break;
+        case IDC_HELP:
+            toggleHelp ();
             break;
         case IDC_GRID_CHECK:
             m_showGrid = (::SendMessageW (m_gridCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -1157,6 +1376,40 @@ LRESULT CALLBACK waveProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case WM_ERASEBKGND:
             return 1;
+        default:
+            break;
+    }
+    return ::DefWindowProcW (hwnd, msg, wp, lp);
+}
+
+// 使用指南覆盖层窗口过程：内容全自绘，点击任意处关闭。
+LRESULT CALLBACK helpProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WinView* v = viewOf (hwnd);
+
+    switch (msg)
+    {
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC dc = ::BeginPaint (hwnd, &ps);
+            if (v)
+                v->paintHelp (dc);
+            ::EndPaint (hwnd, &ps);
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_MBUTTONDOWN:
+            // 点任意处关闭 —— 指南没有任何可交互元素，任何点击都应当只是「知道了」。
+            if (v)
+                v->hideHelp ();
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;      // 背景由 WM_PAINT 整块填，避免闪烁
+        case WM_SETCURSOR:
+            ::SetCursor (::LoadCursorW (nullptr, IDC_ARROW));
+            return TRUE;
         default:
             break;
     }

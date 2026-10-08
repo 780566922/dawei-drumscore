@@ -7,7 +7,7 @@
 //   │  ┌──────────────────────────────────────┐  │
 //   │  │  波形 + 小节网格 + 播放头              │  │
 //   │  └──────────────────────────────────────┘  │
-//   │  0:00 / 3:45  [缩小][放大][全览][回到谱面] 网格 小节号 │
+//   │  0:00 / 3:45 [缩小][放大][全览][回到播放头] 网格 小节号│
 //   │  起始偏移        （改偏移靠波形上 ⌘/⌥ 拖动） │
 //   │  速度 [120] ▲▼  拍号 [4/4▾]  速度来源…      │
 //   │  音量 [───────●───────]          80 %      │
@@ -26,8 +26,18 @@
 //
 // 注：旧版的「点击 / 拖动 = 定位音频播放头」已移除。
 //     音频位置完全由宿主驱动（谱面位置 + 偏移），手动把它拽走只会让红绿两条
-//     播放头分家，用户还得再点一次「回到谱面」才能恢复 —— 纯误操作来源。
+//     播放头分家，用户还得再点一次按钮才能恢复 —— 纯误操作来源。
 //     去掉之后，红线就只是一条只读的「音频实际播到哪」指示。
+//
+// 「回到播放头」（原名「回到谱面」）与「分家检测」：
+//   手动定位这条误操作路径堵上了，但万一有未知 bug 让音频线程跟随失效，
+//   两条线依然会悄悄分家，而用户盯着两条线是看不出来的。所以补两道保险：
+//     · 波形区右上角的错位徽标 —— 播放中两者差值超过阈值就亮出来；
+//     · 「回到播放头」一键修复 —— seek 回谱面位置（+偏移）并把视野也带过去。
+//
+// 「帮助」按钮：
+//   面板只有 640x384，完整操作说明塞不进常驻布局，所以做成覆盖层，
+//   点一下铺满整个面板、点任意处关闭（见 HelpOverlayView）。
 //==============================================================================
 #include "gui.h"
 
@@ -41,6 +51,15 @@
 #include <cstring>
 
 using namespace Steinberg;
+
+//------------------------------------------------------------------------------
+// 分家检测阈值（秒）
+//
+// 正常播放时「音频实际播到哪」与「谱面位置 + 偏移」只差一个音频缓冲的量级
+// （几十毫秒）。超过这个值就说明跟随出了问题，波形区右上角会亮出错位徽标。
+// 取值兼顾两头：太小会被缓冲抖动误报，太大则漏掉真正的分家。
+//------------------------------------------------------------------------------
+static const double kDivergenceWarnSec = 0.25;
 
 // ObjC++ 的 ivar 只能是指针/标量，C++ 容器要包在结构体里再放指针
 struct WaveState
@@ -85,6 +104,7 @@ struct WaveState
 };
 
 @class WaveformView;
+@class HelpOverlayView;   // 定义在文件后半段（用覆盖层做使用指南，见 HelpOverlayView）
 
 // 波形视图 → 面板的回调（面板是父视图，生命期必比子视图长）
 @protocol WavePanel <NSObject>
@@ -108,6 +128,7 @@ struct PanelState
     NSButton* gridCheck = nil;
     NSButton* numCheck = nil;
     NSButton* playBtn = nil;
+    HelpOverlayView* helpOverlay = nil;   ///< 覆盖整块面板的使用指南（默认隐藏）
     NSTimer* timer = nil;
     bool timelineLogged = false;     ///< 宿主时间轴信息只记一次日志
     bool beatsUserSet = false;       ///< 用户手动改过拍号后就不再自动跟随乐谱
@@ -228,6 +249,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)zoomToSpan:(double)spanSec fromStart:(double)startSec;
 - (void)followPlayheadTo:(double)audioSec;
 - (void)recoverAutoFollow;     ///< 用户停止手动操作超时后，自动恢复跟随
+- (void)centerOn:(double)audioSec;   ///< 把视野挪到 audioSec（用于「回到播放头」）
 - (void)stopDrag;
 - (double)viewStartSec;        ///< 当前视野起点（秒），只读 —— 自测与状态展示用
 @end
@@ -290,6 +312,25 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     _st->viewStart = 0.0;
     _st->viewLen = (dur > 0.0) ? dur : 0.0;
     [self refreshPeaks];
+}
+
+// 把视野挪到 audioSec 处（播放头落在画面 25% 的位置，与自动跟随同一套规则）。
+//
+// 用途是「回到播放头」：用户可能把视野拖到了前面或后面，点一下按钮除了
+// 重新对齐，还要把画面也带回当前播放位置 —— 否则会出现「音频对齐了但看不见」
+// 的困惑。同时复位 userScrolling，让自动跟随重新接管。
+- (void)centerOn:(double)audioSec
+{
+    if (!(_st->viewLen > 0.0))       // 全览状态下整段都在画面里，无需滚动
+    {
+        [self fitAll];
+        return;
+    }
+    _st->viewStart = audioSec - _st->viewLen * 0.25;
+    _st->userScrolling = false;
+    [self clampView];
+    [self refreshPeaks];
+    [self setNeedsDisplay:YES];
 }
 
 // 直接设定视野时长与起点（用于「默认放大到前几小节」）。
@@ -631,6 +672,40 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
                                  NSForegroundColorAttributeName : head };
         [@"音频" drawAtPoint:NSMakePoint (x + 2, NSMinY (r) + 12) withAttributes:attrs];
     }
+
+    // ---- 分家检测徽标 ----
+    // 只在「播放中、且不在首尾过渡区」时判定：
+    //   · 起播的头 0.3 秒音频还在追，差值天然偏大 → 不算；
+    //   · 音频比乐谱短时，尾端必然拉开 → 不算（那不是 bug）。
+    // 命中就亮一个红底徽标，把「用户根本看不出来的分家」变成一句明确指令。
+    {
+        const double durW  = _st->backend->durationSec ();
+        const bool   midW  = (pos > 0.30 && pos < durW - 0.30);
+        if (tl.playing && tl.playheadValid && durW > 0.60 && midW)
+        {
+            const double diff = pos - (tl.playheadSec + off);
+            if (std::fabs (diff) > kDivergenceWarnSec)
+            {
+                NSString* warn = [NSString stringWithFormat:
+                                  @"⚠ 与谱面错位 %.2f 秒 · 点「回到播放头」",
+                                  std::fabs (diff)];
+                NSDictionary* wa = @{ NSFontAttributeName : [NSFont systemFontOfSize:10],
+                                      NSForegroundColorAttributeName :
+                                          [NSColor colorWithCalibratedWhite:1.0 alpha:1.0] };
+                const NSSize ws = [warn sizeWithAttributes:wa];
+                const NSRect box = NSMakeRect (NSMaxX (r) - ws.width - 18,
+                                               NSMinY (r) + 3,
+                                               ws.width + 14,
+                                               ws.height + 5);
+                NSBezierPath* bp = [NSBezierPath bezierPathWithRoundedRect:box
+                                                                   xRadius:4 yRadius:4];
+                [[NSColor colorWithCalibratedRed:0.82 green:0.26 blue:0.20 alpha:0.92] setFill];
+                [bp fill];
+                [warn drawAtPoint:NSMakePoint (box.origin.x + 7, box.origin.y + 2.5)
+                   withAttributes:wa];
+            }
+        }
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -844,6 +919,96 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 @end
 
 //------------------------------------------------------------------------------
+// 使用指南覆盖层
+//
+// 面板只有 640x384，完整的操作说明塞不进常驻布局（挤掉的会是波形区）。
+// 所以做成「帮助」按钮唤出的覆盖层：铺满整个面板、点任意处关闭，
+// 既不影响常态布局，也保证第一次用的人一定能找到说明书。
+//
+// 实现要点：它必须作为 GUIView 的【最后一个子视图】加入，这样在子视图顺序上
+// 位于所有控件之上；再把 frame 设成父视图 bounds，就能盖住整块面板并在命中
+// 测试里优先接住点击（下面的控件因此不会被误触）。
+//------------------------------------------------------------------------------
+@interface HelpOverlayView : NSView
+@end
+
+@implementation HelpOverlayView
+
+- (BOOL)isOpaque { return YES; }        // 铺满整块面板，可以声明不透明
+- (BOOL)isFlipped { return YES; }       // 与父视图一致：y 轴向下
+
+// 窗口不是 key window 时，第一次点击默认只用于激活窗口。这里要求接住它，
+// 否则「点一下关掉指南」会出现点了没反应、要点第二次的情况。
+- (BOOL)acceptsFirstMouse:(NSEvent*)e { (void) e; return YES; }
+
+- (void)mouseDown:(NSEvent*)e       { (void) e; self.hidden = YES; }
+- (void)rightMouseDown:(NSEvent*)e  { (void) e; self.hidden = YES; }
+
+- (void)drawRect:(NSRect)dirty
+{
+    (void) dirty;
+    const NSRect r = [self bounds];
+
+    [[NSColor colorWithCalibratedRed:0.09 green:0.10 blue:0.13 alpha:1.0] setFill];
+    NSRectFill (r);
+
+    NSColor* accent = [NSColor colorWithCalibratedRed:0.55 green:0.85 blue:0.55 alpha:1.0];
+    NSDictionary* hAttrs = @{ NSFontAttributeName : [NSFont boldSystemFontOfSize:13],
+                              NSForegroundColorAttributeName : accent };
+    NSDictionary* bAttrs = @{ NSFontAttributeName : [NSFont systemFontOfSize:12],
+                              NSForegroundColorAttributeName :
+                                  [NSColor colorWithCalibratedWhite:0.88 alpha:1.0] };
+    NSDictionary* dAttrs = @{ NSFontAttributeName : [NSFont systemFontOfSize:11],
+                              NSForegroundColorAttributeName :
+                                  [NSColor colorWithCalibratedWhite:0.52 alpha:1.0] };
+
+    [@"使用指南" drawAtPoint:NSMakePoint (26, 10) withAttributes:hAttrs];
+    [@"（点任意处关闭）" drawAtPoint:NSMakePoint (100, 14) withAttributes:dAttrs];
+
+    [[NSColor colorWithCalibratedWhite:0.30 alpha:1.0] setFill];
+    NSRectFill (NSMakeRect (26, 32, NSWidth (r) - 52, 1));
+
+    // 行首 "#" = 小标题（去掉井号后画）；其余为正文，统一缩进两格。
+    NSArray<NSString*>* guide = @[
+        @"#1  载入：点「打开音频」，或把文件拖进窗口。",
+        @"     支持 MP3 / WAV / M4A / AAC / FLAC / OGG",
+        @"",
+        @"#2  对齐：绿线「谱面」=乐谱播到哪，",
+        @"     红线「音频」=音频播到哪。两线重合即对齐。",
+        @"     不重合就按住 ⌘/⌥ 在波形上左右拖动网格，",
+        @"     拖到两线贴合为止。偏移值见「偏移」一栏。",
+        @"",
+        @"#3  播放：在乐谱里按空格，插件自动跟着出声。",
+        @"     插件不能反向控制宿主，播放/暂停请用宿主。",
+        @"",
+        @"#4  视图：滚轮/拖动=平移　⌘/⌥+滚轮=缩放",
+        @"     双击波形=全览；视野会自动跟着播放头走。",
+        @"",
+        @"#5  速度：默认自动跟随乐谱；乐谱没给速度时",
+        @"     手填 BPM 与拍号，网格小节线才对得上。",
+        @"",
+        @"#6  乱了：点「回到播放头」跳回播放位置并对齐。",
+    ];
+
+    CGFloat y = 42.0;
+    const CGFloat lh = 17.0;
+    for (NSString* line in guide)
+    {
+        if (line.length > 0)
+        {
+            if ([line hasPrefix:@"#"])
+                [[line substringFromIndex:1] drawAtPoint:NSMakePoint (26, y)
+                                          withAttributes:hAttrs];
+            else
+                [line drawAtPoint:NSMakePoint (26, y) withAttributes:bAttrs];
+        }
+        y += lh;
+    }
+}
+
+@end
+
+//------------------------------------------------------------------------------
 // 主面板
 //------------------------------------------------------------------------------
 @interface GUIView : NSView <NSTextFieldDelegate>
@@ -868,7 +1033,8 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)zoomIn:(id)s;
 - (void)zoomOut:(id)s;
 - (void)zoomFit:(id)s;
-- (void)backToScore:(id)s;
+- (void)backToPlayhead:(id)s;
+- (void)helpToggle:(id)s;
 - (void)openFile:(id)s;
 - (void)loadPath:(NSString*)path;
 - (BOOL)hasAudioURL:(id<NSDraggingInfo>)sender;
@@ -898,6 +1064,14 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         NSButton* open = [self button:@"打开音频…" action:@selector (openFile:)];
         open.frame = NSMakeRect (530, 5, 96, 24);
 
+        // 「帮助」：唤出使用指南覆盖层。
+        // 有用户反馈「不知道怎么用」——说明书不能只躺在 README / 安装包里，
+        // 得让它在这块面板上直接点得到，否则第一次打开的人只能靠猜。
+        NSButton* help = [self button:@"？帮助" action:@selector (helpToggle:)];
+        help.frame = NSMakeRect (452, 5, 72, 24);
+        help.font = [NSFont systemFontOfSize:11];
+        help.toolTip = @"使用指南：怎么对齐、怎么播放、快捷键一览";
+
         // ---- 波形 + 小节网格 ----
         _st->wave = [[WaveformView alloc] initWithBackend:safeBackend (b)];
         _st->wave.frame = NSMakeRect (14, 38, 612, 118);
@@ -923,14 +1097,17 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         zFit.font = [NSFont systemFontOfSize:11];
         zFit.toolTip = @"缩放到整段音频";
 
-        // 「回到谱面」：音频播放头 seek 回宿主当前谱面位置（+偏移）。
-        // 自从取消了「点击/拖动定位播放头」，正常操作下不会再和谱面分家；
-        // 这个按钮退化成安全阀 —— 万一宿主推位置异常、或音频线程跟随卡住，
-        // 点一下即可强制重新同步。
-        NSButton* backToScore = [self button:@"回到谱面" action:@selector (backToScore:)];
-        backToScore.frame = NSMakeRect (314, 157, 82, 20);
-        backToScore.font = [NSFont systemFontOfSize:11];
-        backToScore.toolTip = @"把音频播放头跳回宿主谱面当前播放的位置（谱面位置 + 偏移）";
+        // 「回到播放头」（原名「回到谱面」）—— 一键重新同步，并把视野也带回去。
+        //
+        // 改名理由：旧名字说的是「跳回谱面的位置」，但用户真正想干的是
+        // 「我现在看不见播放头了，把我送回去」。新名字直说结果，不用理解概念。
+        // 除了 seek 对齐，还会把波形视野挪到播放位置 —— 光对齐不挪视野，
+        // 用户会看到「对齐了但画面上什么都没有」，比不对齐还困惑。
+        NSButton* backToPlayhead = [self button:@"回到播放头" action:@selector (backToPlayhead:)];
+        backToPlayhead.frame = NSMakeRect (314, 157, 86, 20);
+        backToPlayhead.font = [NSFont systemFontOfSize:11];
+        backToPlayhead.toolTip = @"把音频跳回谱面当前位置（+偏移）重新对齐，\n"
+                                  @"并把波形视野带回播放位置";
 
         _st->gridCheck = [NSButton checkboxWithTitle:@"网格" target:self action:@selector (gridToggled:)];
         _st->gridCheck.frame = NSMakeRect (406, 160, 50, 16);
@@ -1040,6 +1217,12 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 
         // ---- 接受拖放 ----
         [self registerForDraggedTypes:@[ NSPasteboardTypeFileURL ]];
+
+        // ---- 使用指南覆盖层（必须最后 addSubview：子视图顺序 = 从前到后，最后加的在最上层）----
+        _st->helpOverlay = [[HelpOverlayView alloc] initWithFrame:self.bounds];
+        _st->helpOverlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        _st->helpOverlay.hidden = YES;
+        [self addSubview:_st->helpOverlay];
 
         // ---- 定时刷新播放头 ----
         _st->timer = [NSTimer scheduledTimerWithTimeInterval:0.05
@@ -1244,26 +1427,57 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     [_st->wave fitAll];
 }
 
-// 一键把音频播放头 seek 回宿主当前谱面位置（谱面位置 + 偏移）。
-// 用于用户手滑拖动波形定位后，快速重新和谱面对齐。
-- (void)backToScore:(id)s
+// 「回到播放头」：一键重新同步 + 把视野带回播放位置。
+//
+// 它是「分家」的最终保险：正常操作下音频位置由宿主驱动（谱面位置 + 偏移），
+// 不该分家；但万一有未知 bug 让跟随失效，用户很难自己看出来（两条线贴不贴
+// 全靠肉眼）。点一下这个按钮 = 强制把音频对齐到谱面，并把画面也送回去。
+//
+// 视野定位直接用算出来的目标位置，不需要等 seek 生效：seekTo 是给音频线程
+// 投递目标，位置会在下一块输出时到位，而下一帧画面就是按目标位置画的。
+- (void)backToPlayhead:(id)s
 {
-    const ap::PlugView::Backend::HostTimeline tl = _st->backend->hostTimeline ();
-    if (!tl.playheadValid)
+    if (!_st->backend->hasAudio ())
     {
-        _st->statusLabel.stringValue = @"宿主未提供谱面位置，无法回到谱面";
+        _st->statusLabel.stringValue = @"还没载入音频 —— 点右上「打开音频」或把文件拖进来";
         [_st->statusLabel setTextColor:[NSColor colorWithCalibratedWhite:0.6 alpha:1.0]];
         return;
     }
+
+    const ap::PlugView::Backend::HostTimeline tl = _st->backend->hostTimeline ();
+    if (!tl.playheadValid)
+    {
+        _st->statusLabel.stringValue = @"宿主没有提供谱面位置，无法回到播放头（可直接用滚轮平移）";
+        [_st->statusLabel setTextColor:[NSColor colorWithCalibratedWhite:0.6 alpha:1.0]];
+        return;
+    }
+
     const double audioPos = tl.playheadSec + _st->backend->offsetSec ();
-    _st->backend->seekTo (audioPos);
+    _st->backend->seekTo (audioPos);        // ① 重新对齐
+    [_st->wave centerOn:audioPos];          // ② 视野跟着回到播放位置
+
     _st->statusLabel.stringValue =
-        [NSString stringWithFormat:@"已回到谱面：音频 seek 到 %.2f 秒", audioPos];
+        [NSString stringWithFormat:@"已回到播放头 %.2f 秒（音频已重新对齐谱面）", audioPos];
     [_st->statusLabel setTextColor:[NSColor colorWithCalibratedRed:0.55
                                                          green:0.85
                                                           blue:0.55
                                                          alpha:1.0]];
     [_st->wave setNeedsDisplay:YES];
+}
+
+// 「帮助」：显示/隐藏使用指南覆盖层。
+// 覆盖层盖住整块面板，任意点击都会把它关掉（见 HelpOverlayView）。
+- (void)helpToggle:(id)s
+{
+    _st->helpOverlay.hidden = !_st->helpOverlay.hidden;
+
+    // 重新置顶：子视图顺序可能被后续操作打乱，这里显式抬到最上层，
+    // 保证它一定盖住所有控件。
+    if (!_st->helpOverlay.hidden)
+    {
+        [self addSubview:_st->helpOverlay positioned:NSWindowAbove relativeTo:nil];
+        [_st->helpOverlay setNeedsDisplay:YES];
+    }
 }
 
 - (void)volChanged:(id)s

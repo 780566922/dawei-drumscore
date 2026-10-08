@@ -23,6 +23,7 @@
 #import <AppKit/AppKit.h>
 #import <objc/message.h>
 
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -366,7 +367,7 @@ int main (int argc, char** argv)
 
         // 偏移改由「波形上 ⌘/⌥拖动」操作，偏移滑块/微调按钮已删除。
         // 循环按钮已删除（「跟谱面走」模式下无实际作用）。
-        // 现在：1 个音量滑块，6 个按钮（打开/－/＋/全览/回到谱面/播放），
+        // 现在：1 个音量滑块，7 个按钮（打开/？帮助/－/＋/全览/回到播放头/播放），
         // 1 个 BPM 步进器（恢复手动 BPM，拍号 N/M）。
         if (sliders < 1)   { std::printf ("[复现] ✗ 滑块缺失\n");   rc = 6; }
         if (buttons < 6)   { std::printf ("[复现] ✗ 按钮数量不足\n"); rc = 7; }
@@ -469,6 +470,61 @@ int main (int argc, char** argv)
 
             // 恢复全览：紧接着的「⌥ 拖动网格」测试按 60px 位移断言偏移变化量，
             // 视野缩放级别一变那个量就不成立（实测被压到 0.098 秒 < 0.2 秒）。
+            if ([wave respondsToSelector:selFit])
+                ((void (*) (id, SEL)) objc_msgSend) (wave, selFit);
+        }
+
+        // ---- 「回到播放头」：seek 必须带上偏移，且视野要跟过去 ----
+        // 回归防线：Windows / Linux 端曾经写成 seekTo(playheadSec)，漏掉起始偏移 ——
+        // 点一次反而把两条播放头按偏移量错开，和这个按钮「修复分家」的职责完全相反。
+        // 这里同时锁住两件事：① 位置算对（原文里带偏移）；② 视野真的被带回播放位置。
+        @autoreleasepool
+        {
+            backend.fakeTimeline = true;     // 让宿主提供谱面播放头
+            backend.setOffsetSec (1.5f);     // 故意给个非零偏移，才能验出「漏加偏移」
+
+            SEL selViewStart = NSSelectorFromString (@"viewStartSec");
+            SEL selFit       = NSSelectorFromString (@"fitAll");
+
+            ((void (*) (id, SEL)) objc_msgSend) (wave, selFit);
+            // 放大到 8 倍：全览时整段都在画面里，视野无需移动，测不出「跳回去」。
+            ((void (*) (id, SEL, double, CGFloat)) objc_msgSend)
+                (wave, NSSelectorFromString (@"zoomBy:aroundX:"), 8.0, (CGFloat) 0.0);
+
+            const double startBefore = ((double (*) (id, SEL)) objc_msgSend) (wave, selViewStart);
+            const int    seeksBefore = backend.seekCalls;
+
+            step ("点「回到播放头」（应 seek 到 谱面位置+偏移，并把视野跳过去）");
+            ((void (*) (id, SEL, id)) objc_msgSend)
+                (guiView, NSSelectorFromString (@"backToPlayhead:"), nil);
+
+            const double startAfter = ((double (*) (id, SEL)) objc_msgSend) (wave, selViewStart);
+            const double posAfter   = backend.positionSec ();
+            const double want       = backend.hostTimeline ().playheadSec + backend.offsetSec ();
+
+            std::printf ("  · seekTo 调用 %d → %d；音频位置 %.4f 秒（期望 %.4f）；"
+                         "视野起点 %.4f → %.4f\n",
+                         seeksBefore, backend.seekCalls, posAfter, want,
+                         startBefore, startAfter);
+
+            if (backend.seekCalls <= seeksBefore)
+            {
+                std::printf ("[复现] ✗ 「回到播放头」没有重新对齐（根本没调用 seekTo）\n");
+                rc = 20;
+            }
+            else if (std::fabs (posAfter - want) > 0.01)
+            {
+                std::printf ("[复现] ✗ 「回到播放头」seek 目标漏了起始偏移\n");
+                rc = 21;
+            }
+            else if (std::fabs (startAfter - startBefore) < 1e-6)
+            {
+                std::printf ("[复现] ✗ 「回到播放头」没有把视野带回播放位置\n");
+                rc = 22;
+            }
+
+            // 复位，避免影响后续「⌥ 拖动网格」的前置条件
+            backend.setOffsetSec (0.0f);
             if ([wave respondsToSelector:selFit])
                 ((void (*) (id, SEL)) objc_msgSend) (wave, selFit);
         }

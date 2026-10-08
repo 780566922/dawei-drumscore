@@ -6,7 +6,7 @@
 //   - 波形预览 + 可拖动播放头
 //   - 带符号起始偏移（在波形上按住 Ctrl / Alt 拖动）
 //   - 小节网格（BPM + 拍号）
-//   - 音量、缩放、全览、回到谱面
+//   - 音量、缩放、全览、回到播放头、使用指南
 //   - 拖入音频文件 / 点按钮选文件
 //
 // 为什么不用 GTK / VSTGUI：
@@ -94,6 +94,7 @@ struct Rect
 };
 
 const Rect rOpenBtn  = { 240,   6,  90, 24 };
+const Rect rHelpBtn  = { 172,   6,  62, 24 };   ///< 「？帮助」：唤出使用指南覆盖层
 const Rect rTime     = {  10, 158,  92, 18 };
 const Rect rZoomOut  = { 104, 155,  38, 22 };
 const Rect rZoomIn   = { 144, 155,  38, 22 };
@@ -114,6 +115,16 @@ const Rect rFile     = {  10, 280, 320, 18 };
 const Rect rStatus   = {  10, 300, 130, 18 };
 const Rect rFmt      = { 140, 300, 190, 18 };
 const Rect rBrand    = {  10, 358, 320, 18 };
+
+//------------------------------------------------------------------------------
+// 分家检测阈值（秒）
+//
+// 正常播放时「音频实际播到哪」与「谱面位置 + 偏移」只差一个音频缓冲的量级
+// （几十毫秒）。超过这个值就认为跟随出了问题，波形区右上角会亮出红色错位徽标，
+// 提示用户点「回到播放头」一键修复。
+// 与 macOS / Windows 端取同一个值，别各写各的。
+//------------------------------------------------------------------------------
+const double kDivergenceWarnSec = 0.25;
 
 // 拍号选项（与 macOS / Windows 端一致）
 struct TimeSig { const char* label; int beats; int denom; };
@@ -218,6 +229,7 @@ private:
     void drawWaveArea (XftDraw* xd);
     void drawControls (XftDraw* xd);
     void drawBrowser (XftDraw* xd);
+    void drawHelp (XftDraw* xd);
 
     void fillRect (Drawable d, const Rect& r, unsigned long pixel);
     void frameRect (Drawable d, const Rect& r, unsigned long pixel);
@@ -242,6 +254,10 @@ private:
     void actionFor (int id);
     void zoomBy (double factor, double centerSec);
     void zoomFit ();
+    /// 把视野挪到 sec（播放头落在画面 25% 处）。用于「回到播放头」。
+    void centerViewOn (double sec);
+    /// 显示/隐藏使用指南覆盖层。
+    void toggleHelp ();
     void clampView ();
     void afterLoad ();
     void refreshCache ();
@@ -293,6 +309,10 @@ private:
     bool m_showGrid = true;
     bool m_showNumbers = true;
     int  m_timeSigIndex = 0;
+
+    /// 使用指南覆盖层是否可见。Linux 端整个界面都画在离屏 pixmap 上，
+    /// 所以直接在最上层再画一遍就行，不需要 Windows 那种独立子窗口。
+    bool m_helpVisible = false;
 
     int  m_hotId = 0;           ///< 鼠标悬停控件
     int  m_pressedId = 0;       ///< 按下的控件
@@ -346,7 +366,7 @@ private:
     enum
     {
         ID_NONE = 0,
-        ID_OPEN, ID_ZOOM_OUT, ID_ZOOM_IN, ID_ZOOM_FIT, ID_BACK,
+        ID_OPEN, ID_ZOOM_OUT, ID_ZOOM_IN, ID_ZOOM_FIT, ID_BACK, ID_HELP,
         ID_GRID, ID_NUM, ID_BPM_BOX, ID_BPM_UP, ID_BPM_DOWN,
         ID_TIMESIG, ID_VOLUME,
         ID_BROWSER_UP, ID_BROWSER_CANCEL, ID_BROWSER_ITEM
@@ -805,6 +825,10 @@ void X11View::paint ()
         drawControls (m_xftDraw);
     }
 
+    // 使用指南画在最上层：整个界面都在离屏 pixmap 上，直接再盖一层即可。
+    if (m_helpVisible)
+        drawHelp (m_xftDraw);
+
     ::XCopyArea (m_dpy, m_pixmap, m_win, m_gc, 0, 0,
                  static_cast<unsigned> (m_w), static_cast<unsigned> (m_h), 0, 0);
     ::XFlush (m_dpy);
@@ -941,19 +965,60 @@ void X11View::drawWaveArea (XftDraw* xd)
             fillRect (m_pixmap, sh, px (COffsetSh));
         }
     }
+
+    // ---- 分家检测徽标 ----
+    // 只在「播放中、且不在首尾过渡区」判定：
+    //   · 起播头 0.3 秒音频还在追，差值天然偏大 → 不算；
+    //   · 音频比乐谱短时尾端必然拉开 → 不算（那不是 bug）。
+    // 命中就亮一个红底徽标，把「用户肉眼看不出来的分家」变成一句明确指令。
+    {
+        const bool mid = (m_posSec > 0.30 && m_durSec > 0.60 && m_posSec < m_durSec - 0.30);
+        if (m_tl.playing && m_tl.playheadValid && mid)
+        {
+            const double diff = m_posSec - (m_tl.playheadSec + offset);
+            if (std::fabs (diff) > kDivergenceWarnSec)
+            {
+                char warn[128];
+                std::snprintf (warn, sizeof warn, "与谱面错位 %.2f 秒 · 点「回到播放头」",
+                               std::fabs (diff));
+
+                XGlyphInfo ext {};
+                ::XftTextExtentsUtf8 (m_dpy, m_fontSmall,
+                                      reinterpret_cast<const FcChar8*> (warn),
+                                      static_cast<int> (std::strlen (warn)), &ext);
+
+                const int th = m_fontSmall->ascent + m_fontSmall->descent;
+                const int bw = ext.xOff + 10;
+                const int bh = th + 6;
+                int bx = kWaveX + kWaveW - bw - 4;
+                if (bx < kWaveX + 2)
+                    bx = kWaveX + 2;
+
+                const Rect box { bx, kWaveY + 3, bw, bh };
+                fillRect (m_pixmap, box, px (CAudioHead));
+                drawText (xd, box.x + 5, box.y + 3 + m_fontSmall->ascent,
+                          warn, xc (CWhite), m_fontSmall);
+            }
+        }
+    }
 }
 
 //------------------------------------------------------------------------------
 void X11View::drawControls (XftDraw* xd)
 {
     button (xd, rOpenBtn, "打开音频", ID_OPEN);
+    // 「？帮助」：唤出使用指南覆盖层。有用户反馈不知道怎么用，
+    // 说明书必须能在界面上直接点开，不能只躺在安装目录的 readme 里。
+    button (xd, rHelpBtn, "？帮助", ID_HELP);
 
     drawText (xd, rTime.x, rTime.y + 14, m_timeText.c_str (), xc (CText), m_fontSmall);
 
     button (xd, rZoomOut, "缩小", ID_ZOOM_OUT);
     button (xd, rZoomIn,  "放大", ID_ZOOM_IN);
     button (xd, rZoomFit, "全览", ID_ZOOM_FIT);
-    button (xd, rBack,    "回到谱面", ID_BACK);
+    // 原名「回到谱面」→「回到播放头」：用户想干的是「把我送回播放位置」，
+    // 新名字直说结果，不必先理解「谱面」和「音频」的关系。
+    button (xd, rBack,    "回到播放头", ID_BACK);
 
     checkbox (xd, rGridChk, "网格",   m_showGrid,    ID_GRID);
     checkbox (xd, rNumChk,  "小节号", m_showNumbers, ID_NUM);
@@ -1015,10 +1080,90 @@ void X11View::drawControls (XftDraw* xd)
 }
 
 //------------------------------------------------------------------------------
+// 使用指南覆盖层
+//
+// 面板只有 340x384，完整说明书塞不进常驻布局（挤掉的会是波形区）。所以做成
+// 「？帮助」唤出的覆盖层：铺满整块面板、点任意处关闭。
+//
+// 实现比 Windows 端简单：整个界面本来就画在离屏 pixmap 上，所以在 paint() 的
+// 最后再盖一层就行，不需要独立子窗口。
+//
+// 配色跟随本端主题 —— Linux 面板是浅色的（与 macOS / Windows 的深色面板不同），
+// 所以这里用白底深字；照搬另外两端的深底浅字会在浅色面板上格格不入。
+//------------------------------------------------------------------------------
+void X11View::drawHelp (XftDraw* xd)
+{
+    // 行首 "#" = 小标题。文案与 macOS / Windows 端保持一致。
+    static const char* kGuide[] = {
+        "#1  载入：点「打开音频」，或把文件拖进窗口。",
+        "     支持 MP3 / WAV / M4A / AAC / FLAC / OGG",
+        "",
+        "#2  对齐：绿线「谱面」=乐谱播到哪，",
+        "     红线「音频」=音频播到哪。两线重合即对齐。",
+        "     不重合就按住 Ctrl/Alt 在波形上左右拖动网格，",
+        "     拖到两线贴合为止。偏移值见「偏移」一栏。",
+        "",
+        "#3  播放：在乐谱里按空格，插件自动跟着出声。",
+        "     插件不能反向控制宿主，播放/暂停请用宿主。",
+        "",
+        "#4  视图：滚轮/拖动=平移　Ctrl/Alt+滚轮=缩放",
+        "     双击波形=全览；视野会自动跟着播放头走。",
+        "",
+        "#5  速度：默认自动跟随乐谱；乐谱没给速度时",
+        "     手填 BPM 与拍号，网格小节线才对得上。",
+        "",
+        "#6  乱了：点「回到播放头」跳回播放位置并对齐。",
+    };
+    const int n = static_cast<int> (sizeof (kGuide) / sizeof (kGuide[0]));
+
+    // 整块面板铺白，盖住底下所有内容
+    fillRect (m_pixmap, Rect { 0, 0, m_w, m_h }, px (CWhite));
+
+    drawText (xd, 12, 8 + m_font->ascent, "使用指南", xc (CCheckOn), m_font);
+    drawText (xd, 62, 10 + m_fontSmall->ascent, "（点任意处关闭）",
+              xc (CTextDim), m_fontSmall);
+
+    fillRect (m_pixmap, Rect { 12, 26, m_w - 24, 1 }, px (CBtnEdge));
+
+    const int lh = 15;
+    int y = 32;
+    for (int i = 0; i < n; ++i)
+    {
+        const char* line = kGuide[i];
+        if (line[0] != '\0')
+        {
+            const bool head = (line[0] == '#');
+            drawText (xd, 12, y + (head ? m_font->ascent : m_fontSmall->ascent),
+                      head ? line + 1 : line,
+                      head ? xc (CCheckOn) : xc (CText),
+                      head ? m_font : m_fontSmall);
+        }
+        y += lh;
+    }
+}
+
+// 显示/隐藏使用指南。关闭由 onButtonPress 负责（点任意处即关）。
+void X11View::toggleHelp ()
+{
+    m_helpVisible = !m_helpVisible;
+    m_hotId = ID_NONE;      // 关掉悬停高亮，避免残留按钮的「热」态
+    m_dirty = true;
+}
+
+//------------------------------------------------------------------------------
 // 交互
 //------------------------------------------------------------------------------
 void X11View::onButtonPress (int x, int y, unsigned state)
 {
+    // 使用指南铺满整块面板，任何点击都只表示「知道了」。
+    if (m_helpVisible)
+    {
+        m_helpVisible = false;
+        m_pressedId = ID_NONE;
+        m_dirty = true;
+        return;
+    }
+
     if (m_browserOpen)
     {
         browserClick (x, y);
@@ -1037,7 +1182,7 @@ void X11View::onButtonPress (int x, int y, unsigned state)
         // 改偏移时记 offset，平移视野时记 viewStart —— 两者互斥，复用同一个字段。
         m_dragStartVal = m_dragOffset ? m_backend->offsetSec () : m_viewStart;
         // 不再有「点击 / 拖动 = 定位播放头」：音频位置完全由宿主驱动，
-        // 手动把它拽走只会和谱面播放头分家，还得再点一次「回到谱面」才能恢复。
+        // 手动把它拽走只会和谱面播放头分家，还得再点一次「回到播放头」才能恢复。
         m_dirty = true;
         return;
     }
@@ -1056,6 +1201,7 @@ void X11View::onButtonPress (int x, int y, unsigned state)
     // 按钮
     int id = ID_NONE;
     if (rOpenBtn.hit (x, y))     id = ID_OPEN;
+    else if (rHelpBtn.hit (x, y)) id = ID_HELP;
     else if (rZoomOut.hit (x, y)) id = ID_ZOOM_OUT;
     else if (rZoomIn.hit (x, y))  id = ID_ZOOM_IN;
     else if (rZoomFit.hit (x, y)) id = ID_ZOOM_FIT;
@@ -1119,8 +1265,21 @@ void X11View::onMotion (int x, int y, unsigned state)
     }
 
     // hover 高亮
+    // 使用指南挡在上面时不做任何悬停高亮 —— 否则鼠标划过会看到底下的按钮
+    // 隔着说明文字亮起来，像是说明本身就是个按钮。
+    if (m_helpVisible)
+    {
+        if (m_hotId != ID_NONE)
+        {
+            m_hotId = ID_NONE;
+            m_dirty = true;
+        }
+        return;
+    }
+
     int id = ID_NONE;
     if (rOpenBtn.hit (x, y))     id = ID_OPEN;
+    else if (rHelpBtn.hit (x, y)) id = ID_HELP;
     else if (rZoomOut.hit (x, y)) id = ID_ZOOM_OUT;
     else if (rZoomIn.hit (x, y))  id = ID_ZOOM_IN;
     else if (rZoomFit.hit (x, y)) id = ID_ZOOM_FIT;
@@ -1189,8 +1348,19 @@ void X11View::actionFor (int id)
             zoomFit ();
             break;
         case ID_BACK:
-            if (m_backend && m_tl.playheadValid)
-                m_backend->seekTo (m_tl.playheadSec);
+            if (m_backend && m_backend->hasAudio () && m_tl.playheadValid)
+            {
+                // ⚠ 必须带上起始偏移：谱面 0 秒 = 音频 offset 秒。
+                //   旧代码写的是 seekTo (m_tl.playheadSec)，漏了这个偏移 ——
+                //   点一次就把两条播放头按偏移量错开，恰好和这个按钮
+                //   「修复分家」的职责相反。（macOS 端一直是带偏移的。）
+                const double target = m_tl.playheadSec + m_backend->offsetSec ();
+                m_backend->seekTo (target);
+                centerViewOn (target);      // 视野也回到播放位置
+            }
+            break;
+        case ID_HELP:
+            toggleHelp ();
             break;
         case ID_GRID:
             m_showGrid = !m_showGrid;
@@ -1254,6 +1424,20 @@ void X11View::clampView ()
         m_viewStart = 0.0;
     if (dur > 0.0 && m_viewStart > dur)
         m_viewStart = dur;
+}
+
+// 把视野挪到 sec 处 —— 播放头落在画面 25% 的位置（与 macOS / Windows 端同一规则）。
+// 「回到播放头」除了重新对齐，还要把画面也带回去：只对齐不挪视野，用户会看到
+// 「提示已对齐，但画面里什么都没有」，比不对齐还困惑。
+void X11View::centerViewOn (double sec)
+{
+    const double dur = m_backend ? m_backend->durationSec () : 0.0;
+    if (m_viewSpan <= 0.0)
+        return;
+    if (dur > 0.0 && m_viewSpan >= dur)
+        return;                 // 全览：整段都在画面里，无需滚动
+    m_viewStart = sec - m_viewSpan * 0.25;
+    clampView ();
 }
 
 void X11View::afterLoad ()
