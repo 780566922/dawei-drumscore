@@ -14,6 +14,7 @@
 #include "pluginterfaces/base/ibstream.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -27,7 +28,7 @@ using namespace Steinberg::Vst;
 static constexpr uint32 kAPlayDistributable = 1 << 0;
 
 // 插件版本字符串（FULL_VERSION_STR 是 CMake 生成的，这里手写）
-#define APLAY_VERSION_WSTR STR16 ("1.0.1")
+#define APLAY_VERSION_WSTR STR16 ("1.0.2")
 
 namespace aplay {
 
@@ -919,7 +920,7 @@ public:
         strncpy (ci.subCategories, "Instrument", Steinberg::PClassInfo2::kSubCategoriesSize - 1);
         // 厂商名：纯 ASCII。它是插件名上面那一级菜单的分组名，中文会乱码。
         strncpy (ci.vendor, "Dawei DrumScore", Steinberg::PClassInfo2::kVendorSize - 1);
-        strncpy (ci.version, "1.0.1", Steinberg::PClassInfo2::kVersionSize - 1);
+        strncpy (ci.version, "1.0.2", Steinberg::PClassInfo2::kVersionSize - 1);
         strncpy (ci.sdkVersion, kVstVersionString, Steinberg::PClassInfo2::kVersionSize - 1);
         registerClass (&ci, aplay::APlayProcessor::createInstance);
 
@@ -963,7 +964,45 @@ public:
         return Steinberg::kResultOk;
     }
 
+    //--------------------------------------------------------------------------
+    // 引用计数：工厂是进程级常驻单例，计数归零也不销毁
+    //
+    // 【这是被一次真实闪退逼出来的】症状：宿主里「关掉谱子 → 导入另一个工程
+    // → 打开插件」宿主闪退，崩溃栈落在宿主自己的模块加载路径上
+    // （VstModulesRepository::addPluginModule → Module::create）。
+    //
+    // 根因：宿主每次打开插件编辑器都会重读一遍模块元数据，也就是每次都会走
+    // 「GetPluginFactory() + release()」一对。而 SDK 的 CPluginFactory 在计数
+    // 归零时 `delete this`；它的析构只把 **SDK 自己的全局 gPluginFactory**
+    // 置空（见 sdk/public.sdk/source/main/pluginfactory.cpp），管不到我们在
+    // 函数内 static 缓存的指针。实测计数轨迹（见 factory_lifecycle_test.cpp）：
+    //   第 1 次索取：new=1 → 我们 addRef=2 → 宿主 release=1
+    //   第 2 次索取：不补引用仍=1 → 宿主 release=0 → delete this
+    //   第 3 次索取：static 仍非空 → 返回【已释放内存】→ 宿主当场崩溃
+    //
+    // 所以这里把工厂做成常驻单例：计数照常维护（宿主自查时数是对的），
+    // 但归零只钉回 1，绝不 delete。模块级资源本来就该活到进程退出，
+    // 这样无论宿主的引用计数行为多不规范，都不可能再悬垂。
+    //--------------------------------------------------------------------------
+    Steinberg::uint32 PLUGIN_API addRef () override
+    {
+        return m_refCount.fetch_add (1, std::memory_order_relaxed) + 1;
+    }
+
+    Steinberg::uint32 PLUGIN_API release () override
+    {
+        Steinberg::uint32 r = m_refCount.fetch_sub (1, std::memory_order_acq_rel) - 1;
+        if (r == 0)
+        {
+            m_refCount.store (1, std::memory_order_relaxed);   // 常驻，不销毁
+            r = 1;
+        }
+        return r;
+    }
+
 private:
+    std::atomic<Steinberg::uint32> m_refCount { 1 };
+
     static Steinberg::PFactoryInfo factoryInfo ()
     {
         Steinberg::PFactoryInfo fi {};
@@ -1029,12 +1068,15 @@ extern "C"
 
     SMTG_EXPORT_SYMBOL Steinberg::IPluginFactory* PLUGIN_API GetPluginFactory ()
     {
+        // 与 SDK 官方宏 BEGIN_FACTORY_DEF / END_FACTORY 对齐：官方在 else 分支
+        // 补了一次 addRef()，因为宿主【每次】索取工厂都会配对一次 release()。
+        // 我们原先只在首次 addRef，计数会被宿主耗尽 —— 详见 APlayFactory 里
+        // addRef/release 的注释（那次「关谱子换工程再开插件就闪退」的事故）。
         static APlayFactory* gFactory = nullptr;
         if (!gFactory)
-        {
-            gFactory = new APlayFactory ();
-            gFactory->addRef ();
-        }
+            gFactory = new APlayFactory ();   // 构造后引用计数 = 1
+        else
+            gFactory->addRef ();              // 宿主每次索取都配对一次 release
         return static_cast<Steinberg::IPluginFactory*> (gFactory);
     }
 

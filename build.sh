@@ -135,8 +135,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key>                        <string>大伟鼓谱MuseScore音频播放器</string>
     <key>CFBundlePackageType</key>                 <string>BNDL</string>
     <key>CFBundleSignature</key>                   <string>????</string>
-    <key>CFBundleShortVersionString</key>          <string>1.0.1</string>
-    <key>CFBundleVersion</key>                     <string>1.0.1</string>
+    <key>CFBundleShortVersionString</key>          <string>1.0.2</string>
+    <key>CFBundleVersion</key>                     <string>1.0.2</string>
     <key>NSHumanReadableCopyright</key>            <string>Free for personal use</string>
 </dict>
 </plist>
@@ -211,6 +211,8 @@ build_test "$OUT/validate" -std=c++17 -O1 -arch arm64 "$HERE/validate.cpp" \
            -I"$SDK" $SDK_OBJS_ARM64 $FRAMEWORKS
 build_test "$OUT/e2e_test" -std=c++17 -O1 -arch arm64 "$HERE/e2e_test.cpp" \
            -I"$SDK" $SDK_OBJS_ARM64 $FRAMEWORKS
+build_test "$OUT/factory_lifecycle_test" -std=c++17 -O1 -arch arm64 \
+           "$HERE/factory_lifecycle_test.cpp" -I"$SDK" $SDK_OBJS_ARM64 $FRAMEWORKS
 
 echo "==> 验证 1：VST3 接口生命周期"
 if "$OUT/validate" "$BUNDLE/Contents/MacOS/$EXEC_NAME" > "$OUT/validate.log" 2>&1; then
@@ -337,6 +339,20 @@ if "$OUT/test_player" > "$OUT/player.log" 2>&1; then
 else
   echo "  ✗ 播放核心验证失败："
   grep FAIL "$OUT/player.log" | head -8 | sed 's/^/    /'
+  exit 1
+fi
+
+# 工厂引用计数：宿主每次打开插件编辑器都会「索取工厂 → 用 → release」一轮。
+# 曾经只在首次 addRef，计数被宿主耗尽 → CPluginFactory 归零即 delete this
+# → 函数内 static 变野指针 → 第 3 次打开编辑器时宿主闪退。
+# 触发条件很隐蔽（关谱子 → 换工程 → 再开插件），必须由这一项长期守着。
+echo "==> 验证 7：工厂引用计数（反复索取/释放，防宿主闪退）"
+if "$OUT/factory_lifecycle_test" "$BUNDLE/Contents/MacOS/$EXEC_NAME" \
+        > "$OUT/factory.log" 2>&1; then
+  echo "  ✓ 工厂生命周期验证通过（$(grep -c PASS "$OUT/factory.log") 项）"
+else
+  echo "  ✗ 工厂生命周期验证失败（宿主会因此闪退）："
+  grep FAIL "$OUT/factory.log" | head -5 | sed 's/^/    /'
   exit 1
 fi
 
