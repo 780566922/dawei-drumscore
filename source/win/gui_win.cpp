@@ -39,6 +39,11 @@
 // 这里自定义一个不与系统冲突的位，由 modsNow() 用 GetKeyState(VK_MENU) 填充。
 #define AP_MK_ALT 0x8000
 
+// WM_DPICHANGED 在较老的 SDK / _WIN32_WINNT 下没有定义，这里兜一个。
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
 namespace {
 
 const int kPanelW = 340;      ///< 面板宽（与 macOS 版一致）
@@ -132,6 +137,82 @@ int modsNow ()
     return m;
 }
 
+//------------------------------------------------------------------------------
+// 高 DPI 缩放
+//
+// 背景：宿主进程若是「每显示器 DPI 感知」（Per-Monitor Aware），我们拿到的窗口
+// 坐标就是**物理像素**。写死的 340×384 布局在 150% / 200% 缩放的屏幕上会被画成
+// 物理尺寸极小的面板 —— 这就是「界面太小」的根因。
+//
+// 对策：按窗口实际 DPI 把整套布局（面板尺寸、控件坐标、字号、波形区）等比放大。
+//
+// 宿主若是 DPI 无感知（Windows 会整窗位图拉伸放大），GetDpiForWindow 返回 96
+// → 缩放系数 1.0，行为与改动前完全一致。所以这条改动对老环境是**无副作用**的。
+//
+// 三个 API 依次降级，保证 Win7 也能跑：
+//   GetDpiForWindow (Win10 1607+) → GetDpiForMonitor (Win8.1+) → GetDeviceCaps
+// 全部用 GetProcAddress 动态取，不引入新的链接期依赖。
+//------------------------------------------------------------------------------
+double g_uiScale = 1.0;   ///< 模块级缩放系数（getSize 在 attached 之前被调用时用它）
+
+using GetDpiForWindowFn  = UINT    (WINAPI*) (HWND);
+using GetDpiForMonitorFn = HRESULT (WINAPI*) (HMONITOR, int, UINT*, UINT*);
+
+double rawDpiScaleFor (HWND hwnd)
+{
+    if (!hwnd)
+        hwnd = ::GetForegroundWindow ();
+
+    if (HMODULE user32 = ::GetModuleHandleW (L"user32.dll"))
+    {
+        auto p = reinterpret_cast<GetDpiForWindowFn> (
+            reinterpret_cast<void*> (::GetProcAddress (user32, "GetDpiForWindow")));
+        if (p && hwnd)
+        {
+            const UINT dpi = p (hwnd);
+            if (dpi >= 96)
+                return static_cast<double> (dpi) / 96.0;
+        }
+    }
+
+    if (HMODULE shcore = ::LoadLibraryW (L"shcore.dll"))
+    {
+        auto p = reinterpret_cast<GetDpiForMonitorFn> (
+            reinterpret_cast<void*> (::GetProcAddress (shcore, "GetDpiForMonitor")));
+        UINT dx = 0, dy = 0;
+        if (p && SUCCEEDED (p (::MonitorFromWindow (hwnd, MONITOR_DEFAULTTOPRIMARY),
+                               0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) && dx >= 96)
+        {
+            ::FreeLibrary (shcore);
+            return static_cast<double> (dx) / 96.0;
+        }
+        ::FreeLibrary (shcore);
+    }
+
+    if (HDC dc = ::GetDC (nullptr))
+    {
+        const int dpi = ::GetDeviceCaps (dc, LOGPIXELSX);
+        ::ReleaseDC (nullptr, dc);
+        if (dpi >= 96)
+            return static_cast<double> (dpi) / 96.0;
+    }
+    return 1.0;
+}
+
+double uiScaleFor (HWND hwnd)
+{
+    double s = rawDpiScaleFor (hwnd);
+    // 夹到 [1.0, 3.0]，再量化到 0.25 的档位：避免 137/96 这类零碎比例
+    // 让控件落在半像素上、文字发虚、边框粗细不一。
+    if (s < 1.0) s = 1.0;
+    if (s > 3.0) s = 3.0;
+    s = std::round (s * 4.0) / 4.0;
+    return s < 1.0 ? 1.0 : s;
+}
+
+int scaledPanelW () { return static_cast<int> (std::lround (kPanelW * g_uiScale)); }
+int scaledPanelH () { return static_cast<int> (std::lround (kPanelH * g_uiScale)); }
+
 } // namespace
 
 namespace ap {
@@ -160,10 +241,18 @@ public:
     void onHScroll (HWND slider);
     HBRUSH onCtlColor (HDC dc, HWND ctl);
 
+    /// DPI 变了（跨屏拖动、系统缩放改动）时重算缩放系数并重建字体/布局。
+    void onDpiChanged ();
+    /// 绑定宿主侧回调，供 onDpiChanged 请求改窗口尺寸。
+    void setOwner (PlugView* o) { m_owner = o; }
+
     HWND hwnd () const { return m_hwnd; }
 
 private:
     void layoutChildren ();
+    void createFonts ();
+    void deleteFonts ();
+    void applyFontsToChildren ();
     void refreshLabels ();
     void openFileDialog ();
     void applyBpmFromEdit ();
@@ -189,8 +278,21 @@ private:
     HFONT m_font = nullptr, m_fontSmall = nullptr, m_fontBold = nullptr;
     HBRUSH m_bgBrush = nullptr;
 
+    PlugView* m_owner = nullptr;      ///< 宿主侧回调（DPI 变化时请求改窗口尺寸）
+
     double m_viewStart = 0.0;   ///< 视野起点（秒）
     double m_viewSpan = 8.0;    ///< 视野跨度（秒）
+
+    //---- 高 DPI ----
+    double m_scale = 1.0;             ///< DPI 缩放系数（1.0 = 96 DPI）
+    int    m_waveW = kWaveW;          ///< 缩放后的波形区宽（secToX 的基准）
+    int    m_waveH = kWaveH;          ///< 缩放后的波形区高
+
+    /// 把「96 DPI 下的设计像素」换算成当前 DPI 下的物理像素。
+    int px (int designPx) const
+    {
+        return static_cast<int> (std::lround (static_cast<double> (designPx) * m_scale));
+    }
 
     bool m_dragging = false;
     bool m_dragOffset = false;
@@ -247,9 +349,94 @@ void ensureClasses ()
 } // namespace
 
 //------------------------------------------------------------------------------
+void WinView::createFonts ()
+{
+    // 字号同样按 DPI 放大（lfHeight 取负 = 按字符高度指定，不是行距）。
+    // 下限 -8，避免极小缩放时算出 0 让系统退回默认大字。
+    LOGFONTW lf = {};
+    lf.lfHeight = -std::max (8L, std::lround (13.0 * m_scale));
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    ::wcscpy_s (lf.lfFaceName, LF_FACESIZE, L"Microsoft YaHei UI");
+    m_font = ::CreateFontIndirectW (&lf);
+
+    lf.lfHeight = -std::max (8L, std::lround (11.0 * m_scale));
+    m_fontSmall = ::CreateFontIndirectW (&lf);
+
+    lf.lfHeight = -std::max (8L, std::lround (15.0 * m_scale));
+    lf.lfWeight = FW_BOLD;
+    m_fontBold = ::CreateFontIndirectW (&lf);
+
+    if (!m_font)      m_font = reinterpret_cast<HFONT> (::GetStockObject (DEFAULT_GUI_FONT));
+    if (!m_fontSmall) m_fontSmall = m_font;
+    if (!m_fontBold)  m_fontBold = m_font;
+}
+
+void WinView::deleteFonts ()
+{
+    if (m_font && m_font != ::GetStockObject (DEFAULT_GUI_FONT))
+        ::DeleteObject (m_font);
+    if (m_fontSmall && m_fontSmall != m_font)
+        ::DeleteObject (m_fontSmall);
+    if (m_fontBold && m_fontBold != m_font)
+        ::DeleteObject (m_fontBold);
+    m_font = m_fontSmall = m_fontBold = nullptr;
+}
+
+void WinView::applyFontsToChildren ()
+{
+    const HWND normal[] = { m_openBtn, m_zoomOut, m_zoomIn, m_zoomFit, m_backBtn,
+                            m_gridCheck, m_numCheck, m_bpmEdit, m_bpmUp, m_bpmDown,
+                            m_timesig, m_volSlider };
+    for (HWND c : normal)
+        if (c)
+            ::SendMessageW (c, WM_SETFONT, reinterpret_cast<WPARAM> (m_font), TRUE);
+
+    const HWND smalls[] = { m_timeLabel, m_offsetLabel, m_srcLabel, m_volLabel,
+                            m_fileLabel, m_hintLabel, m_statusLamp, m_fmtLabel, m_brand };
+    for (HWND c : smalls)
+        if (c)
+            ::SendMessageW (c, WM_SETFONT, reinterpret_cast<WPARAM> (m_fontSmall), TRUE);
+}
+
+void WinView::onDpiChanged ()
+{
+    if (!m_hwnd)
+        return;
+
+    const double s = uiScaleFor (m_hwnd);
+    if (std::fabs (s - m_scale) < 0.01)
+        return;
+
+    m_scale  = s;
+    g_uiScale = s;
+    m_waveW  = px (kWaveW);
+    m_waveH  = px (kWaveH);
+
+    deleteFonts ();
+    createFonts ();
+    applyFontsToChildren ();
+    layoutChildren ();
+
+    ::InvalidateRect (m_hwnd, nullptr, TRUE);
+    if (m_wave)
+        ::InvalidateRect (m_wave, nullptr, FALSE);
+
+    // 面板尺寸变了，请宿主重新调整窗口（宿主不理也没关系，只是面板被裁一点）。
+    if (m_owner)
+        m_owner->requestResizeToPreferred ();
+}
+
+//------------------------------------------------------------------------------
 bool WinView::create (HWND parent, int w, int h)
 {
     ensureClasses ();
+
+    // 先定缩放系数：后面所有尺寸（窗口、控件、字号、波形区）都按它放大。
+    m_scale  = uiScaleFor (parent);
+    g_uiScale = m_scale;
+    m_waveW  = px (kWaveW);
+    m_waveH  = px (kWaveH);
 
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof icc;
@@ -265,22 +452,7 @@ bool WinView::create (HWND parent, int w, int h)
     if (!m_hwnd)
         return false;
 
-    LOGFONTW lf = {};
-    lf.lfHeight = -13;
-    lf.lfCharSet = DEFAULT_CHARSET;
-    lf.lfQuality = CLEARTYPE_QUALITY;
-    ::wcscpy_s (lf.lfFaceName, LF_FACESIZE, L"Microsoft YaHei UI");
-    m_font = ::CreateFontIndirectW (&lf);
-
-    lf.lfHeight = -11;
-    m_fontSmall = ::CreateFontIndirectW (&lf);
-    lf.lfHeight = -15;
-    lf.lfWeight = FW_BOLD;
-    m_fontBold = ::CreateFontIndirectW (&lf);
-
-    if (!m_font)      m_font = reinterpret_cast<HFONT> (::GetStockObject (DEFAULT_GUI_FONT));
-    if (!m_fontSmall) m_fontSmall = m_font;
-    if (!m_fontBold)  m_fontBold = m_font;
+    createFonts ();
 
     HINSTANCE hi = ::GetModuleHandleW (nullptr);
     auto mk = [&] (const wchar_t* cls, const wchar_t* text, DWORD style, int id) -> HWND {
@@ -336,11 +508,7 @@ bool WinView::create (HWND parent, int w, int h)
     m_brand       = mk (L"STATIC", L"♪ B 站「大伟鼓谱」· 欢迎关注，鼓谱 / 教学 / 伴奏持续更新",
                         SS_LEFT, IDC_BRAND);
 
-    HWND smalls[] = { m_timeLabel, m_offsetLabel, m_srcLabel, m_volLabel,
-                      m_fileLabel, m_hintLabel, m_statusLamp, m_fmtLabel, m_brand };
-    for (HWND c : smalls)
-        if (c)
-            ::SendMessageW (c, WM_SETFONT, reinterpret_cast<WPARAM> (m_fontSmall), TRUE);
+    applyFontsToChildren ();
 
     ::DragAcceptFiles (m_hwnd, TRUE);
     if (m_wave)
@@ -359,15 +527,9 @@ void WinView::destroy ()
         ::DestroyWindow (m_hwnd);
         m_hwnd = nullptr;
     }
-    if (m_font && m_font != ::GetStockObject (DEFAULT_GUI_FONT))
-        ::DeleteObject (m_font);
-    if (m_fontSmall && m_fontSmall != m_font)
-        ::DeleteObject (m_fontSmall);
-    if (m_fontBold && m_fontBold != m_font)
-        ::DeleteObject (m_fontBold);
+    deleteFonts ();
     if (m_bgBrush)
         ::DeleteObject (m_bgBrush);
-    m_font = m_fontSmall = m_fontBold = nullptr;
     m_bgBrush = nullptr;
 }
 
@@ -382,9 +544,11 @@ void WinView::resize (int w, int h)
 //------------------------------------------------------------------------------
 void WinView::layoutChildren ()
 {
-    auto move = [] (HWND h, int x, int y, int w, int hh) {
+    // 【所有数字都是 96 DPI 下的设计值】统一乘缩放系数后再交给 MoveWindow。
+    // 新增/调整控件时继续写设计值即可，别在这里直接写物理像素。
+    auto move = [this] (HWND h, int x, int y, int w, int hh) {
         if (h)
-            ::MoveWindow (h, x, y, w, hh, TRUE);
+            ::MoveWindow (h, px (x), px (y), px (w), px (hh), TRUE);
     };
 
     move (m_openBtn,    240,   6,  90, 24);
@@ -421,25 +585,26 @@ void WinView::layoutChildren ()
 //------------------------------------------------------------------------------
 double WinView::xToSec (int x) const
 {
-    return m_viewStart + (static_cast<double> (x) / kWaveW) * m_viewSpan;
+    // 基准必须是【缩放后】的波形区宽度，否则 DPI ≠ 96 时点击定位会整体偏移。
+    return m_viewStart + (static_cast<double> (x) / m_waveW) * m_viewSpan;
 }
 
 int WinView::secToX (double sec) const
 {
     if (m_viewSpan <= 0.0)
         return 0;
-    return static_cast<int> ((sec - m_viewStart) / m_viewSpan * kWaveW);
+    return static_cast<int> ((sec - m_viewStart) / m_viewSpan * m_waveW);
 }
 
 //------------------------------------------------------------------------------
 void WinView::paint (HDC target, const RECT& rc)
 {
-    // 【恒按整块波形区绘制】secToX() / xToSec() 的基准是 kWaveW，
-    // 所以离屏位图也必须恒为 kWaveW × kWaveH；最后再把 rc 与波形区的
+    // 【恒按整块波形区绘制】secToX() / xToSec() 的基准是 m_waveW，
+    // 所以离屏位图也必须恒为 m_waveW × m_waveH；最后再把 rc 与波形区的
     // 交集 Blt 上屏。若按 rc 的宽高建位图，局部重绘（rcPaint 非全窗）时
     // 波形/网格/播放头会整块错位裁切。
-    const int W = kWaveW;
-    const int H = kWaveH;
+    const int W = m_waveW;
+    const int H = m_waveH;
 
     const int sx = std::max (0, static_cast<int> (rc.left));
     const int sy = std::max (0, static_cast<int> (rc.top));
@@ -480,7 +645,7 @@ void WinView::paint (HDC target, const RECT& rc)
         m_backend->waveformPeaks (peaks, W, m_viewStart, m_viewStart + m_viewSpan);
         if (!peaks.empty ())
         {
-            HPEN wavePen = ::CreatePen (PS_SOLID, 1, RGB (90, 190, 255));
+            HPEN wavePen = ::CreatePen (PS_SOLID, std::max (1, px (1)), RGB (90, 190, 255));
             HPEN oldPen = reinterpret_cast<HPEN> (::SelectObject (dc, wavePen));
             const int mid = H / 2;
             const int n = static_cast<int> (peaks.size ());
@@ -489,7 +654,7 @@ void WinView::paint (HDC target, const RECT& rc)
                 float p = peaks[static_cast<size_t> (i)];
                 if (p < 0.0f) p = 0.0f;
                 if (p > 1.0f) p = 1.0f;
-                const int half = static_cast<int> (p * (H / 2 - 2));
+                const int half = static_cast<int> (p * (H / 2 - px (2)));
                 ::MoveToEx (dc, i, mid - half, nullptr);
                 ::LineTo (dc, i, mid + half + 1);
             }
@@ -515,7 +680,9 @@ void WinView::paint (HDC target, const RECT& rc)
 
         if (m_showGrid && beatSec > 1e-6)
         {
-            HPEN barPen  = ::CreatePen (PS_SOLID, 1, RGB (255, 190, 90));
+            // ⚠️ PS_DOT / PS_DASH 只支持宽度 1（几何画笔限制），所以拍线不跟着放大，
+            // 小节线是实线、可以放大。这样高 DPI 下小节线更醒目，层次反而更清楚。
+            HPEN barPen  = ::CreatePen (PS_SOLID, std::max (1, px (1)), RGB (255, 190, 90));
             HPEN beatPen = ::CreatePen (PS_DOT,   1, RGB (110, 110, 120));
             HPEN prevPen = reinterpret_cast<HPEN> (::SelectObject (dc, barPen));
             ::SetBkMode (dc, TRANSPARENT);
@@ -555,11 +722,11 @@ void WinView::paint (HDC target, const RECT& rc)
                     if (b < m_viewStart)
                         continue;
                     const int x = secToX (b);
-                    if (x < -20 || x > W)
+                    if (x < -px (20) || x > W)
                         continue;
                     wchar_t buf[32];
                     std::swprintf (buf, 32, L"%lld", barNo + 1);
-                    ::TextOutW (dc, x + 2, 2, buf, static_cast<int> (std::wcslen (buf)));
+                    ::TextOutW (dc, x + px (2), px (2), buf, static_cast<int> (std::wcslen (buf)));
                 }
             }
 
@@ -574,7 +741,7 @@ void WinView::paint (HDC target, const RECT& rc)
             const int x = secToX (tl0.playheadSec + offset);
             if (x >= 0 && x <= W)
             {
-                HPEN p = ::CreatePen (PS_SOLID, 2, RGB (80, 220, 120));
+                HPEN p = ::CreatePen (PS_SOLID, std::max (1, px (2)), RGB (80, 220, 120));
                 HPEN op = reinterpret_cast<HPEN> (::SelectObject (dc, p));
                 ::MoveToEx (dc, x, 0, nullptr);
                 ::LineTo (dc, x, H);
@@ -588,7 +755,7 @@ void WinView::paint (HDC target, const RECT& rc)
             const int x = secToX (m_backend->positionSec ());
             if (x >= 0 && x <= W)
             {
-                HPEN p = ::CreatePen (PS_SOLID, 2, RGB (255, 90, 90));
+                HPEN p = ::CreatePen (PS_SOLID, std::max (1, px (2)), RGB (255, 90, 90));
                 HPEN op = reinterpret_cast<HPEN> (::SelectObject (dc, p));
                 ::MoveToEx (dc, x, 0, nullptr);
                 ::LineTo (dc, x, H);
@@ -649,7 +816,7 @@ void WinView::onMouseMove (int x, int y, int mods)
 
     if (m_dragOffset)
     {
-        const double dxSec = (x - m_dragStartX) / static_cast<double> (kWaveW) * m_viewSpan;
+        const double dxSec = (x - m_dragStartX) / static_cast<double> (m_waveW) * m_viewSpan;
         double v = m_dragStartVal + dxSec;
         if (mods & MK_SHIFT)
             v = m_dragStartVal + dxSec * 0.1;
@@ -1024,6 +1191,11 @@ LRESULT CALLBACK mainProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_DROPFILES:
             if (v) v->onDropFiles (reinterpret_cast<HDROP> (wp));
             return 0;
+        case WM_DPICHANGED:
+            // 跨屏拖动 / 系统缩放改动时收到（宿主需为 Per-Monitor Aware）。
+            // 子窗口通常收不到这条消息，收到了就按新 DPI 重建字体与布局。
+            if (v) v->onDpiChanged ();
+            return 0;
         default:
             break;
     }
@@ -1073,14 +1245,34 @@ tresult PLUGIN_API PlugView::attached (void* parent, FIDString type)
     if (!m_backend && m_resolver)
         m_backend = m_resolver ();
 
+    // 缩放系数要【在 create 之前】定下来：宿主很可能是先 attached 再 getSize，
+    // 这样 getSize 报出去的就是已经放大过的尺寸。
+    const double scaleBefore = g_uiScale;
+    g_uiScale = uiScaleFor (reinterpret_cast<HWND> (parent));
+
     WinView* v = new WinView (m_backend);
-    if (!v->create (reinterpret_cast<HWND> (parent), kPanelW, kPanelH))
+    if (!v->create (reinterpret_cast<HWND> (parent), scaledPanelW (), scaledPanelH ()))
     {
         delete v;
         return Steinberg::kResultFalse;
     }
+    v->setOwner (this);
     m_view = v;
+
+    // 若宿主是在 attached 之前就调过 getSize（那时还不知道真实 DPI，报的是 96 DPI
+    // 下的尺寸），这里主动请宿主按新尺寸重新调整一次窗口。
+    if (g_uiScale != scaleBefore)
+        requestResizeToPreferred ();
     return Steinberg::kResultOk;
+}
+
+void PlugView::requestResizeToPreferred ()
+{
+    if (!m_frame)
+        return;
+    ViewRect r;
+    if (getSize (&r) == Steinberg::kResultOk)
+        m_frame->resizeView (this, &r);
 }
 
 tresult PLUGIN_API PlugView::removed ()
@@ -1120,8 +1312,8 @@ tresult PLUGIN_API PlugView::getSize (ViewRect* size)
         return Steinberg::kInvalidArgument;
     size->left = 0;
     size->top = 0;
-    size->right = kPanelW;
-    size->bottom = kPanelH;
+    size->right  = scaledPanelW ();
+    size->bottom = scaledPanelH ();
     return Steinberg::kResultOk;
 }
 
@@ -1141,7 +1333,7 @@ tresult PLUGIN_API PlugView::onFocus (Steinberg::TBool state)
 
 tresult PLUGIN_API PlugView::setFrame (IPlugFrame* frame)
 {
-    (void) frame;
+    m_frame = frame;
     return Steinberg::kResultOk;
 }
 
@@ -1154,8 +1346,8 @@ tresult PLUGIN_API PlugView::checkSizeConstraint (ViewRect* rect)
 {
     if (rect)
     {
-        rect->right = rect->left + kPanelW;
-        rect->bottom = rect->top + kPanelH;
+        rect->right  = rect->left + scaledPanelW ();
+        rect->bottom = rect->top  + scaledPanelH ();
     }
     return Steinberg::kResultOk;
 }

@@ -140,10 +140,18 @@ public:
     // 供验证器检查「视图是否真的拿到了音频后端」
     Backend* backendForTest () const { return m_backend; }
 
+    // Windows 专用：请宿主按当前首选尺寸（含 DPI 缩放）重新调整窗口。
+    // 只在 gui_win.cpp 里实现，其他平台不调用。
+    void requestResizeToPreferred ();
+
 private:
     Backend* m_backend = nullptr;
     BackendResolver m_resolver = nullptr;
     void* m_view = nullptr;   // GUIView* （ObjC 类，用 void* 跨语言边界持有）
+    // 宿主回调。Windows 版用得上：DPI 缩放系数在 attached 时才确定，若与
+    // getSize 之前上报的尺寸不一致，要通过 resizeView 请宿主重新调整窗口。
+    // （Mac/Linux 版不使用，保持 nullptr 即可。）
+    IPlugFrame* m_frame = nullptr;
     uint32 m_refCount = 0;
 };
 
