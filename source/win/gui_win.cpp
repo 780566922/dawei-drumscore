@@ -19,6 +19,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -433,13 +434,29 @@ int WinView::secToX (double sec) const
 //------------------------------------------------------------------------------
 void WinView::paint (HDC target, const RECT& rc)
 {
-    const int W = rc.right - rc.left;
-    const int H = rc.bottom - rc.top;
-    if (W <= 0 || H <= 0)
+    // 【恒按整块波形区绘制】secToX() / xToSec() 的基准是 kWaveW，
+    // 所以离屏位图也必须恒为 kWaveW × kWaveH；最后再把 rc 与波形区的
+    // 交集 Blt 上屏。若按 rc 的宽高建位图，局部重绘（rcPaint 非全窗）时
+    // 波形/网格/播放头会整块错位裁切。
+    const int W = kWaveW;
+    const int H = kWaveH;
+
+    const int sx = std::max (0, static_cast<int> (rc.left));
+    const int sy = std::max (0, static_cast<int> (rc.top));
+    const int sw = std::min (W, static_cast<int> (rc.right))  - sx;
+    const int sh = std::min (H, static_cast<int> (rc.bottom)) - sy;
+    if (sw <= 0 || sh <= 0)
         return;
 
     HDC dc = ::CreateCompatibleDC (target);
+    if (!dc)
+        return;
     HBITMAP bmp = ::CreateCompatibleBitmap (target, W, H);
+    if (!bmp)
+    {
+        ::DeleteDC (dc);
+        return;
+    }
     HBITMAP oldBmp = reinterpret_cast<HBITMAP> (::SelectObject (dc, bmp));
 
     RECT full = { 0, 0, W, H };
@@ -586,16 +603,20 @@ void WinView::paint (HDC target, const RECT& rc)
             const int x = secToX (offset);
             if (x > 0)
             {
-                RECT sh = { 0, 0, x < W ? x : W, H };
+                RECT shade = { 0, 0, x < W ? x : W, H };
                 HBRUSH ob = ::CreateSolidBrush (RGB (70, 40, 20));
-                ::FillRect (dc, &sh, ob);
+                ::FillRect (dc, &shade, ob);
                 ::DeleteObject (ob);
             }
         }
     }
 
+    // ⚠️ 顺序绝不能反：BitBlt 读的是 DC 【当前选中】的那张位图。
+    // 先 SelectObject (dc, oldBmp) 会把 CreateCompatibleDC 自带的 1×1 单色
+    // 占位图挂回去 —— 拷出来的就是一整块纯色，画进 bmp 的波形/网格/
+    // 播放头全部不上屏（这正是「波形区一片空白」的根因）。
+    ::BitBlt (target, rc.left, rc.top, sw, sh, dc, sx, sy, SRCCOPY);
     ::SelectObject (dc, oldBmp);
-    ::BitBlt (target, rc.left, rc.top, W, H, dc, 0, 0, SRCCOPY);
     ::DeleteObject (bmp);
     ::DeleteDC (dc);
 }
