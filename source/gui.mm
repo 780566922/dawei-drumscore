@@ -21,8 +21,13 @@
 //   滚轮            左右平移
 //   ⌥滚轮 / 双指捏合 以鼠标位置为锚点缩放
 //   双击            回到全览
-//   拖动            定位播放头
-//   ⌥拖动           拖动小节网格 = 改起始偏移（配合 ⇧ 微调 0.1 倍）
+//   按住拖动        平移视图（抓手）—— 只动视野，不碰播放位置
+//   ⌥/⌘ 拖动        拖动小节网格 = 改起始偏移（配合 ⇧ 微调 0.1 倍）
+//
+// 注：旧版的「点击 / 拖动 = 定位音频播放头」已移除。
+//     音频位置完全由宿主驱动（谱面位置 + 偏移），手动把它拽走只会让红绿两条
+//     播放头分家，用户还得再点一次「回到谱面」才能恢复 —— 纯误操作来源。
+//     去掉之后，红线就只是一条只读的「音频实际播到哪」指示。
 //==============================================================================
 #include "gui.h"
 
@@ -42,7 +47,13 @@ struct WaveState
 {
     ap::PlugView::Backend* backend = nullptr;
     std::vector<float> peaks;        ///< 当前可见区间的峰值包络
-    bool dragging = false;           ///< 正在拖播放头
+
+    //---- 按住拖动 = 平移视图（抓手）----
+    // 旧字段 dragging 的语义是「正在拖播放头」，已废弃：
+    // 播放位置不再允许手动拖动（见文件头注释）。现在拖动只改 viewStart。
+    bool   panning = false;          ///< 正在按住拖动平移视图
+    double panStartX = 0.0;          ///< 按下时的鼠标 x（视图坐标）
+    double panStartViewStart = 0.0;  ///< 按下时的视野起点
 
     //---- 视野（单位：秒，音频时间轴）----
     double viewStart = 0.0;
@@ -218,6 +229,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)followPlayheadTo:(double)audioSec;
 - (void)recoverAutoFollow;     ///< 用户停止手动操作超时后，自动恢复跟随
 - (void)stopDrag;
+- (double)viewStartSec;        ///< 当前视野起点（秒），只读 —— 自测与状态展示用
 @end
 
 @implementation WaveformView
@@ -238,6 +250,8 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 }
 
 - (void)setPanel:(void*)panel { _st->panel = panel; }
+
+- (double)viewStartSec { return _st->viewStart; }
 - (void)setShowGrid:(BOOL)b { _st->showGrid = b ? true : false; [self setNeedsDisplay:YES]; }
 - (void)setShowNumbers:(BOOL)b { _st->showNumbers = b ? true : false; [self setNeedsDisplay:YES]; }
 
@@ -305,7 +319,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)followPlayheadTo:(double)audioSec
 {
     if (!_st->followScroll) return;
-    if (_st->dragging || _st->draggingGrid) return;
+    if (_st->panning || _st->draggingGrid) return;
     if (!(_st->viewLen > 0.0)) return;
 
     const double v0 = _st->viewStart;
@@ -660,10 +674,13 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         return;
     }
 
-    _st->dragging = YES;
-    _st->userScrolling = true;   // 用户手动定位，暂停自动跟随
+    // 无修饰键拖动 = 平移视图（抓手），不改变播放位置。
+    _st->panning = true;
+    _st->panStartX = p.x;
+    _st->panStartViewStart = _st->viewStart;
+    _st->userScrolling = true;   // 用户在看别处，暂停自动跟随
     _st->lastUserScrollAt = e.timestamp;
-    [self seekToX:p.x];
+    [[NSCursor closedHandCursor] push];
 }
 
 - (void)mouseDragged:(NSEvent*)e
@@ -686,7 +703,15 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         return;
     }
 
-    if (_st->dragging) [self seekToX:p.x];
+    if (_st->panning)
+    {
+        if (!(_st->viewLen > 0.0) || NSWidth (r) <= 0.0) return;
+        const double pxPerSec = NSWidth (r) / _st->viewLen;
+        // 抓手语义：把内容往右拉 → 视野往左移，看到更早的音频。
+        _st->viewStart = _st->panStartViewStart - (p.x - _st->panStartX) / pxPerSec;
+        [self clampView];
+        [self setNeedsDisplay:YES];   // 重取样交给 drawRect，避免高频持锁
+    }
 }
 
 - (void)mouseUp:(NSEvent*)e
@@ -696,24 +721,18 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         _st->draggingGrid = false;
         [[NSCursor closedHandCursor] pop];
     }
-    _st->dragging = NO;
+    if (_st->panning)
+    {
+        _st->panning = false;
+        [[NSCursor closedHandCursor] pop];
+    }
 }
 
 - (void)stopDrag
 {
-    _st->dragging = false;
-    _st->draggingGrid = false;
-}
-
-- (void)seekToX:(CGFloat)x
-{
-    const NSRect r = [self bounds];
-    if (NSWidth (r) <= 0.0) return;
-    CGFloat f = (x - NSMinX (r)) / NSWidth (r);
-    if (f < 0) f = 0;
-    if (f > 1) f = 1;
-    _st->backend->seekTo (_st->viewStart + _st->viewLen * (double) f);
-    [self setNeedsDisplay:YES];
+    // 关窗口 / 换音频时也会走到这里，光标栈必须成对回收，否则残留抓手光标。
+    if (_st->panning)      { _st->panning = false;      [[NSCursor closedHandCursor] pop]; }
+    if (_st->draggingGrid) { _st->draggingGrid = false; [[NSCursor closedHandCursor] pop]; }
 }
 
 // 空格键转发给宿主主窗口。
@@ -814,7 +833,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)recoverAutoFollow
 {
     if (!_st->userScrolling) return;
-    if (_st->dragging || _st->draggingGrid) return;   // 还在拖，别打断
+    if (_st->panning || _st->draggingGrid) return;   // 还在拖，别打断
     const double now = [NSProcessInfo processInfo].systemUptime;
     // e.timestamp 是 NSTimeInterval（进程启动后的秒数），与 systemUptime 同源，
     // 可直接相减。不用 CACurrentMediaTime —— 那要额外链 QuartzCore 框架。
@@ -885,7 +904,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         [_st->wave setPanel:(__bridge void*) self];
         [self addSubview:_st->wave];
         _st->wave.toolTip = @"滚轮左右平移 · ⌥滚轮缩放 · 双击全览 · "
-                            @"拖动=定位播放头 · ⌥拖动或⌘拖动=改起始偏移（配合 ⇧ 微调）";
+                            @"按住拖动=平移视图 · ⌥拖动或⌘拖动=改起始偏移（配合 ⇧ 微调）";
 
         // ---- 时间 + 缩放 + 显示开关 ----
         _st->timeLabel = [self label:@"0:00 / 0:00" size:11 align:NSTextAlignmentLeft];
@@ -905,7 +924,9 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         zFit.toolTip = @"缩放到整段音频";
 
         // 「回到谱面」：音频播放头 seek 回宿主当前谱面位置（+偏移）。
-        // 用户手滑拖动波形定位后，点一下就能重新和谱面对齐。
+        // 自从取消了「点击/拖动定位播放头」，正常操作下不会再和谱面分家；
+        // 这个按钮退化成安全阀 —— 万一宿主推位置异常、或音频线程跟随卡住，
+        // 点一下即可强制重新同步。
         NSButton* backToScore = [self button:@"回到谱面" action:@selector (backToScore:)];
         backToScore.frame = NSMakeRect (314, 157, 82, 20);
         backToScore.font = [NSFont systemFontOfSize:11];
@@ -931,7 +952,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
                                     @"改偏移：在波形上按住 ⌘（或 ⌥）拖动网格";
 
         // ---- 快捷键提示 ----
-        NSTextField* hintKeys = [self label:@"拖动=定位　⌘/⌥拖动=改偏移　⇧=微调　滚轮=平移　⌘/⌥滚轮=缩放　双击=全览"
+        NSTextField* hintKeys = [self label:@"拖动=平移视图　⌘/⌥拖动=改偏移　⇧=微调　滚轮=平移　⌘/⌥滚轮=缩放　双击=全览"
                                      size:10 align:NSTextAlignmentLeft];
         hintKeys.frame = NSMakeRect (170, 189, 450, 16);
         [hintKeys setTextColor:[NSColor colorWithCalibratedWhite:0.55 alpha:1.0]];

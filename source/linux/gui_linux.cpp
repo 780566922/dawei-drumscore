@@ -283,10 +283,10 @@ private:
     double m_viewStart = 0.0;   ///< 视野起点（秒）
     double m_viewSpan  = 8.0;   ///< 视野跨度（秒）
 
-    bool m_dragging = false;
-    bool m_dragOffset = false;
+    bool m_dragging = false;      ///< 波形区按住鼠标中
+    bool m_dragOffset = false;    ///< true = 改起始偏移；false = 平移视野
     int  m_dragStartX = 0;
-    double m_dragStartVal = 0.0;
+    double m_dragStartVal = 0.0;  ///< 拖动开始时被改的量（改偏移时 = offset，平移时 = viewStart）
 
     bool m_dragVolume = false;
 
@@ -960,7 +960,7 @@ void X11View::drawControls (XftDraw* xd)
 
     drawText (xd, rOffset.x, rOffset.y + 14, m_offsetText.c_str (), xc (CText), m_fontSmall);
     drawText (xd, rHint.x, rHint.y + 14,
-              "拖动=定位 · Ctrl/Alt 拖动=改偏移 · 滚轮=平移/缩放 · 双击=全览",
+              "拖动=平移视图 · Ctrl/Alt 拖动=改偏移 · 滚轮=平移/缩放 · 双击=全览",
               xc (CTextDim), m_fontSmall);
 
     // BPM
@@ -1034,9 +1034,10 @@ void X11View::onButtonPress (int x, int y, unsigned state)
         m_dragging = true;
         m_dragStartX = x;
         m_dragOffset = ((state & ControlMask) != 0) || ((state & Mod1Mask) != 0);
-        m_dragStartVal = m_dragOffset ? m_backend->offsetSec () : 0.0;
-        if (!m_dragOffset)
-            m_backend->seekTo (xToSec (x));
+        // 改偏移时记 offset，平移视野时记 viewStart —— 两者互斥，复用同一个字段。
+        m_dragStartVal = m_dragOffset ? m_backend->offsetSec () : m_viewStart;
+        // 不再有「点击 / 拖动 = 定位播放头」：音频位置完全由宿主驱动，
+        // 手动把它拽走只会和谱面播放头分家，还得再点一次「回到谱面」才能恢复。
         m_dirty = true;
         return;
     }
@@ -1097,9 +1098,12 @@ void X11View::onMotion (int x, int y, unsigned state)
             if (v < -3600.0) v = -3600.0;
             m_backend->setOffsetSec (static_cast<float> (v));
         }
-        else
+        else if (kWaveW > 0 && m_viewSpan > 0.0)
         {
-            m_backend->seekTo (xToSec (x));
+            // 平移视野（抓手）：把内容往右拉 → 视野往左移，看到更早的音频。
+            const double dxSec = (x - m_dragStartX) / static_cast<double> (kWaveW) * m_viewSpan;
+            m_viewStart = m_dragStartVal - dxSec;
+            clampView ();
         }
         m_dirty = true;
         return;

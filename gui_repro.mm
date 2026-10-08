@@ -93,7 +93,7 @@ public:
     bool playing () const override { return m_player.playing (); }
     void setLooping (bool b) override { m_player.setLooping (b); }
     bool looping () const override { return m_player.looping (); }
-    void seekTo (double s) override { m_player.seekTo (s); }
+    void seekTo (double s) override { ++seekCalls; m_player.seekTo (s); }
     double positionSec () const override { return m_player.positionSec (); }
 
     void setGridBPM (float bpm) override { m_bpm = bpm; }
@@ -119,6 +119,7 @@ public:
     }
 
     bool fakeTimeline = false;
+    int  seekCalls = 0;   ///< seekTo 被调用次数 —— 回归防线：拖动波形不该 seek
 
 private:
     mutable ap::Player m_player;
@@ -417,6 +418,60 @@ int main (int argc, char** argv)
         }
         if ([wave respondsToSelector:selFit])
             ((void (*) (id, SEL)) objc_msgSend) (wave, selFit);
+
+        // ---- 无修饰键拖动 = 平移视图，且【绝不能】seek 播放位置 ----
+        // 回归防线：旧版这里是「拖动 = 定位音频播放头」，会把音频拽离谱面，
+        // 用户还得再点一次「回到谱面」才能恢复 —— 已改成纯视野平移。
+        @autoreleasepool
+        {
+            backend.setOffsetSec (0.0f);
+            // 先放大：全览下 viewStart 恒为 0，拖动无从体现。
+            // 锚点取最左边，保证缩放后 viewStart 仍是 0，起点可预期。
+            ((void (*) (id, SEL, double, CGFloat)) objc_msgSend)
+                (wave, NSSelectorFromString (@"zoomBy:aroundX:"), 8.0, (CGFloat) 0.0);
+
+            SEL selViewStart = NSSelectorFromString (@"viewStartSec");
+            const double startBefore = ((double (*) (id, SEL)) objc_msgSend) (wave, selViewStart);
+            const int    seeksBefore = backend.seekCalls;
+
+            const NSInteger wn = g_hostWindow.windowNumber;
+            NSEvent* down = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                               location:NSMakePoint (300, 60)
+                                          modifierFlags:0 timestamp:0 windowNumber:wn
+                                                context:nil eventNumber:1 clickCount:1 pressure:1.0];
+            NSEvent* drag = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDragged
+                                               location:NSMakePoint (180, 60)
+                                          modifierFlags:0 timestamp:0.01 windowNumber:wn
+                                                context:nil eventNumber:2 clickCount:1 pressure:1.0];
+            NSEvent* up = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+                                             location:NSMakePoint (180, 60)
+                                        modifierFlags:0 timestamp:0.02 windowNumber:wn
+                                              context:nil eventNumber:3 clickCount:1 pressure:1.0];
+            step ("无修饰键按下 → 左拖 120px → 松开（应平移视野、不 seek）");
+            [wave mouseDown:down];
+            [wave mouseDragged:drag];
+            [wave mouseUp:up];
+
+            const double startAfter = ((double (*) (id, SEL)) objc_msgSend) (wave, selViewStart);
+            std::printf ("  · 视野起点 %.4f → %.4f 秒；seekTo 调用 %d → %d\n",
+                         startBefore, startAfter, seeksBefore, backend.seekCalls);
+
+            if (backend.seekCalls != seeksBefore)
+            {
+                std::printf ("[复现] ✗ 拖动波形竟然 seek 了播放位置（应只改视野）\n");
+                rc = 18;
+            }
+            else if (!(startAfter > startBefore))
+            {
+                std::printf ("[复现] ✗ 无修饰键拖动没有平移视野\n");
+                rc = 19;
+            }
+
+            // 恢复全览：紧接着的「⌥ 拖动网格」测试按 60px 位移断言偏移变化量，
+            // 视野缩放级别一变那个量就不成立（实测被压到 0.098 秒 < 0.2 秒）。
+            if ([wave respondsToSelector:selFit])
+                ((void (*) (id, SEL)) objc_msgSend) (wave, selFit);
+        }
 
         // ---- ⌥ 拖动网格 = 调整起始偏移 ----
         backend.setOffsetSec (0.0f);

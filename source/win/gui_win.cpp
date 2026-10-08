@@ -294,10 +294,10 @@ private:
         return static_cast<int> (std::lround (static_cast<double> (designPx) * m_scale));
     }
 
-    bool m_dragging = false;
-    bool m_dragOffset = false;
+    bool m_dragging = false;      ///< 波形区按住鼠标中
+    bool m_dragOffset = false;    ///< true = 改起始偏移；false = 平移视野
     int  m_dragStartX = 0;
-    double m_dragStartVal = 0.0;
+    double m_dragStartVal = 0.0;  ///< 拖动开始时被改的量（改偏移时 = offset，平移时 = viewStart）
 
     bool m_showGrid = true;
     bool m_showNumbers = true;
@@ -501,7 +501,7 @@ bool WinView::create (HWND parent, int w, int h)
     m_volLabel    = mk (L"STATIC", L"100 %", SS_LEFT, 0);
     m_fileLabel   = mk (L"STATIC", L"未载入音频", SS_LEFT | SS_ENDELLIPSIS, 0);
     m_hintLabel   = mk (L"STATIC",
-                        L"拖动=定位　Ctrl/Alt拖动=改偏移　滚轮=平移　Ctrl/Alt滚轮=缩放　双击=全览",
+                        L"拖动=平移视图　Ctrl/Alt拖动=改偏移　滚轮=平移　Ctrl/Alt滚轮=缩放　双击=全览",
                         SS_LEFT, 0);
     m_statusLamp  = mk (L"STATIC", L"○ 未载入", SS_LEFT, 0);
     // ⚠ 标签框只有 190px（11px 字号）。加 OGG 后原串会溢出被裁，
@@ -802,10 +802,11 @@ void WinView::onMouseDown (int x, int y, int mods)
     m_dragging = true;
     m_dragStartX = x;
     m_dragOffset = ((mods & MK_CONTROL) != 0) || ((mods & AP_MK_ALT) != 0);
-    m_dragStartVal = m_dragOffset ? m_backend->offsetSec () : 0.0;
+    // 改偏移时记 offset，平移视野时记 viewStart —— 两者互斥，复用同一个字段。
+    m_dragStartVal = m_dragOffset ? m_backend->offsetSec () : m_viewStart;
 
-    if (!m_dragOffset)
-        m_backend->seekTo (xToSec (x));
+    // 不再有「点击 / 拖动 = 定位播放头」：音频位置完全由宿主驱动，
+    // 手动把它拽走只会和谱面播放头分家，还得再点一次「回到谱面」才能恢复。
 
     refreshLabels ();
     ::InvalidateRect (m_wave, nullptr, FALSE);
@@ -827,9 +828,12 @@ void WinView::onMouseMove (int x, int y, int mods)
         if (v < -3600.0) v = -3600.0;
         m_backend->setOffsetSec (static_cast<float> (v));
     }
-    else
+    else if (m_waveW > 0 && m_viewSpan > 0.0)
     {
-        m_backend->seekTo (xToSec (x));
+        // 平移视野（抓手）：把内容往右拉 → 视野往左移，看到更早的音频。
+        const double dxSec = (x - m_dragStartX) / static_cast<double> (m_waveW) * m_viewSpan;
+        m_viewStart = m_dragStartVal - dxSec;
+        clampView ();
     }
 
     refreshLabels ();
