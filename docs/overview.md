@@ -343,3 +343,73 @@ Windows 版由用户**上机实测通过**后发版。
 版本号散落在 **9 处**，升级时必须同步：CMakeLists.txt（`project VERSION`，Linux CI 从此 grep 提取）、
 installer/windows/setup.iss、make_pkg.sh、build.sh 的 CFBundle 两行、pkg/distribution.xml、
 source/plugin.mm、source/aplaysdk.cpp 两处。
+
+---
+
+## v1.0.2 发布（2026-10-08）
+
+修复一次宿主闪退：**关掉谱子 → 导入另一个工程 → 打开插件 → 宿主闪退**（macOS 上实测）。
+
+### 定位过程（这次是「日志 → 假设 → 复现 → 修复」一条龙）
+
+1. **崩溃日志给了关键信息**。插件自己的崩溃取证把宿主闪退现场写进了
+   `~/Library/Logs/DaweiDrumScore.log`，栈整个落在**宿主自己的模块加载路径**上：
+   ```
+   VstModulesRepository::addPluginModule
+     → VstPluginMetaReader::readMeta
+       → VST3::Hosting::Module::create
+         → Module::getModuleInfoPath      ← 崩在这里（相邻帧重复 = 栈已损坏）
+   ```
+   同时日志的时间线显示：`Processor 析构`（关文档）之后，每次重扫/打开编辑器
+   都在消耗点什么，最终某一轮崩掉 —— 是「同一进程内**反复取工厂**」才触发。
+
+2. **读 SDK 源码确认机制**。`CPluginFactory` 由 `FUNKNOWN_CTOR` 把引用计数初始化
+   为 1，`release()` 归零时 `delete this`；而 SDK 官方宏 `END_FACTORY` 写着
+   `else gPluginFactory->addRef();` —— 因为**宿主每次调用 `GetPluginFactory()`
+   都会配对一次 `release()`**。我们漏了这一句。
+
+3. **写复现程序确证**（`factory_lifecycle_test.cpp`，dlopen bundle 后反复索取/释放）：
+   ```
+   第 1 轮: release 后计数=1     ← new=1 → 我们 addRef=2 → 宿主 release=1
+   第 2 轮: release 后计数=0     ← 不补引用仍=1 → 宿主 release=0 → delete this
+   （第 3 轮直接崩溃，连输出都没有）
+   ```
+
+### 根因
+
+```cpp
+// 旧代码：只在首次 addRef，之后再也不补
+static APlayFactory* gFactory = nullptr;
+if (!gFactory) { gFactory = new APlayFactory (); gFactory->addRef (); }
+return gFactory;              // ← 第 3 次索取返回的是【已释放内存】
+```
+
+加剧因素：SDK 的 `~CPluginFactory` 只把**它自己的**全局 `gPluginFactory` 置空来兜底，
+管不到我们在函数内 static 缓存的指针 → 那个指针**永久悬垂**。
+
+### 修法（双保险）
+
+- `GetPluginFactory()` 对齐官方宏：`else` 分支补 `addRef()`；
+- `APlayFactory` 重写 `addRef`/`release`：工厂是**进程级常驻单例**，计数归零只钉回 1，
+  **绝不 delete**。模块级资源本就该活到进程退出 —— 无论宿主引用计数多不规范都不可能再悬垂。
+
+### 三端影响
+
+`aplaysdk.cpp` 是 **macOS / Windows / Linux 共用源码**，同一个 bug 三端都在，本次一并修复。
+（macOS 的 `source/plugin.mm` 其实**不参与构建**，真正的工厂与处理器都在 `aplaysdk.cpp`。）
+
+### 回归防线
+
+`factory_lifecycle_test.cpp` 接入 `build.sh` 成为**验证 7**：
+同一进程内反复「索取 → 使用 → 释放」20 轮 + 故意过度释放 + 连续索取 100 轮。
+修复前第 3 轮必崩，修复后全绿。
+
+### 构建健壮性顺带修复
+
+`make_pkg.sh` 里 `rm -rf` 在**外置盘**上会被沙箱以 `Operation not permitted` 拒绝，
+而脚本开头是 `set -e` → 打包中途中断。改为容忍该失败（内容后续都会整体重建/覆盖）；
+展开校验目录名改用带 PID 的唯一名，避免残留目录让 `pkgutil --expand` 误报「无法展开」。
+
+### 资产
+
+`DaweiDrumScore-1.0.2-{Windows-Setup.exe, macOS.pkg, Linux-x86_64.tar.gz/.deb/.rpm}`

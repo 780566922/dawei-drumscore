@@ -38,7 +38,11 @@ if [ ! -x "$SRC_BUNDLE/Contents/MacOS/DaweiDrumScore" ]; then
 fi
 
 echo "==> 准备 payload"
-rm -rf "$WORK" "$OUT"
+# 注意：本目录在外置盘上，rm 可能被系统/沙箱以 "Operation not permitted"
+# 拒绝。脚本开头是 set -e，不吞掉这个错误会直接中断打包 —— 而这两个路径
+# 后面都会整体重建/覆盖（mkdir -p + ditto + pkgbuild），删不掉并不影响
+# 产物正确性，所以这里允许失败继续。
+rm -rf "$WORK" "$OUT" 2>/dev/null || true
 mkdir -p "$WORK/root/$INSTALL_DIR" "$DIST"
 # 用 ditto 复制：完整保留 bundle 的扩展属性与签名信息（cp -R 不保证）
 ditto "$SRC_BUNDLE" "$WORK/root/$INSTALL_DIR/$BUNDLE_NAME"
@@ -75,8 +79,10 @@ for NEED in "Contents/MacOS/DaweiDrumScore" "Contents/Info.plist" "Contents/PkgI
     fi
 done
 # 2) 最终分发包结构：Distribution + 内部组件包
-EXPAND="$WORK/verify"
-rm -rf "$EXPAND"
+# 目录名带 PID：外置盘上旧目录可能删不掉（Operation not permitted），
+# 固定名字会让 pkgutil --expand 因「目标已存在」而失败，误报校验不通过。
+EXPAND="$WORK/verify.$$"
+rm -rf "$EXPAND" 2>/dev/null || true
 if pkgutil --expand "$OUT" "$EXPAND" >/dev/null 2>&1; then
     [ -f "$EXPAND/Distribution" ] && echo "  ✓ 分发脚本就位" || { echo "  ✗ 缺少 Distribution"; FAIL=1; }
     [ -d "$EXPAND/component.pkg" ] && echo "  ✓ 含内部组件包" || { echo "  ✗ 缺少内部组件包"; FAIL=1; }
