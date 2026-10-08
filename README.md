@@ -157,7 +157,7 @@ cmake --build build --target DaweiDrumScore --parallel
 打包成三种安装包（脚本也可在本地跑，缺 dpkg-deb / rpmbuild 时自动跳过对应格式）：
 
 ```bash
-sh installer/linux/make_packages.sh build/VST3/Release/DaweiDrumScore.vst3 1.0.0 dist
+sh installer/linux/make_packages.sh build/VST3/Release/DaweiDrumScore.vst3 1.0.1 dist
 ```
 
 > 解码不依赖任何音频开发库 —— 三个单文件解码库（dr_wav / dr_mp3 / dr_flac）

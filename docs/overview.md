@@ -301,3 +301,45 @@ B 站署名仍在底部页脚：`♪ B 站「大伟鼓谱」· 欢迎关注，�
 1. 触控板双指捏合缩放是否恢复
 2. 点谱面小节后是否还会偶发从头发播放
 3. 填对 BPM + 拍号后，网格小节号是否和谱面对齐
+
+---
+
+## v1.0.1 发版（2026-10-08）
+
+Windows 版由用户**上机实测通过**后发版。
+
+### 本轮修的两个 Windows Bug
+
+| # | 现象 | 根因 | 提交 |
+|---|---|---|---|
+| 1 | 波形区一片空白（音频正常） | 双缓冲收尾时 `BitBlt` 写在 `SelectObject(dc, oldBmp)` **之后** —— BitBlt 读的是 DC 当前选中的位图，摘掉后挂回的是 `CreateCompatibleDC` 自带的 1×1 单色占位图 → 拷出一整块纯色 | `9f340f1` |
+| 2 | 高分屏上界面太小 | 宿主是 Per-Monitor DPI Aware，窗口坐标是**物理像素**，写死的 340×384 在 150%/200% 下就真的只画那么点物理像素 | `d1cbc6a` |
+
+高 DPI 修法要点：DPI 探测三级降级（`GetDpiForWindow` → `GetDpiForMonitor` → `GetDeviceCaps`，
+全部 `GetProcAddress` 动态取，不新增链接依赖），系数夹到 [1,3] 并**量化到 0.25 档**；
+布局继续写 96 DPI 设计值、由 `px()` 统一换算；⭐ `secToX()` / `xToSec()` 的基准必须改成
+缩放后的 `m_waveW`，否则 DPI≠96 时点击定位整体偏移。
+
+### 三平台检查结论
+
+| 平台 | 构建 | 本次是否改动 | HiDPI 情况 |
+|---|---|---|---|
+| macOS | 本机 `./build.sh` 6 项验证全绿（universal 双架构、72 项接口、42 项播放核心） | 未改布局；`gui.h` 的新增成员不影响 AppKit 路径 | ✅ 天然安全：AppKit 用 point 坐标，Retina 由系统自动 ×2 渲染 |
+| Windows | CI 全绿 + 用户上机实测通过 | 修波形 + 加 DPI 缩放 | ✅ 已修 |
+| Linux | CI 全绿 | 未改 | ⚠️ **已知限制**：X11 自绘窗口尺寸是物理像素，桌面缩放 200% 时界面偏小 |
+
+> Linux 的 HiDPI 未在本轮一并处理，理由：`gui_linux.cpp` 的布局是 6 个尺寸常量 +
+> 20 个 `const Rect` 控件矩形 + 约 50 处字面量引用，要全量缩放得改 30+ 处引用点，
+> 而 **Linux 版 GUI 从未实机验证过**（本机是 Mac，CI 不渲染 GUI）—— 改动风险大于收益。
+> 要补的话，最小改动方案是把这些常量/矩形改成运行时按 `Xft.dpi` 重算的全局量
+> （引用处不用动），默认路径 `Xft.dpi=96` → 系数 1.0，行为不变。
+
+### Release 资产（v1.0.1，资产名全 ASCII）
+
+- `DaweiDrumScore-1.0.1-Windows-Setup.exe`
+- `DaweiDrumScore-1.0.1-macOS.pkg`
+- `DaweiDrumScore-1.0.1-Linux-x86_64.tar.gz` / `.deb` / `.rpm`
+
+版本号散落在 **9 处**，升级时必须同步：CMakeLists.txt（`project VERSION`，Linux CI 从此 grep 提取）、
+installer/windows/setup.iss、make_pkg.sh、build.sh 的 CFBundle 两行、pkg/distribution.xml、
+source/plugin.mm、source/aplaysdk.cpp 两处。
