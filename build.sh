@@ -110,6 +110,12 @@ for ARCH in x86_64 arm64; do
   # aplaysdk 是纯 C++（不含 ObjC），按普通 C++ 编译 —— 与 Windows 端共用同一份源码
   $CXX -std=c++17 -O2 -DNDEBUG=1 $AFLAGS -mmacosx-version-min=11.0 -fPIC \
        -I"$SRC" -I"$SDK" -c "$SRC/aplaysdk.cpp" -o "$OUT/plugin_$ARCH.o" $FRAMEWORKS
+  # Ogg Vorbis 解码：三端系统框架都没有 Vorbis 解码器（CoreAudio 没有、
+  # Media Foundation 也没有），所以三端共用这一份 stb_vorbis。
+  # -w：文件里 #include 了 stb_vorbis.c（约 5600 行第三方 C 代码），
+  #     它自带一条无害的 -Wtautological-compare，不屏蔽会刷屏。
+  $CXX -std=c++17 -O2 -DNDEBUG=1 -w $AFLAGS -mmacosx-version-min=11.0 -fPIC \
+       -I"$SRC" -I"$SDK" -c "$SRC/ogg_vorbis.cpp" -o "$OUT/ogg_vorbis_$ARCH.o"
 done
 
 # 合并必须在循环外 —— 放循环内会被下一轮的单架构 .o 覆盖
@@ -117,10 +123,12 @@ lipo -create "$OUT/audiofile_x86_64.o"  "$OUT/audiofile_arm64.o"  -output "$OUT/
 lipo -create "$OUT/crashguard_x86_64.o" "$OUT/crashguard_arm64.o" -output "$OUT/crashguard.o"
 lipo -create "$OUT/gui_x86_64.o"       "$OUT/gui_arm64.o"       -output "$OUT/gui.o"
 lipo -create "$OUT/plugin_x86_64.o"    "$OUT/plugin_arm64.o"    -output "$OUT/plugin.o"
+lipo -create "$OUT/ogg_vorbis_x86_64.o" "$OUT/ogg_vorbis_arm64.o" -output "$OUT/ogg_vorbis.o"
 
 echo "==> 链接"
 $CXX -bundle -arch x86_64 -arch arm64 -o "$BUNDLE/Contents/MacOS/$EXEC_NAME" \
-  "$OUT/player.o" "$OUT/audiofile.o" "$OUT/gui.o" "$OUT/plugin.o" "$OUT/crashguard.o" $SDK_OBJS \
+  "$OUT/player.o" "$OUT/audiofile.o" "$OUT/gui.o" "$OUT/plugin.o" "$OUT/crashguard.o" \
+  "$OUT/ogg_vorbis.o" $SDK_OBJS \
   $FRAMEWORKS
 
 echo "==> 生成 Info.plist"
@@ -135,8 +143,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key>                        <string>大伟鼓谱MuseScore音频播放器</string>
     <key>CFBundlePackageType</key>                 <string>BNDL</string>
     <key>CFBundleSignature</key>                   <string>????</string>
-    <key>CFBundleShortVersionString</key>          <string>1.0.2</string>
-    <key>CFBundleVersion</key>                     <string>1.0.2</string>
+    <key>CFBundleShortVersionString</key>          <string>1.1.0</string>
+    <key>CFBundleVersion</key>                     <string>1.1.0</string>
     <key>NSHumanReadableCopyright</key>            <string>Free for personal use</string>
 </dict>
 </plist>
@@ -264,10 +272,17 @@ fi
 # 解码路径：不同编码格式在 AVFoundation 里走不同解码器，个别分支会抛
 # ObjC 异常——插件里没人接，异常穿到宿主就是闪退。所以逐个格式真跑一遍。
 echo "==> 验证 4：多格式解码（含异常捕获）"
-$CXX -x objective-c++ -std=c++17 -O1 -fobjc-arc -arch arm64 \
-     -I"$SRC" -o "$OUT/decode_probe" \
-     "$HERE/decode_probe.mm" "$SRC/audiofile.mm" \
-     -framework AVFoundation -framework Foundation 2>&1 | tail -3
+# 注意 audiofile.mm 会引用 OGG 那条支路，所以必须一起链上 ogg_vorbis.cpp。
+# 这里的失败要当致命处理：以前用 `| tail -3` 不检查退出码，链不上时旧二进制
+# 会被拿去跑，结果是「假通过」—— 明明没编出来却报验证通过。
+if ! $CXX -x objective-c++ -std=c++17 -O1 -w -fobjc-arc -arch arm64 \
+         -I"$SRC" -o "$OUT/decode_probe" \
+         "$HERE/decode_probe.mm" "$SRC/audiofile.mm" "$SRC/ogg_vorbis.cpp" \
+         -framework AVFoundation -framework Foundation > "$OUT/decode_probe.build.log" 2>&1; then
+  echo "  ✗ 解码探针编译失败："
+  grep -E "error" "$OUT/decode_probe.build.log" | head -5 | sed 's/^/    /'
+  exit 1
+fi
 
 PROBE_ARGS=""
 # 有损压缩（走音频解码器）
@@ -307,11 +322,13 @@ fi
 # 按崩溃日志里的时序把两条路径各跑一遍。
 echo "==> 验证 5：界面生命周期（点开音频 / 拖入文件）"
 if [ -n "$TEST_AUDIO" ] && [ -f "$TEST_AUDIO" ]; then
+  # audiofile_arm64.o 引用 OGG 解码支路 → 这里也得链上 ogg_vorbis（按 arm64 单独编，
+  # 因为它跟 gui_repro 一样是单架构的）
   build_test "$OUT/gui_repro" -x objective-c++ -std=c++17 -O1 -DNDEBUG=1 -arch arm64 \
              -mmacosx-version-min=11.0 -I"$SRC" -I"$SDK" \
              "$HERE/gui_repro.mm" \
              -x none "$OUT/gui_arm64.o" "$OUT/player.o" "$OUT/crashguard_arm64.o" \
-             "$OUT/audiofile_arm64.o" $SDK_OBJS_ARM64 $FRAMEWORKS
+             "$OUT/audiofile_arm64.o" "$OUT/ogg_vorbis_arm64.o" $SDK_OBJS_ARM64 $FRAMEWORKS
 
   UI_FAIL=0
   for MODE in load drag grid; do
@@ -331,8 +348,9 @@ fi
 # 播放核心单元测试：带符号偏移的静音长度、音频是否被跳过、播完能否重播。
 # 这一层跑得最快，也最容易定位 —— 上面几项失败时先看它的输出。
 echo "==> 验证 6：播放核心单元测试（带符号偏移）"
-build_test "$OUT/test_player" -x objective-c++ -std=c++17 -O1 -fobjc-arc -arch arm64 \
-           "$HERE/test_player.cpp" "$SRC/player.cpp" "$SRC/audiofile.mm" -I"$SRC" \
+build_test "$OUT/test_player" -x objective-c++ -std=c++17 -O1 -w -fobjc-arc -arch arm64 \
+           "$HERE/test_player.cpp" "$SRC/player.cpp" "$SRC/audiofile.mm" \
+           "$SRC/ogg_vorbis.cpp" -I"$SRC" \
            -framework AVFoundation -framework Foundation
 if "$OUT/test_player" > "$OUT/player.log" 2>&1; then
   echo "  ✓ 播放核心验证通过（$(grep -c PASS "$OUT/player.log") 项）"
@@ -353,6 +371,20 @@ if "$OUT/factory_lifecycle_test" "$BUNDLE/Contents/MacOS/$EXEC_NAME" \
 else
   echo "  ✗ 工厂生命周期验证失败（宿主会因此闪退）："
   grep FAIL "$OUT/factory.log" | head -5 | sed 's/^/    /'
+  exit 1
+fi
+
+# Ogg Vorbis：三端系统框架都没有 Vorbis 解码器（CoreAudio 没有、Media Foundation
+# 也没有），这一格完全靠我们自己带进去的 stb_vorbis，所以必须真跑一遍。
+# 素材是入库的小文件（testdata/），不依赖机器上装没装 ffmpeg。
+echo "==> 验证 8：Ogg Vorbis 解码（含单声道合并 / Opus 提示）"
+build_test "$OUT/ogg_vorbis_test" -std=c++17 -O1 -w -arch arm64 \
+           "$HERE/ogg_vorbis_test.cpp" "$SRC/ogg_vorbis.cpp" -I"$SRC"
+if "$OUT/ogg_vorbis_test" "$HERE/testdata" > "$OUT/ogg.log" 2>&1; then
+  echo "  ✓ Ogg Vorbis 验证通过（$(grep -c PASS "$OUT/ogg.log") 项）"
+else
+  echo "  ✗ Ogg Vorbis 验证失败："
+  grep FAIL "$OUT/ogg.log" | head -8 | sed 's/^/    /'
   exit 1
 fi
 

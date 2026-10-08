@@ -1,7 +1,13 @@
 //==============================================================================
 // audiofile.cpp - 音频解码（AVFoundation）
+//
+// 例外：Ogg Vorbis 不走 AVFoundation。CoreAudio 从来没有过 Vorbis 解码器
+//   （系统里只有 mp3 / aac / alac / flac / aiff 这些），所以这一格和 Windows
+//   一样必须自带解码器 —— 走三端共用的 ogg_vorbis.cpp（stb_vorbis）。
+//   见 ogg_vorbis.h。
 //==============================================================================
 #include "audiofile.h"
+#include "ogg_vorbis.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
@@ -38,6 +44,12 @@ bool decodeAudioFile(const std::string& path, AudioData& out, std::string& err)
             err = "文件路径为空";
             return false;
         }
+
+        // Ogg Vorbis 交给自带的 stb_vorbis。
+        // 放在最前面：AVFoundation 这条路对它必然是失败的，白跑一趟
+        // 还会把 err 覆盖成 CoreAudio 那句没什么信息量的报错。
+        if (isOggExtension(path))
+            return decodeOggVorbis(path, out, err);
 
         NSString* nsPath = [NSString stringWithUTF8String:path.c_str()];
         if (!nsPath)
@@ -184,7 +196,8 @@ bool decodeAudioFile(const std::string& path, AudioData& out, std::string& err)
 bool isSupportedAudioExtension(const std::string& path)
 {
     static const char* kExt[] = { ".mp3", ".wav", ".m4a", ".aac", ".alac",
-                                  ".aiff", ".aif", ".caf", ".flac", ".mp4", ".m4b" };
+                                  ".aiff", ".aif", ".caf", ".flac", ".mp4", ".m4b",
+                                  ".ogg", ".oga" };
     const size_t n = path.size();
     std::string lower;
     lower.reserve(n);

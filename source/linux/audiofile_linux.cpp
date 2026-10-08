@@ -12,11 +12,15 @@
 //   用户端还得自行安装运行时库。把编解码器直接编进插件，用户【零依赖】，
 //   下载即用 —— 与 Mac/Win 走系统原生解码一样省心。
 //
-// 覆盖格式：WAV / MP3 / FLAC。
+// 覆盖格式：WAV / MP3 / FLAC（dr_libs）+ OGG Vorbis（自带 stb_vorbis）。
 // 不支持：m4a / aac / wma（Linux 上零依赖方案覆盖不到，会给出明确提示，
 //   而不是静默失败）。
+//
+// Ogg Vorbis 虽然也是「编进插件的编解码器」，但因为它三端系统框架都没有，
+// 所以写成平台无关的共享源码 ogg_vorbis.cpp，被三端一起编译 —— 见 ogg_vorbis.h。
 //==============================================================================
 #include "audiofile.h"
+#include "ogg_vorbis.h"
 
 #include <cctype>
 #include <cstdio>
@@ -32,7 +36,7 @@ namespace ap {
 
 namespace {
 
-enum class Fmt { Unknown, Wav, Mp3, Flac };
+enum class Fmt { Unknown, Wav, Mp3, Flac, Ogg };
 
 // 每次解码 4096 帧：够大以减少循环开销，临时缓冲又不会太大
 constexpr size_t kChunkFrames = 4096;
@@ -62,6 +66,7 @@ Fmt formatOfExt (const std::string& ext)
     if (ext == ".wav" || ext == ".wave") return Fmt::Wav;
     if (ext == ".mp3")                   return Fmt::Mp3;
     if (ext == ".flac")                  return Fmt::Flac;
+    if (ext == ".ogg" || ext == ".oga")  return Fmt::Ogg;
     return Fmt::Unknown;
 }
 
@@ -83,6 +88,11 @@ Fmt sniffFormat (const std::string& path)
         return Fmt::Wav;
     if (n >= 4 && std::memcmp (h, "fLaC", 4) == 0)
         return Fmt::Flac;
+    // Ogg 家族统一标记（Vorbis / Opus / FLAC 都是 "OggS" 开头）。
+    // 具体是哪一个由 ogg_vorbis.cpp 打开后判断，认不出来时给的是
+    // 「这是 Opus 不是 Vorbis」这类有信息量的提示。
+    if (n >= 4 && std::memcmp (h, "OggS", 4) == 0)
+        return Fmt::Ogg;
     if (n >= 3 && std::memcmp (h, "ID3", 3) == 0)
         return Fmt::Mp3;
     // MPEG 音频帧同步字：前 11 位全 1
@@ -251,20 +261,21 @@ bool decodeAudioFile (const std::string& path, AudioData& out, std::string& err)
         case Fmt::Wav:  return decodeWav  (path, out, err);
         case Fmt::Mp3:  return decodeMp3  (path, out, err);
         case Fmt::Flac: return decodeFlac (path, out, err);
+        case Fmt::Ogg:  return decodeOggVorbis (path, out, err);
         default: break;
     }
 
     if (ext.empty ())
-        err = "无法识别的音频文件（Linux 版支持 MP3 / WAV / FLAC）";
+        err = "无法识别的音频文件（Linux 版支持 MP3 / WAV / FLAC / OGG）";
     else
-        err = "Linux 版暂不支持 " + ext + " 格式，请转换为 MP3 / WAV / FLAC";
+        err = "Linux 版暂不支持 " + ext + " 格式，请转换为 MP3 / WAV / FLAC / OGG";
     return false;
 }
 
 //------------------------------------------------------------------------------
 bool isSupportedAudioExtension (const std::string& path)
 {
-    static const char* kExt[] = { ".mp3", ".wav", ".wave", ".flac" };
+    static const char* kExt[] = { ".mp3", ".wav", ".wave", ".flac", ".ogg", ".oga" };
 
     std::string lower;
     lower.reserve (path.size ());

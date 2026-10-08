@@ -185,7 +185,8 @@ bool isAudioFile (const std::string& name)
     std::string e = name.substr (dot);
     for (char& c : e)
         c = static_cast<char> (std::tolower (static_cast<unsigned char> (c)));
-    return e == ".mp3" || e == ".wav" || e == ".wave" || e == ".flac";
+    return e == ".mp3" || e == ".wav" || e == ".wave" || e == ".flac"
+        || e == ".ogg" || e == ".oga";
 }
 
 } // namespace
@@ -1002,7 +1003,7 @@ void X11View::drawControls (XftDraw* xd)
     drawText (xd, rFile.x, rFile.y + 14, m_fileText.c_str (), xc (CText), m_fontSmall);
     drawText (xd, rStatus.x, rStatus.y + 14, m_statusText.c_str (), xc (CText), m_fontSmall);
     drawText (xd, rFmt.x, rFmt.y + 14,
-              "支持 MP3 / WAV / FLAC",
+              "支持 MP3/WAV/FLAC/OGG",
               xc (CTextDim), m_fontSmall);
 
     if (!m_errText.empty ())

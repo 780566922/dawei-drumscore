@@ -13,7 +13,7 @@ MuseScore 本身不支持加载外部音频伴奏。这个插件以 VST3 的形�
 ## 功能特性
 
 - 🎵 **拖拽即播**：把音频文件拖进插件窗口即可加载
-  （macOS / Windows：mp3 / wav / m4a / aac / flac 等；Linux：mp3 / wav / flac）
+  （macOS / Windows：mp3 / wav / m4a / aac / flac / ogg 等；Linux：mp3 / wav / flac / ogg）
 - 📈 **波形 + 小节网格**：显示音频波形与按拍号推算的小节线、小节号（可独立开关）
 - 🔴 **播放位置映射**：红线标记音频当前播放位置在谱面上的对应位置
 - ↔️ **免裁剪对齐（偏移）**：音频与谱面起点不一致时，用偏移对齐，无需裁剪音频
@@ -84,11 +84,13 @@ sudo dnf install ./DaweiDrumScore-*-Linux-x86_64.rpm
 **运行要求**：glibc ≥ 2.31，即 Ubuntu 20.04+ / Debian 11+ / RHEL 9+；
 依赖 `libX11` 与 `libXft`（桌面发行版默认都装了）。
 
-> 插件本身**零额外运行时依赖** —— MP3 / WAV / FLAC 三个解码器直接编进了 .so，
+> 插件本身**零额外运行时依赖** —— MP3 / WAV / FLAC / OGG 的解码器直接编进了 .so，
 > 不需要 FFmpeg、libsndfile 之类任何东西。
 
-> **格式支持**：Linux 版支持 **MP3 / WAV / FLAC**。m4a / aac 在 Linux 上没有零依赖的解码方案，
-> 为保「下载即用、零运行时依赖」故未支持 —— 请先转成 MP3 或 WAV。
+> **格式支持**：Linux 版支持 **MP3 / WAV / FLAC / OGG（Ogg Vorbis）**。
+> m4a / aac 在 Linux 上没有零依赖的解码方案，为保「下载即用、零运行时依赖」故未支持
+> —— 请先转成 MP3 或 WAV。
+> ⚠️ OGG 指的是 **Ogg Vorbis**；同后缀的 **Ogg Opus** 不支持（是另一套编码），会给出明确提示。
 >
 > Linux 版本目前**未经实机测试**，如遇问题请提 [Issue](../../issues)。
 
@@ -236,6 +238,15 @@ Linux：`$HOME/DaweiDrumScore.log`）。
 Linux 没有像 AVFoundation / Media Foundation 那样的系统级零依赖解码方案。
 为了「下载即用、装完零运行时依赖」，Linux 版把 MP3 / WAV / FLAC 三个解码器直接编进了插件；
 m4a / aac 需要额外引入 FFmpeg 一类依赖，会让用户安装变复杂，故暂不支持 —— 转成 MP3 即可。
+
+**Q：OGG 支持到什么程度？Opus 呢？**
+支持 **Ogg Vorbis**（`.ogg` / `.oga`），三个平台都能放。
+这一点值得单独说明：macOS 的 CoreAudio 和 Windows 的 Media Foundation **都没有内置 Vorbis 解码器**
+（微软把它放在商店的可选包「Web Media Extensions」里，默认不装），所以 OGG 不是"调用系统解码"，
+而是插件**自带了一份解码器**（stb_vorbis，三端共用同一份源码）。
+
+**Ogg Opus 不支持**（`.opus` 或后缀写成 `.ogg` 的 Opus）。Opus 是另一套编码，需要另一个解码器。
+插件会识别出来并明确提示"这是 Ogg Opus"，而不是含糊地报"解码失败" —— 转成 MP3 或 OGG 即可。
 
 **Q：Linux 版能在我的发行版上跑吗？**
 能跑的条件是 **glibc ≥ 2.31**：Ubuntu 20.04+ / Debian 11+ / RHEL 9+ / Fedora 32+ 及更新的桌面发行版都满足。

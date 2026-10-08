@@ -11,10 +11,15 @@
 //   覆盖 MP3 / WAV / M4A(AAC) / WMA / FLAC(Win10+) 等；
 //   系统装了对应 codec 的格式也能解。
 //
+// 例外：Ogg Vorbis 不走 MF。MF 内置解码器里【没有】Vorbis（微软把它放在
+//   商店的可选包「Web Media Extensions」里，默认不装），所以这一格必须自带
+//   解码器 —— 走三端共用的 ogg_vorbis.cpp（stb_vorbis）。见 ogg_vorbis.h。
+//
 // 路径编码：源路径是 UTF-8（std::string），MF 只认 UTF-16，
 //   所以这里统一做 UTF-8 → UTF-16 转换，中文路径/文件名才能正常打开。
 //==============================================================================
 #include "audiofile.h"
+#include "ogg_vorbis.h"
 
 #include <windows.h>
 #include <mfapi.h>
@@ -165,6 +170,14 @@ bool decodeAudioFile (const std::string& path, AudioData& out, std::string& err)
         err = "文件路径为空";
         return false;
     }
+
+    // Ogg Vorbis 交给自带的 stb_vorbis。放在 MF 初始化之前：
+    // 解 OGG 根本用不到 Media Foundation，不该为它付初始化成本
+    //（更要紧的是：MF 那条路必然是失败的，白跑一遍还会覆盖掉我们
+    //  更准确的错误提示，比如「这是 Opus 不是 Vorbis」）。
+    if (isOggExtension (path))
+        return decodeOggVorbis (path, out, err);
+
     if (!ensureMfStarted ())
     {
         err = "Media Foundation 初始化失败（系统组件缺失）";
@@ -320,11 +333,13 @@ bool decodeAudioFile (const std::string& path, AudioData& out, std::string& err)
 }
 
 //------------------------------------------------------------------------------
-// Windows 上支持的扩展名（Media Foundation 解得了的那些）
+// Windows 上支持的扩展名
+//   MF 解得了的那些 + 我们自己带的 Ogg Vorbis（.ogg / .oga）
 bool isSupportedAudioExtension (const std::string& path)
 {
     static const char* kExt[] = { ".mp3", ".wav", ".m4a", ".aac", ".wma",
-                                  ".mp4", ".m4b", ".flac", ".aif", ".aiff", ".adts" };
+                                  ".mp4", ".m4b", ".flac", ".aif", ".aiff", ".adts",
+                                  ".ogg", ".oga" };
     std::string lower;
     lower.reserve (path.size ());
     for (char c : path)

@@ -27,7 +27,7 @@
 #==============================================================================
 cmake_minimum_required(VERSION 3.20)
 
-project(DaweiDrumScore VERSION 1.0.2 LANGUAGES C CXX)
+project(DaweiDrumScore VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,6 +95,9 @@ add_subdirectory("${VST3_SDK_DIR}" "${CMAKE_BINARY_DIR}/vst3sdk")
 set(AP_SOURCES
     source/player.cpp        # 播放核心（纯 C++，跨平台）
     source/aplaysdk.cpp      # VST3 处理器 / 控制器 / 工厂（纯 C++）
+    # Ogg Vorbis 解码 —— 三端系统框架都没有 Vorbis，所以三端都得自带这一份。
+    # 见 source/ogg_vorbis.h。（stb_vorbis 的实现单元由它 #include 进来）
+    source/ogg_vorbis.cpp
 )
 
 if(APPLE)
@@ -184,4 +187,13 @@ elseif(UNIX)
     # 第三方单文件解码库：屏蔽它自身的编译警告，别淹没我们自己的日志
     set_source_files_properties(source/linux/dr_libs_impl.cpp
         PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+
+# ogg_vorbis.cpp 里 #include 了 stb_vorbis.c（约 5600 行第三方 C 代码）。
+# 它自己会带出一条无害的 -Wtautological-compare，不屏蔽的话每次构建都刷屏，
+# 把真正的告警淹掉。这个屏蔽只作用于该文件，不影响我们自己的代码。
+if(MSVC)
+    set_source_files_properties(source/ogg_vorbis.cpp PROPERTIES COMPILE_OPTIONS "/w")
+else()
+    set_source_files_properties(source/ogg_vorbis.cpp PROPERTIES COMPILE_OPTIONS "-w")
 endif()

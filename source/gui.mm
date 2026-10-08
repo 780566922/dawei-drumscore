@@ -997,7 +997,9 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         _st->playBtn.toolTip = @"插件无法反向控制宿主播放，此按钮仅显示宿主播放状态；\n请直接在宿主里播放/暂停";
 
         // ---- 拖放提示 ----
-        NSTextField* hint = [self label:@"支持 MP3 / WAV / M4A / AAC / ALAC / AIFF" size:10
+        // 文案收紧成不带空格的形式：加上 OGG 后原串会顶到 196px 的框外。
+        // 这里不动 frame —— 布局尺寸有验证器断言盯着，改文案风险最低。
+        NSTextField* hint = [self label:@"支持 MP3/WAV/M4A/AAC/FLAC/OGG" size:10
                                  align:NSTextAlignmentRight];
         hint.frame = NSMakeRect (430, 320, 196, 14);
         [hint setTextColor:[NSColor colorWithCalibratedWhite:0.5 alpha:1.0]];
@@ -1256,7 +1258,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     p.allowsMultipleSelection = NO;
     p.canChooseDirectories = NO;
     p.allowedFileTypes = @[ @"mp3", @"wav", @"m4a", @"aac", @"alac", @"aiff", @"aif",
-                            @"caf", @"flac", @"mp4" ];
+                            @"caf", @"flac", @"mp4", @"ogg", @"oga" ];
     p.message = @"选择要播放的音频文件";
     if ([p runModal] != NSModalResponseOK) return;
 
@@ -1327,7 +1329,8 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     static NSSet* ok = nil;
     if (!ok)
         ok = [[NSSet alloc] initWithArray:@[ @"mp3", @"wav", @"m4a", @"aac", @"alac",
-                                              @"aiff", @"aif", @"caf", @"flac", @"mp4" ]];
+                                              @"aiff", @"aif", @"caf", @"flac", @"mp4",
+                                              @"ogg", @"oga" ]];
     return [ok containsObject:ext];
 }
 

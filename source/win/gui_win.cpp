@@ -504,7 +504,10 @@ bool WinView::create (HWND parent, int w, int h)
                         L"拖动=定位　Ctrl/Alt拖动=改偏移　滚轮=平移　Ctrl/Alt滚轮=缩放　双击=全览",
                         SS_LEFT, 0);
     m_statusLamp  = mk (L"STATIC", L"○ 未载入", SS_LEFT, 0);
-    m_fmtLabel    = mk (L"STATIC", L"支持 MP3/WAV/M4A/AAC/WMA/FLAC", SS_LEFT, 0);
+    // ⚠ 标签框只有 190px（11px 字号）。加 OGG 后原串会溢出被裁，
+    //   所以把 WMA 从这里拿掉腾位置 —— WMA 仍在文件对话框的筛选器和
+    //   isSupportedAudioExtension 里，只是不再占用这行提示。
+    m_fmtLabel    = mk (L"STATIC", L"支持 MP3/WAV/M4A/AAC/FLAC/OGG", SS_LEFT, 0);
     m_brand       = mk (L"STATIC", L"♪ B 站「大伟鼓谱」· 欢迎关注，鼓谱 / 教学 / 伴奏持续更新",
                         SS_LEFT, IDC_BRAND);
 
@@ -985,7 +988,7 @@ void WinView::openFileDialog ()
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof ofn;
     ofn.hwndOwner = m_hwnd;
-    ofn.lpstrFilter = L"音频文件\0*.mp3;*.wav;*.m4a;*.aac;*.wma;*.flac;*.aif;*.aiff\0所有文件\0*.*\0";
+    ofn.lpstrFilter = L"音频文件\0*.mp3;*.wav;*.m4a;*.aac;*.wma;*.flac;*.aif;*.aiff;*.ogg;*.oga\0所有文件\0*.*\0";
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH * 2;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;

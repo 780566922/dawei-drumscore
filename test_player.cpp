@@ -250,6 +250,9 @@ int main()
         check(".m4a", isSupportedAudioExtension("a.m4a"));
         check(".wav", isSupportedAudioExtension("a.wav"));
         check(".flac", isSupportedAudioExtension("a.flac"));
+        check(".ogg", isSupportedAudioExtension("a.ogg"));
+        check(".OGG 大写", isSupportedAudioExtension("a.OGG"));
+        check(".oga", isSupportedAudioExtension("a.oga"));
         check(".txt 不支持", !isSupportedAudioExtension("a.txt"));
         check("a.mp3.txt 不支持", !isSupportedAudioExtension("a.mp3.txt"));
     }
