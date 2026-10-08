@@ -3,7 +3,7 @@
 # make_pkg.sh — 把已编译好的 VST3 打包成可分发的 macOS 安装包(.pkg)
 #
 # 前置：先跑 ./build.sh 生成 build/大伟鼓谱MuseScore音频播放器.vst3
-# 产物：dist/大伟鼓谱MuseScore音频播放器-1.0.0.pkg
+# 产物：dist/大伟鼓谱MuseScore音频播放器-<VERSION>.pkg
 #
 # 安装位置：/Library/Audio/Plug-Ins/VST3/（全局，所有账号 + MuseScore 都能扫到）
 # 安装方式：双击 PKG → 系统安装器 → 输密码 → 完成（业界 VST 插件标准做法）
@@ -16,7 +16,7 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE_NAME="大伟鼓谱MuseScore音频播放器.vst3"
 DISPLAY_NAME="大伟鼓谱 MuseScore 音频播放器"
-VERSION="1.0.0"
+VERSION="1.0.1"
 IDENT="com.dawei.drumscore"
 
 SRC_BUNDLE="$HERE/build/$BUNDLE_NAME"
@@ -96,12 +96,12 @@ if [ "$FAIL" = "1" ]; then echo "  安装包校验失败"; exit 1; fi
 rm -rf "$WORK"
 
 # ---- 生成放行指引 ----
-cat > "$DIST/安装说明-请先读.txt" <<'TXTEOF'
+cat > "$DIST/安装说明-请先读.txt" <<TXTEOF
 大伟鼓谱 MuseScore 音频播放器 — 安装说明
 ========================================
 
 【怎么装】
-双击「大伟鼓谱MuseScore音频播放器-1.0.0.pkg」，
+双击「大伟鼓谱MuseScore音频播放器-$VERSION.pkg」，
 按提示点「继续 / 安装」，输入开机密码即可。
 
 【如果双击提示"来自身份不明的开发者"】

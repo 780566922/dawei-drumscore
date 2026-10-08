@@ -19,5 +19,5 @@
     <choice id="com.dawei.drumscore" visible="false">
         <pkg-ref id="com.dawei.drumscore"/>
     </choice>
-    <pkg-ref id="com.dawei.drumscore" version="1.0.0" onConclusion="none">component.pkg</pkg-ref>
+    <pkg-ref id="com.dawei.drumscore" version="1.0.1" onConclusion="none">component.pkg</pkg-ref>
 </installer-gui-script>

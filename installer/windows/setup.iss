@@ -19,7 +19,7 @@
 #endif
 
 #define MyAppName      "大伟鼓谱 MuseScore 音频播放器"
-#define MyAppVersion   "1.0.0"
+#define MyAppVersion   "1.0.1"
 #define MyAppPublisher "大伟鼓谱"
 #define MyVst3Folder   "DaweiDrumScore.vst3"
 ; ↓ 想指向你的 B 站空间，把这里换成 https://space.bilibili.com/你的UID
