@@ -72,7 +72,10 @@ enum : int
     IDC_BPM_DOWN,
     IDC_TIMESIG_COMBO,
     IDC_VOLUME_SLIDER,
-    IDC_HELP,
+    // ⚠️ 不能叫 IDC_HELP —— winuser.h 已经把 IDC_HELP 定义成「帮助光标」的资源 ID
+    //    （MAKEINTRESOURCE(32651)）。同名枚举项会被宏展开成一串语法垃圾，
+    //    MSVC 只报 "syntax error: missing '}' before '('"，很难看出是宏冲突。
+    IDC_HELP_BTN,
     IDC_BRAND = 1100,
     IDC_TIMER_UI = 1200
 };
@@ -504,7 +507,7 @@ bool WinView::create (HWND parent, int w, int h)
     m_openBtn   = mk (L"BUTTON", L"打开音频…", BS_PUSHBUTTON, IDC_OPEN);
     // 「？帮助」：唤出使用指南覆盖层。有用户反馈不知道怎么用，说明书必须能在
     // 界面上直接点开，不能只躺在安装目录的 readme 里。
-    m_helpBtn   = mk (L"BUTTON", L"？帮助", BS_PUSHBUTTON, IDC_HELP);
+    m_helpBtn   = mk (L"BUTTON", L"？帮助", BS_PUSHBUTTON, IDC_HELP_BTN);
     m_zoomOut   = mk (L"BUTTON", L"缩小", BS_PUSHBUTTON, IDC_ZOOM_OUT);
     m_zoomIn    = mk (L"BUTTON", L"放大", BS_PUSHBUTTON, IDC_ZOOM_IN);
     m_zoomFit   = mk (L"BUTTON", L"全览", BS_PUSHBUTTON, IDC_ZOOM_FIT);
@@ -1281,7 +1284,7 @@ void WinView::onCommand (int id, int notify)
             refreshLabels ();
             ::InvalidateRect (m_wave, nullptr, FALSE);
             break;
-        case IDC_HELP:
+        case IDC_HELP_BTN:
             toggleHelp ();
             break;
         case IDC_GRID_CHECK:
