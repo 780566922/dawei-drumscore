@@ -5,6 +5,22 @@
 
 ---
 
+## ✅ 状态更新（2026-10-08 10:0x）：补丁**已落地并编译通过**
+
+- 提交 `9f340f1` `fix(win): 修正波形区空白——BitBlt 在 SelectObject(oldBmp) 之后导致整块不上屏`
+- 两个 CI（Windows / Linux）全绿，Windows 安装包已产出：
+  - `dist/DaweiDrumScore-Setup-1.0.0-waveform-fix.exe`（安装器，双击即装）
+  - `dist/DaweiDrumScore.vst3/`（绿色版，直接拷进 `C:\Program Files\Common Files\VST3\`）
+- **下方 §1 的判断已被采纳为正式补丁**；§2 之后的备选假设树保留作兜底，
+  若上机后波形**仍然空白**再按它逐条排查。
+
+改动要点（比原计划多修了一处）：
+1. `BitBlt` 挪到 `SelectObject(dc, oldBmp)` **之前**（本文 §1 的根因）。
+2. 离屏位图**恒按 `kWaveW × kWaveH`** 建 —— `secToX()/xToSec()` 的基准是 `kWaveW`，
+   原先按 `rcPaint` 宽高建位图，局部重绘时会整块错位裁切。上屏只 Blt `rcPaint` 与波形区的交集。
+
+---
+
 ## 0. 现场事实（已由用户实测确认）
 
 | 观察项 | 实测结果 | 由此能推出什么 |
