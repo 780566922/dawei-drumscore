@@ -413,3 +413,81 @@ return gFactory;              // ← 第 3 次索取返回的是【已释放内�
 ### 资产
 
 `DaweiDrumScore-1.0.2-{Windows-Setup.exe, macOS.pkg, Linux-x86_64.tar.gz/.deb/.rpm}`
+
+---
+
+## v1.1.0 发布（2026-10-08）
+
+新增 **Ogg Vorbis 解码**，三端可用。
+
+### 为什么 OGG 需要单独写一节
+
+插件其它格式都是「调系统解码器」：macOS 走 AVFoundation/CoreAudio，Windows 走
+Media Foundation，Linux 走自家 vendored 的 dr_libs。**OGG 是唯一三端系统框架都填不上的格式**：
+
+| 平台 | 结果 | 原因 |
+|---|---|---|
+| macOS | ❌ 系统没有 | CoreAudio 从未提供过 Vorbis 解码器 |
+| Windows | ❌ 系统没有 | Media Foundation 内置解码器里没有；微软把它放在商店的可选包「Web Media Extensions」里，默认不装 |
+| Linux | ❌ 库里没有 | dr_libs 只做 WAV / MP3 / FLAC |
+
+> ⚠️ 容易混的一点：`dr_flac.h` 里到处是 "Ogg" 字样，但那指的是 **Ogg 封装的 FLAC**，
+> 与 Ogg Vorbis 是两回事（源码里还主动 `#define DR_FLAC_NO_OGG` 关掉了它）。
+
+### 实现
+
+新增平台无关的共享源码 `source/ogg_vorbis.{h,cpp}`，被三端一起编译
+（与 `player.cpp` / `aplaysdk.cpp` 同一层级）。解码器是 **stb_vorbis v1.22**
+（公共领域 / MIT-0，`source/third_party/stb_vorbis.c`，193 KB 单文件），
+按 C++ 编 —— stb 自带 `__cplusplus` 外部 "C" 保护，官方支持这么用。
+它的唯一实现单元在 `ogg_vorbis.cpp` 里 `#include` 进来，避免多 TU 重复编译。
+
+两处刻意「不用库自带能力」的地方：
+
+1. **文件读取自己写**。`stb_vorbis_open_filename()` 内部是 `fopen(const char*)`，
+   Windows 上只认 ANSI 代码页 → 中文路径打不开。现有三端解码器拿到的都是 UTF-8 路径，
+   所以自己读整个文件（Windows 走 UTF-8 → UTF-16 + `_wfopen`），再交给
+   `stb_vorbis_open_memory()`。
+2. **声道合并自己做**。stb 在「要的声道数比源多」时会给多余声道**补 0** 而不是复制
+   （见 `stb_vorbis.c` 的 `stb_vorbis_get_samples_float_interleaved`：`for (; i < channels; ++i) *buffer++ = 0;`）
+   —— mono 文件若直接按 2 声道索取，**右声道就是死的**。所以始终按源声道数取，
+   再自己按「mono → 左右复制；多声道 → 取前两路」合并，与其它格式行为一致。
+
+错误提示做了区分：同样是 `.ogg` 后缀，里面装的可能是 Opus 或 FLAC，会被识别出来并
+明确提示（"这是 Ogg Opus 文件"），而不是含糊地报"解码失败"；非 Ogg 内容改后缀也挡得住
+（校验 `OggS` 文件头）。
+
+**仍然不支持 Ogg Opus** —— 那是另一套编码，需要另一个解码器。
+
+### 接入点（六处，容易漏）
+
+- `source/audiofile.mm` / `source/win/audiofile_win.cpp` / `source/linux/audiofile_linux.cpp`：
+  在扩展名分派处转到 `ap::decodeOggVorbis`，并把 `.ogg` / `.oga` 加进各自的 `kExt[]`
+  （Linux 还要在 `sniffFormat` 里认 `OggS` 魔数）
+- 三端 UI：macOS `gui.mm` 两处（`allowedFileTypes` + 拖放白名单）+ 提示文案；
+  Windows `gui_win.cpp` 两处（文件对话框 filter + `m_fmtLabel`）；
+  Linux `gui_linux.cpp` 两处（`isAudioFile()` + 状态行文案）
+- 构建：`CMakeLists.txt`（`AP_SOURCES`）+ `build.sh`（逐架构编译 + lipo + 链接）
+
+### 回归防线
+
+新增 `testdata/`（3 个素材共 12.7 KB，入库，不依赖机器上装没装 ffmpeg）与
+`ogg_vorbis_test.cpp`，接入 `build.sh` 成为**验证 8**，27 项，重点守三条：
+立体声左右必须是两份**不同**数据、单声道必须**复制成两路**（不能补 0）、
+Opus 必须**点名提示**。
+
+### 顺带修掉一个构建漏洞
+
+「验证 4：多格式解码」探针的编译是 `$CXX ... 2>&1 | tail -3`，**不检查退出码**。
+一旦链不上，`$OUT/decode_probe` 会执行失败（或跑上一次的旧二进制），
+而判定逻辑只 grep 日志里有没有 `NSException` / `ok=0` → 什么都没找到就算通过，
+于是「明明没编出来却报验证通过」。本次新增源文件正好踩到这个坑（日志里 0 个真实文件）。
+已改为编译失败即中断。
+
+### 资产
+
+`DaweiDrumScore-1.1.0-{Windows-Setup.exe, macOS.pkg, Linux-x86_64.tar.gz/.deb/.rpm}`
+
+### 体积
+
+各平台二进制约 +100 KB（stb_vorbis 的代码），换来三端一致的 OGG 支持。
