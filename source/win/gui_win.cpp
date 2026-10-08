@@ -12,6 +12,7 @@
 //   这里创建一个子窗口挂上去，控件全部是它的子窗口。
 //==============================================================================
 #include "gui.h"
+#include "crashguard.h"   // ap::crashLog：跟随疑似失效时落一条日志
 
 #include <windows.h>
 #include <windowsx.h>
@@ -56,6 +57,17 @@ const int kWaveH  = 118;      ///< 波形区高
 // 出红色错位徽标，提示用户点「回到播放头」一键修复。
 // 与 macOS / Linux 端取同一个值，别各写各的。
 const double kDivergenceWarnSec = 0.25;
+
+//---- 「点完『回到播放头』仍然错位」的判定窗口 --------------------------------
+// 正常点一下就对齐了。若这么久之内又错位，说明偏差不是一次能纠正的，而是某个
+// 跟随条件**持续**为假 —— 再点按钮也没用，徽标文案升级为「建议重启插件」，
+// 并记一条日志（带冷却，避免抖动着刷屏）。
+// ⚠️ 这里只做「提示升级」，绝不自动 seek：0.25 秒的偏差等于十几个音频块，
+//    属结构性故障，自动 seek 会下一块又错开 → 每几十毫秒拉一次 → 音频发抖。
+//    （跳变场景的自动硬 seek 在 aplaysdk.cpp 的 captureHostTimeline 里。）
+// 用 GetTickCount() 的毫秒计数：DWORD 无符号相减天然抗 49.7 天回绕。
+const DWORD kFollowFailWindowMs = 3000;
+const DWORD kFollowFailLogGapMs  = 5000;
 
 // 控件 ID
 enum : int
@@ -307,6 +319,11 @@ private:
 
     double m_viewStart = 0.0;   ///< 视野起点（秒）
     double m_viewSpan = 8.0;    ///< 视野跨度（秒）
+
+    //---- 「点完『回到播放头』仍错位」检测（onTimer 维护，paint 只读）----
+    DWORD m_lastBackTick = 0;          ///< 上次点「回到播放头」的时刻（毫秒）
+    bool  m_followFail = false;        ///< 是否处于「点了按钮仍错位」状态
+    DWORD m_followFailLoggedTick = 0;  ///< 上次为此写日志的时刻（做冷却）
 
     //---- 高 DPI ----
     double m_scale = 1.0;             ///< DPI 缩放系数（1.0 = 96 DPI）
@@ -848,9 +865,17 @@ void WinView::paint (HDC target, const RECT& rc)
                 const double diff = pos - (tl0.playheadSec + offset);
                 if (std::fabs (diff) > kDivergenceWarnSec)
                 {
+                    // 刚点过「回到播放头」却还是错位 → 不是一次性偏差，而是跟随失效，
+                    // 此时再点按钮也没用，直接告诉用户重启插件（onTimer 里已记日志）。
                     wchar_t warn[128];
-                    std::swprintf (warn, 128, L"与谱面错位 %.2f 秒 · 点「回到播放头」",
-                                   std::fabs (diff));
+                    if (m_followFail)
+                        std::swprintf (warn, 128,
+                                       L"跟随可能已失效 · 建议重启插件（错位 %.2f 秒）",
+                                       std::fabs (diff));
+                    else
+                        std::swprintf (warn, 128,
+                                       L"与谱面错位 %.2f 秒 · 点「回到播放头」",
+                                       std::fabs (diff));
 
                     ::SelectObject (dc, m_fontSmall);
                     ::SetBkMode (dc, TRANSPARENT);
@@ -946,6 +971,7 @@ void WinView::paintHelp (HDC dc)
         L"     手填 BPM 与拍号，网格小节线才对得上。",
         L"",
         L"#6  乱了：点「回到播放头」跳回播放位置并对齐。",
+        L"     若提示「跟随可能已失效」，请重开宿主。",
     };
     const int n = static_cast<int> (sizeof (kGuide) / sizeof (kGuide[0]));
 
@@ -1117,6 +1143,42 @@ void WinView::onTimer ()
 {
     if (!m_backend)
         return;
+
+    // ---- 「点完『回到播放头』仍然错位」= 跟随本身失效 ----
+    // 正常点一下就对齐了。若 3 秒内又错位，说明有某个跟随条件持续为假 ——
+    // 徽标文案升级为「建议重启插件」，并记一条日志。
+    // 判据与波形区徽标完全一致（同样排除起播追赶期与音频尾端）。
+    {
+        const PlugView::Backend::HostTimeline tl = m_backend->hostTimeline ();
+        const double audioNow = m_backend->positionSec ();
+        const double durNow   = m_backend->durationSec ();
+        const double offNow   = static_cast<double> (m_backend->offsetSec ());
+        const double diffNow  = audioNow - (tl.playheadSec + offNow);
+
+        const bool diverging =
+            tl.playing && tl.playheadValid && durNow > 0.60
+            && audioNow > 0.30 && audioNow < durNow - 0.30
+            && std::fabs (diffNow) > kDivergenceWarnSec;
+
+        const DWORD nowT = ::GetTickCount ();
+        if (diverging && (nowT - m_lastBackTick) < kFollowFailWindowMs)
+        {
+            m_followFail = true;
+            if ((nowT - m_followFailLoggedTick) > kFollowFailLogGapMs)
+            {
+                m_followFailLoggedTick = nowT;
+                ap::crashLog ("跟随可能已失效：点「回到播放头」后 %.1f 秒仍错位 %.2f 秒"
+                              "（音频 %.3f / 谱面 %.3f + 偏移 %.3f）",
+                              static_cast<double> (nowT - m_lastBackTick) * 0.001,
+                              std::fabs (diffNow), audioNow, tl.playheadSec, offNow);
+            }
+        }
+        else
+        {
+            m_followFail = false;
+        }
+    }
+
     refreshLabels ();
     ::InvalidateRect (m_wave, nullptr, FALSE);
 }
@@ -1279,6 +1341,11 @@ void WinView::onCommand (int id, int notify)
                     const double target = tl.playheadSec + m_backend->offsetSec ();
                     m_backend->seekTo (target);
                     centerViewOn (target);      // 视野也回到播放位置
+
+                    // 记下「刚刚手动对齐过」：若 3 秒内 onTimer 又发现错位，
+                    // 说明是跟随失效而非一次性偏差 → 徽标升级提示 + 落一条日志。
+                    m_lastBackTick = ::GetTickCount ();
+                    m_followFail = false;
                 }
             }
             refreshLabels ();

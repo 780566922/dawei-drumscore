@@ -61,6 +61,16 @@ using namespace Steinberg;
 //------------------------------------------------------------------------------
 static const double kDivergenceWarnSec = 0.25;
 
+//---- 「点完『回到播放头』仍然错位」的判定窗口 ----------------------------------
+// 正常情况下点了那个按钮就该对齐。若这么久之内又检测到错位，说明偏差不是一次
+// 能纠正的，而是某个跟随条件**持续**为假 —— 此时再点按钮也没用，提示要升级成
+// 「建议重启插件」，并落一条日志方便事后收故障报告。
+// ⚠️ 这里只做「提示升级」，绝不自动 seek：0.25 秒的偏差等于十几个音频块，
+//    属结构性故障，自动 seek 会下一块又错开 → 每 33ms 拉一次 → 音频发抖。
+//    （跳变场景的自动硬 seek 在 aplaysdk.cpp 的 captureHostTimeline 里。）
+static const double kFollowFailWindowSec = 3.0;
+static const double kFollowFailLogGapSec = 5.0;   ///< 日志冷却，避免抖动着刷屏
+
 // ObjC++ 的 ivar 只能是指针/标量，C++ 容器要包在结构体里再放指针
 struct WaveState
 {
@@ -101,6 +111,11 @@ struct WaveState
     bool   followScroll = true;      ///< 是否启用「视野跟随谱面播放头」
     bool   userScrolling = false;    ///< 用户手动滚轮/拖动时暂停跟随（避免抢视图）
     double lastUserScrollAt = 0.0;   ///< 用户最后一次手动滚动的时刻（秒），用于自动恢复跟随
+
+    //---- 「点完『回到播放头』仍错位」检测（由 tick 维护，drawRect 只读）----
+    double lastBackAt = -1.0e9;      ///< 上次点「回到播放头」的时刻（systemUptime）
+    bool   followFail = false;       ///< 是否处于「点了按钮仍错位」状态
+    double followFailLoggedAt = -1.0e9;  ///< 上次为此写日志的时刻（做冷却）
 };
 
 @class WaveformView;
@@ -250,6 +265,9 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)followPlayheadTo:(double)audioSec;
 - (void)recoverAutoFollow;     ///< 用户停止手动操作超时后，自动恢复跟随
 - (void)centerOn:(double)audioSec;   ///< 把视野挪到 audioSec（用于「回到播放头」）
+- (void)noteBackToPlayhead;          ///< 记下「刚点过回到播放头」，供升级提示用
+- (void)checkFollow;                 ///< 由面板 tick 调用：判定点完按钮后是否仍错位
+- (BOOL)followFailActive;            ///< 是否处于「点了按钮仍错位」状态（只读，自测用）
 - (void)stopDrag;
 - (double)viewStartSec;        ///< 当前视野起点（秒），只读 —— 自测与状态展示用
 @end
@@ -319,6 +337,54 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 // 用途是「回到播放头」：用户可能把视野拖到了前面或后面，点一下按钮除了
 // 重新对齐，还要把画面也带回当前播放位置 —— 否则会出现「音频对齐了但看不见」
 // 的困惑。同时复位 userScrolling，让自动跟随重新接管。
+// 「点完『回到播放头』仍错位」的判定 —— 说明跟随机制本身失效，再点按钮也没用。
+// 由面板的 tick 调用（界面线程，20Hz）：日志 I/O 只能在界面线程做，音频线程绝不碰文件。
+// 判据与下面徽标完全一致，同样排除起播追赶期与音频尾端（那两种偏差天然存在）。
+- (void)checkFollow
+{
+    const ap::PlugView::Backend::HostTimeline tl = _st->backend->hostTimeline ();
+    const double audioNow = _st->backend->positionSec ();
+    const double durNow   = _st->backend->durationSec ();
+    const double offNow   = _st->backend->offsetSec ();
+    const double diffNow  = audioNow - (tl.playheadSec + offNow);
+
+    const bool diverging =
+        tl.playing && tl.playheadValid && durNow > 0.60
+        && audioNow > 0.30 && audioNow < durNow - 0.30
+        && std::fabs (diffNow) > kDivergenceWarnSec;
+
+    const double nowT = [NSProcessInfo processInfo].systemUptime;
+    if (diverging && (nowT - _st->lastBackAt) < kFollowFailWindowSec)
+    {
+        _st->followFail = true;
+        if ((nowT - _st->followFailLoggedAt) > kFollowFailLogGapSec)
+        {
+            _st->followFailLoggedAt = nowT;
+            ap::crashLog ("跟随可能已失效：点「回到播放头」后 %.1f 秒仍错位 %.2f 秒"
+                          "（音频 %.3f / 谱面 %.3f + 偏移 %.3f）",
+                          nowT - _st->lastBackAt, std::fabs (diffNow),
+                          audioNow, tl.playheadSec, offNow);
+        }
+    }
+    else
+    {
+        _st->followFail = false;
+    }
+}
+
+// 用户点了「回到播放头」：记下时刻、清掉升级状态。
+- (void)noteBackToPlayhead
+{
+    _st->lastBackAt = [NSProcessInfo processInfo].systemUptime;
+    _st->followFail = false;
+}
+
+// 只读访问器（自测用）：当前是否处于「点了按钮仍错位」状态。
+- (BOOL)followFailActive
+{
+    return _st->followFail ? YES : NO;
+}
+
 - (void)centerOn:(double)audioSec
 {
     if (!(_st->viewLen > 0.0))       // 全览状态下整段都在画面里，无需滚动
@@ -686,9 +752,13 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
             const double diff = pos - (tl.playheadSec + off);
             if (std::fabs (diff) > kDivergenceWarnSec)
             {
-                NSString* warn = [NSString stringWithFormat:
-                                  @"⚠ 与谱面错位 %.2f 秒 · 点「回到播放头」",
-                                  std::fabs (diff)];
+                // 刚点过「回到播放头」却还是错位 → 这不是一次性偏差，而是跟随失效。
+                // 此时再点按钮也没用，直接告诉用户该重启插件（tick 里已记日志）。
+                NSString* warn = _st->followFail
+                    ? [NSString stringWithFormat:
+                       @"跟随可能已失效 · 建议重启插件（错位 %.2f 秒）", std::fabs (diff)]
+                    : [NSString stringWithFormat:
+                       @"⚠ 与谱面错位 %.2f 秒 · 点「回到播放头」", std::fabs (diff)];
                 NSDictionary* wa = @{ NSFontAttributeName : [NSFont systemFontOfSize:10],
                                       NSForegroundColorAttributeName :
                                           [NSColor colorWithCalibratedWhite:1.0 alpha:1.0] };
@@ -988,6 +1058,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         @"     手填 BPM 与拍号，网格小节线才对得上。",
         @"",
         @"#6  乱了：点「回到播放头」跳回播放位置并对齐。",
+        @"     若提示「跟随可能已失效」，请 ⌘Q 完全退出后重开。",
     ];
 
     CGFloat y = 42.0;
@@ -1456,6 +1527,10 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     _st->backend->seekTo (audioPos);        // ① 重新对齐
     [_st->wave centerOn:audioPos];          // ② 视野跟着回到播放位置
 
+    // 记下「刚刚手动对齐过」：若 3 秒内又发现错位，说明这是跟随失效而非
+    // 一次性偏差 → 徽标文案升级为「建议重启插件」，同时落一条日志。
+    [_st->wave noteBackToPlayhead];
+
     _st->statusLabel.stringValue =
         [NSString stringWithFormat:@"已回到播放头 %.2f 秒（音频已重新对齐谱面）", audioPos];
     [_st->statusLabel setTextColor:[NSColor colorWithCalibratedRed:0.55
@@ -1589,6 +1664,10 @@ static NSString* fmtTime (double sec)
 - (void)tick
 {
     const ap::PlugView::Backend::HostTimeline tl = _st->backend->hostTimeline ();
+
+    // 「点完『回到播放头』仍然错位」= 跟随本身失效 → 徽标文案升级并记一条日志。
+    // 判定逻辑内聚在波形视图里（它同时负责画那个徽标），这里只做调用。
+    [_st->wave checkFollow];
 
     // 宿主到底给没给时间轴信息，只记一次日志（在界面线程写文件，
     // 音频线程里绝不能做 I/O）。之后看 ~/Library/Logs/DaweiDrumScore.log 就知道

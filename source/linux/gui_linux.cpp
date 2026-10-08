@@ -25,6 +25,7 @@
 //   X11 绘图本身不做双缓冲会闪，这里用 Pixmap 离屏绘制再整体拷贝。
 //==============================================================================
 #include "gui.h"
+#include "crashguard.h"   // ap::crashLog：跟随疑似失效时落一条日志
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -125,6 +126,16 @@ const Rect rBrand    = {  10, 358, 320, 18 };
 // 与 macOS / Windows 端取同一个值，别各写各的。
 //------------------------------------------------------------------------------
 const double kDivergenceWarnSec = 0.25;
+
+//---- 「点完『回到播放头』仍然错位」的判定窗口 ----------------------------------
+// 正常点一下就对齐了。若这么久之内又错位，说明偏差不是一次能纠正的，而是某个
+// 跟随条件**持续**为假 —— 再点按钮也没用，徽标文案升级为「建议重启插件」，
+// 并记一条日志（带冷却，避免抖动着刷屏）。
+// ⚠️ 这里只做「提示升级」，绝不自动 seek：0.25 秒的偏差等于十几个音频块，
+//    属结构性故障，自动 seek 会下一块又错开 → 每几十毫秒拉一次 → 音频发抖。
+//    （跳变场景的自动硬 seek 在 aplaysdk.cpp 的 captureHostTimeline 里。）
+const double kFollowFailWindowSec = 3.0;
+const double kFollowFailLogGapSec = 5.0;
 
 // 拍号选项（与 macOS / Windows 端一致）
 struct TimeSig { const char* label; int beats; int denom; };
@@ -298,6 +309,11 @@ private:
 
     double m_viewStart = 0.0;   ///< 视野起点（秒）
     double m_viewSpan  = 8.0;   ///< 视野跨度（秒）
+
+    //---- 「点完『回到播放头』仍错位」检测（渲染循环维护，paint 只读）----
+    double m_lastBackAt = -1.0e9;       ///< 上次点「回到播放头」的时刻（nowSec）
+    bool   m_followFail = false;        ///< 是否处于「点了按钮仍错位」状态
+    double m_followFailLoggedAt = -1.0e9;  ///< 上次为此写日志的时刻（做冷却）
 
     bool m_dragging = false;      ///< 波形区按住鼠标中
     bool m_dragOffset = false;    ///< true = 改起始偏移；false = 平移视野
@@ -651,6 +667,40 @@ void X11View::runLoop ()
 
         // 正在播放时固定帧率刷新播放头
         const double t = nowSec ();
+
+        // ---- 「点完『回到播放头』仍然错位」= 跟随本身失效 ----
+        // 正常点一下就对齐了。若 3 秒内又错位，说明有某个跟随条件持续为假 ——
+        // 徽标文案升级为「建议重启插件」，并记一条日志（带冷却）。
+        // 判据与波形区徽标一致。放在 XUnlockDisplay 之后：写文件不涉及 X 锁。
+        {
+            const double audioNow = m_posSec;
+            const double durNow   = m_durSec;
+            const double offNow   = m_backend
+                                        ? static_cast<double> (m_backend->offsetSec ())
+                                        : 0.0;
+            const double diffNow  = audioNow - (m_tl.playheadSec + offNow);
+            const bool diverging =
+                m_backend && m_tl.playing && m_tl.playheadValid && durNow > 0.60
+                && audioNow > 0.30 && audioNow < durNow - 0.30
+                && std::fabs (diffNow) > kDivergenceWarnSec;
+
+            if (diverging && (t - m_lastBackAt) < kFollowFailWindowSec)
+            {
+                m_followFail = true;
+                if ((t - m_followFailLoggedAt) > kFollowFailLogGapSec)
+                {
+                    m_followFailLoggedAt = t;
+                    ap::crashLog ("跟随可能已失效：点「回到播放头」后 %.1f 秒仍错位 %.2f 秒"
+                                  "（音频 %.3f / 谱面 %.3f + 偏移 %.3f）",
+                                  t - m_lastBackAt, std::fabs (diffNow),
+                                  audioNow, m_tl.playheadSec, offNow);
+                }
+            }
+            else
+            {
+                m_followFail = false;
+            }
+        }
         if (m_backend && m_backend->hasAudio () && m_tl.playing)
         {
             if (t - lastPaint > 1.0 / 30.0)
@@ -978,9 +1028,17 @@ void X11View::drawWaveArea (XftDraw* xd)
             const double diff = m_posSec - (m_tl.playheadSec + offset);
             if (std::fabs (diff) > kDivergenceWarnSec)
             {
+                // 刚点过「回到播放头」却还是错位 → 不是一次性偏差，而是跟随失效，
+                // 此时再点按钮也没用，直接告诉用户重启插件（渲染循环里已记日志）。
                 char warn[128];
-                std::snprintf (warn, sizeof warn, "与谱面错位 %.2f 秒 · 点「回到播放头」",
-                               std::fabs (diff));
+                if (m_followFail)
+                    std::snprintf (warn, sizeof warn,
+                                   "跟随可能已失效 · 建议重启插件（错位 %.2f 秒）",
+                                   std::fabs (diff));
+                else
+                    std::snprintf (warn, sizeof warn,
+                                   "与谱面错位 %.2f 秒 · 点「回到播放头」",
+                                   std::fabs (diff));
 
                 XGlyphInfo ext {};
                 ::XftTextExtentsUtf8 (m_dpy, m_fontSmall,
@@ -1113,6 +1171,7 @@ void X11View::drawHelp (XftDraw* xd)
         "     手填 BPM 与拍号，网格小节线才对得上。",
         "",
         "#6  乱了：点「回到播放头」跳回播放位置并对齐。",
+        "     若提示「跟随可能已失效」，请重开宿主。",
     };
     const int n = static_cast<int> (sizeof (kGuide) / sizeof (kGuide[0]));
 
@@ -1357,6 +1416,11 @@ void X11View::actionFor (int id)
                 const double target = m_tl.playheadSec + m_backend->offsetSec ();
                 m_backend->seekTo (target);
                 centerViewOn (target);      // 视野也回到播放位置
+
+                // 记下「刚刚手动对齐过」：若 3 秒内又发现错位，说明是跟随失效而非
+                // 一次性偏差 → 徽标升级提示 + 落一条日志。
+                m_lastBackAt = nowSec ();
+                m_followFail = false;
             }
             break;
         case ID_HELP:

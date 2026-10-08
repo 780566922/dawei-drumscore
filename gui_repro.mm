@@ -474,6 +474,62 @@ int main (int argc, char** argv)
                 ((void (*) (id, SEL)) objc_msgSend) (wave, selFit);
         }
 
+        // ---- 「点完『回到播放头』仍错位」→ 提示升级为「建议重启插件」 ----
+        // 这条是「跟随失效」的探针：只有「刚点过按钮 **且** 仍然错位」才升级提示。
+        // 三个反例都要挡住，否则用户会被误报折腾：
+        //   ① 没点过按钮就报 ② 点了没反应却不报 ③ 错位消失后不复位（永久卡在重启提示）
+        // ⚠️ 必须放在下面「回到播放头」用例**之前** —— 「没点过按钮」这个状态
+        //    只在任何一次 noteBackToPlayhead 之前成立（lastBackAt 初值极小）。
+        @autoreleasepool
+        {
+            backend.fakeTimeline = true;     // 谱面播放头 = 3.5 秒，playing = true
+            backend.setOffsetSec (1.5f);     // 目标音频位置 = 3.5 + 1.5 = 5.0 秒
+
+            SEL selCheck   = NSSelectorFromString (@"checkFollow");
+            SEL selNote    = NSSelectorFromString (@"noteBackToPlayhead");
+            SEL selFailNow = NSSelectorFromString (@"followFailActive");
+
+            // ① 错位（6.5 vs 5.0）但**没点过**按钮 → 不该升级
+            backend.seekTo (6.5);
+            ((void (*) (id, SEL)) objc_msgSend) (wave, selCheck);
+            const BOOL failNoClick = ((BOOL (*) (id, SEL)) objc_msgSend) (wave, selFailNow);
+
+            // ② 点一下按钮（记时刻 + 清状态），再让音频偏回去 = 模拟「点了也没用」
+            ((void (*) (id, SEL)) objc_msgSend) (wave, selNote);
+            backend.seekTo (6.5);
+            ((void (*) (id, SEL)) objc_msgSend) (wave, selCheck);
+            const BOOL failAfterClick = ((BOOL (*) (id, SEL)) objc_msgSend) (wave, selFailNow);
+
+            // ③ 错位消失（回到 5.0）→ 必须自动复位
+            backend.seekTo (5.0);
+            ((void (*) (id, SEL)) objc_msgSend) (wave, selCheck);
+            const BOOL failAfterRealign = ((BOOL (*) (id, SEL)) objc_msgSend) (wave, selFailNow);
+
+            std::printf ("  · 没点按钮=%s；点了仍错位=%s；错位消失后=%s（期望 NO / YES / NO）\n",
+                         failNoClick ? "YES" : "NO",
+                         failAfterClick ? "YES" : "NO",
+                         failAfterRealign ? "YES" : "NO");
+
+            if (failNoClick)
+            {
+                std::printf ("[复现] ✗ 没点过「回到播放头」就升级提示（误报）\n");
+                rc = 23;
+            }
+            else if (!failAfterClick)
+            {
+                std::printf ("[复现] ✗ 点过「回到播放头」仍错位，却没升级提示\n");
+                rc = 24;
+            }
+            else if (failAfterRealign)
+            {
+                std::printf ("[复现] ✗ 错位消失后没有复位 —— 徽标会永久卡在「建议重启插件」\n");
+                rc = 25;
+            }
+
+            // 复位，避免影响后续用例
+            backend.setOffsetSec (0.0f);
+        }
+
         // ---- 「回到播放头」：seek 必须带上偏移，且视野要跟过去 ----
         // 回归防线：Windows / Linux 端曾经写成 seekTo(playheadSec)，漏掉起始偏移 ——
         // 点一次反而把两条播放头按偏移量错开，和这个按钮「修复分家」的职责完全相反。
