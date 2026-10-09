@@ -348,6 +348,22 @@ private:
 };
 
 //------------------------------------------------------------------------------
+// 页脚「可点击宣传语」的子类过程 —— 前置声明
+//
+// ⚠ 它【定义】在文件后半（见 brandSubclassProc 的实现），但 WinView::create()
+//   和 destroy() 里就要用到 → 必须在这里先声明。
+//   漏掉本行 = MSVC 在 create() 里报 `error C2065: 'brandSubclassProc':
+//   undeclared identifier`，Windows 端直接编不过；而 mac / Linux 本机编译
+//   【永远看不到】这个问题，只能靠 CI。同理 kBrandSubclassId 也必须提前定义
+//   （常量没有「先声明后定义」的写法，直接搬上来）。
+//------------------------------------------------------------------------------
+static LRESULT CALLBACK brandSubclassProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                           UINT_PTR id, DWORD_PTR ref);
+
+/// SetWindowSubclass 的子类 ID（同一控件可挂多个子类，用 ID 区分；必须唯一且非 0）
+static const UINT_PTR kBrandSubclassId = 1;
+
+//------------------------------------------------------------------------------
 // 窗口过程与类注册
 //------------------------------------------------------------------------------
 namespace {
@@ -1436,9 +1452,7 @@ static LRESULT CALLBACK brandSubclassProc (HWND hwnd, UINT msg, WPARAM wp, LPARA
     return ::DefSubclassProc (hwnd, msg, wp, lp);
 }
 
-/// SetWindowSubclass 的子类 ID（同一控件可以挂多个子类，用 ID 区分；必须唯一且非 0）
-static const UINT_PTR kBrandSubclassId = 1;
-
+/// SetWindowSubclass 的子类 ID 见文件前半的前置声明区（必须在 WinView::create 之前定义）
 void WinView::onCommand (int id, int notify)
 {
     switch (id)
