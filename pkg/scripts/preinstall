@@ -1,0 +1,33 @@
+#!/bin/bash
+#==============================================================================
+# preinstall — 安装【之前】把目标域里的旧版本清干净
+#
+# 由 macOS 安装器以 root 身份运行，时机是「payload 复制之前」。
+#
+# 为什么必须有这一步（用户实测反馈：「安装新版本之前，老版本要自动清理干净」）：
+#   1. 同名 bundle 直接覆盖安装时，旧版 bundle 里多出来的文件会【残留】——
+#      例如旧版的可执行文件叫别的名字、或多了个 Resources 子目录，新版没有，
+#      覆盖后那个旧文件还在里头。VST3 宿主加载的是 bundle 里声明的可执行文件，
+#      残留文件平时无害，但会让「装的是哪一版」变得难以判断，也很容易在回滚时
+#      诈尸（旧的 Mach-O 还在，被 host 扫到就是另一个条目）。
+#   2. 我们改过两次 bundle 名（APLAY.vst3 → DaweiDrumScore.vst3 → 中文名），
+#      这些遗留在扫描目录里都会被 MuseScore 当成【独立的插件】列出来。
+#   3. 最关键的一条：光靠 postinstall 清理不够 —— 那已经是复制之后了。先删干净
+#      再放新文件，才能保证「这次装完之后，bundle 里的内容 100% 来自本安装包」。
+#
+# 只操作 Audio/Plug-Ins/VST3 下我们自己的 bundle，不碰用户其它文件。
+#==============================================================================
+set -u
+
+DEST="/Library/Audio/Plug-Ins/VST3"
+
+# 我们自己用过的所有 bundle 名（改名前叫 APLAY，中间一版叫 DaweiDrumScore）
+NAMES="大伟鼓谱MuseScore音频播放器.vst3 APLAY.vst3 DaweiDrumScore.vst3"
+
+for NAME in $NAMES; do
+    if [ -e "$DEST/$NAME" ]; then
+        rm -rf "$DEST/$NAME" && echo "安装前清理旧版本：$DEST/$NAME"
+    fi
+done
+
+exit 0

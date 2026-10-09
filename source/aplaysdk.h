@@ -103,6 +103,9 @@ public:
     int gridBeatDenominator () const override;
     ap::PlugView::Backend::HostTimeline hostTimeline () const override;
 
+    /// 实时健康探针：音频线程因抢不到锁而整块丢弃音频的累计次数（见 gui.h）。
+    uint64_t lockDropCount () const override;
+
 private:
     void loadCurrentFile ();
     void applyParams ();

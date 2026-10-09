@@ -124,6 +124,13 @@ public:
         out.assign (static_cast<size_t> (buckets > 0 ? buckets : 1), 0.f);
     }
 
+    /// 实时健康探针转发（见 gui.h 的说明）：界面线程用它把「音频丢块」写进日志。
+    uint64_t lockDropCount () const override
+    {
+        APlayProcessor* p = currentProcessor ();
+        return p ? p->lockDropCount () : 0;
+    }
+
     void setOffsetSec (float sec) override
     {
         if (APlayProcessor* p = currentProcessor ()) p->setOffsetSec (sec);
@@ -726,6 +733,7 @@ void APlayProcessor::waveformPeaks (std::vector<float>& out, int buckets,
 
 void APlayProcessor::setGridBPM (float bpm) { m_gridBPM = (bpm < 0.f) ? 0.f : (bpm > 400.f ? 400.f : bpm); }
 float APlayProcessor::gridBPM () const { return m_gridBPM; }
+uint64_t APlayProcessor::lockDropCount () const { return m_player.lockDropCount (); }
 void APlayProcessor::setGridBeatsPerBar (int beats)
 {
     m_gridBeats = (beats < 1) ? 4 : (beats > 32 ? 32 : beats);

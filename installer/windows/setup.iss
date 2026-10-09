@@ -22,8 +22,13 @@
 #define MyAppVersion   "1.1.0"
 #define MyAppPublisher "大伟鼓谱"
 #define MyVst3Folder   "DaweiDrumScore.vst3"
-; ↓ 想指向你的 B 站空间，把这里换成 https://space.bilibili.com/你的UID
-#define MySiteUrl      "https://search.bilibili.com/all?keyword=%E5%A4%A7%E4%BC%9F%E9%BC%93%E8%B0%B1"
+; 作者 B 站主页。⭐ 与插件里页脚宣传语的跳转地址必须一致 ——
+;    三端 + 安装器的地址都来自同一个语义，改地址时【四处一起改】：
+;      · source/gui.h  ap::kBrandHomeUrl（插件三端共用）
+;      · 本文件的 MySiteUrl（Windows 安装器）
+;      · make_pkg.sh 生成的安装说明（macOS）
+;      · pkg/resources/{welcome,conclusion}.html（macOS 安装器页面）
+#define MySiteUrl      "https://space.bilibili.com/65320474"
 
 [Setup]
 ; AppId 是卸载识别的唯一键，一旦发布【不要改】，否则升级会被当成两个软件
@@ -60,6 +65,16 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 Source: "{#MyBuildDir}\VST3\Release\{#MyVst3Folder}\*"; \
     DestDir: "{app}\{#MyVst3Folder}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; ⭐ 装新版本前，先把旧版本整个删掉（用户实测反馈：升级后老版本没清干净）。
+;   Inno 默认只做「同名文件覆盖」—— 旧 bundle 里多出来的文件会残留，
+;   而且我们改过一次 bundle 名（APLAY → DaweiDrumScore），旧目录会一直留在
+;   VST3 扫描目录里，被 MuseScore 当成【另一个插件】列出来。
+;   先删干净再放新文件，才能保证装完的 bundle 内容 100% 来自本安装包。
+Type: filesandordirs; Name: "{app}\{#MyVst3Folder}"
+Type: filesandordirs; Name: "{app}\APLAY.vst3"
+Type: filesandordirs; Name: "{app}\大伟鼓谱MuseScore音频播放器.vst3"
 
 [UninstallDelete]
 ; Inno 不追踪运行时生成的文件，卸载时把整个 bundle 目录清掉，避免残留

@@ -71,6 +71,17 @@ static const double kDivergenceWarnSec = 0.25;
 static const double kFollowFailWindowSec = 3.0;
 static const double kFollowFailLogGapSec = 5.0;   ///< 日志冷却，避免抖动着刷屏
 
+//---- 宿主播放头「跳变」阈值（秒）----------------------------------------------
+// 界面定时器 20Hz 跑一次。正常播放时相邻两次读到的谱面位置只差几十毫秒；
+// 超过这个值就说明不是「播放头自己在走」，而是宿主把它挪了（点小节 / 循环回卷 /
+// 拖播放头 / 播放到结尾后回卷）。只有这种跳变才允许视野跟着跳。
+static const double kHostJumpSec = 0.25;
+
+//---- 音频丢块探针的日志冷却（秒）---------------------------------------------
+// 「音频线程抢不到锁 → 整块丢音频 → 播放位置永久落后宿主」是完全隐形的故障。
+// 这里把它变成一条日志（同一故障 5 秒内只记一次，避免刷屏）。
+static const double kLockDropLogGapSec = 5.0;
+
 // ObjC++ 的 ivar 只能是指针/标量，C++ 容器要包在结构体里再放指针
 struct WaveState
 {
@@ -89,10 +100,13 @@ struct WaveState
     double viewLen   = 0.0;          ///< 0 表示全览
 
     //---- 峰值取样节流：只在视野真正变化时才重取样 ----
-    // 手势（滚轮/缩放）是高频事件，一秒几十次。若每次都同步持锁遍历
-    // 音频数据取样，音频线程的 try_lock 会反复失败 → 播放卡顿、丢帧、
-    // 两个播放头错位。这里记录「峰值是对哪个视野取的」，drawRect 里
-    // 发现视野变了才重取一次（每绘制帧至多一次）。
+    // 手势（滚轮/缩放）是高频事件，一秒几十次。取样会遍历可见区间的采样，
+    // 若这段遍历持着音频线程要用的锁，音频线程的 try_lock 就会反复失败 →
+    // 整块丢音频 → 播放位置永久落后宿主（实测表现为「一边拖波形一边分家」）。
+    //
+    // ⭐ 根治办法在播放器侧：音频数据改成不可变快照，画波形只取一份
+    //    shared_ptr 就随便扫，完全不碰那把锁（见 audiofile.h）。这里的节流
+    //    仍然保留 —— 它省的是界面线程自己的 CPU，与实时安全已无关。
     double peaksViewStart = -1.0;    ///< 峰值对应的视野起点（-1 表示从未取样）
     double peaksViewLen   = -1.0;    ///< 峰值对应的视野时长
     bool   peaksDirty     = true;    ///< 需要重新取样
@@ -147,6 +161,17 @@ struct PanelState
     NSTimer* timer = nil;
     bool timelineLogged = false;     ///< 宿主时间轴信息只记一次日志
     bool beatsUserSet = false;       ///< 用户手动改过拍号后就不再自动跟随乐谱
+
+    //---- 宿主播放头跳变检测（区分「播放头自己在走」和「宿主把它挪走了」）----
+    // 只在 GUIView::tick 里用，所以归 PanelState（⚠️ 别加进 WaveState：
+    // tick 里的 `_st` 是 PanelState，加错会报 no member named ... in 'PanelState'）。
+    bool   hasPrevPlayhead = false;  ///< 是否已经存过上一帧的谱面位置
+    double prevPlayheadSec = 0.0;    ///< 上一帧的谱面位置（秒）
+
+    //---- 实时健康探针：音频线程丢块（见 Backend::lockDropCount）----
+    uint64_t lockDropSeen = 0;       ///< 上次记录的丢块计数（用于判断有没有增长）
+    double   lockDropLoggedAt = -1.0e9;  ///< 上次为此写日志的时刻（冷却）
+
     // 注：跳转跟随（宿主拖播放头 → 音频 seek）已下沉到音频线程，
     // 不再需要 GUI 侧保存播放头历史。
 };
@@ -262,7 +287,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)fitAll;
 - (void)zoomBy:(double)factor aroundX:(CGFloat)x;
 - (void)zoomToSpan:(double)spanSec fromStart:(double)startSec;
-- (void)followPlayheadTo:(double)audioSec;
+- (void)followPlayheadTo:(double)audioSec allowJump:(BOOL)allowJump;
 - (void)recoverAutoFollow;     ///< 用户停止手动操作超时后，自动恢复跟随
 - (void)centerOn:(double)audioSec;   ///< 把视野挪到 audioSec（用于「回到播放头」）
 - (void)noteBackToPlayhead;          ///< 记下「刚点过回到播放头」，供升级提示用
@@ -414,46 +439,50 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 
 // 让视野跟随谱面播放头（audioSec 为播放头在音频时间轴上的位置）。
 //
-// 【反抽搐设计】之前这里在「播放头快出右边缘」时就会滚，而用户手动滚
-// 视图时播放头会被逼到边缘、触发跟随拉回，两者来回拉锯 —— 表现就是
-// 快速往外拖播放条时画面抽搐，最后红绿两条播放头在视觉上「分家」。
-//
-// 现在的规则只有一条，不再有中间态：
-//   - 用户正在手动滚/拖（userScrolling）→ 完全不干预，除非播放头
-//     已经完全跑出画面（此时才强制拉回，并复位 userScrolling 结束拉锯）。
-//   - 用户没在手动操作 → 播放头快出右边缘时才顺滑滚动。
-// 这样「跟着谱面走」和「手动看别处」不再互相抢，也就不会抽搐。
-- (void)followPlayheadTo:(double)audioSec
+// 【反抽搐设计 · 定稿规则】画面**永远不会把播放头「拽」回来**，只有一条规则：
+//   · 用户正在手动操作（userScrolling）→ 完全不干预。播放头允许呆在画面之外。
+//     旧版在这里加了「播放头完全跑出画面就强制拉回」，于是用户往左拖、画面被
+//     拽回右，来回拉锯 —— 视觉上就是抽搐（用户实测反馈的正是这个症状）。
+//   · 播放头在画面内 / 刚擦出边缘 → 顺滑向右滚，让它落在画面 25% 处。
+//   · 播放头远在画面之外（用户把视野拖到别处看）→ 什么都不做。想回来看播放头
+//     就点「回到播放头」—— 该按钮存在就是为了这件事，比偷偷自动跳转可预期。
+//   · 唯一例外 allowJump：**宿主自己**把播放头挪了（点小节 / 循环回卷 / 拖播放
+//     头）。这种跳变若不让画面跟过去，用户会「找不到播放头」，所以允许跟随。
+//     allowJump 由 tick 用「相邻两帧的谱面位置差」判定，见 kHostJumpSec。
+- (void)followPlayheadTo:(double)audioSec allowJump:(BOOL)allowJump
 {
     if (!_st->followScroll) return;
     if (_st->panning || _st->draggingGrid) return;
     if (!(_st->viewLen > 0.0)) return;
 
+    // ① 用户在看别处 → 不干预（宿主主动跳转时例外：那种情况用户正等着画面跟过去）
+    if (_st->userScrolling && !allowJump) return;
+
     const double v0 = _st->viewStart;
     const double v1 = v0 + _st->viewLen;
     const double margin = _st->viewLen * 0.25;   // 播放头离边缘多少时开始滚
 
-    const bool fullyOffscreen = (audioSec < v0 || audioSec > v1);
+    // ② 远在画面之外、且不是宿主跳转 → 不追。这是「不抢用户视野」的关键一条。
+    //    容差取一个整屏：极端放大时播放头两帧之间就能移动大半屏，容差太小会漏跟。
+    if (!allowJump && (audioSec < v0 - _st->viewLen || audioSec > v1 + _st->viewLen))
+        return;
 
-    if (fullyOffscreen)
+    // ③ 播放头落在画面左侧（循环回卷 / 向前跳转）→ 对到 25% 处，让它重新可见
+    if (audioSec < v0)
     {
-        // 完全跑出画面：无条件拉回，播放头落在画面 25% 处。
-        // 同时复位 userScrolling —— 拉回之后用户与自动跟随的「抢视图」就该结束，
-        // 否则会一直拉锯（这是抽搐的根因）。
         _st->viewStart = audioSec - margin;
-        _st->userScrolling = false;
+        [self clampView];
+        [self setNeedsDisplay:YES];
+        return;
     }
-    else if (!_st->userScrolling && audioSec > v1 - margin)
+
+    // ④ 播放头快到右边缘 → 顺滑向右滚
+    if (audioSec > v1 - margin)
     {
-        // 没在手动操作，播放头快出右边缘 → 顺滑向右滚
         _st->viewStart = audioSec - margin;
+        [self clampView];
+        [self setNeedsDisplay:YES];   // 重取样交给 drawRect（20Hz 触发，避免高频持锁）
     }
-    else
-    {
-        return;   // 用户在手动看别处，或播放头还在舒适区：都不滚动
-    }
-    [self clampView];
-    [self setNeedsDisplay:YES];   // 重取样交给 drawRect（20Hz 触发，避免高频持锁）
 }
 
 - (void)zoomBy:(double)factor aroundX:(CGFloat)x
@@ -461,6 +490,12 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     const NSRect r = [self bounds];
     if (NSWidth (r) <= 0.0 || !(_st->viewLen > 0.0)) return;
     if (factor <= 0.0) return;
+
+    // ⭐ 缩放也算「用户在看别处」：否则点「放大/缩小」按钮时（它们不经过
+    //    scrollWheel，过去不会置 userScrolling）播放头会被挤出画面，紧接着
+    //    被自动跟随拽回去 → 画面抽搐。放在这里就不漏任何缩放入口。
+    _st->userScrolling = true;
+    _st->lastUserScrollAt = [NSProcessInfo processInfo].systemUptime;
 
     const double frac = std::min (1.0, std::max (0.0, (double) ((x - NSMinX (r)) / NSWidth (r))));
     const double anchor = _st->viewStart + frac * _st->viewLen;
@@ -989,6 +1024,66 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 @end
 
 //------------------------------------------------------------------------------
+// 作者主页跳转（实现在文件末尾的 namespace ap 里）
+//
+// 这里先声明：BrandLinkField 在下面就要用它，而定义跟 PlugView 一起放在文件末尾。
+//------------------------------------------------------------------------------
+namespace ap { void openBrandHome (); }
+
+//------------------------------------------------------------------------------
+// 可点击的页脚宣传语（B 站署名）
+//
+// 需求：点一下底部那条粉色宣传语，用系统默认浏览器打开作者的 B 站主页。
+//
+// 为什么是 NSTextField 子类而不是 NSButton：
+//   NSButton 自带边框与按下高亮背景，会把页脚那一行「顺着底边的一行粉色小字」
+//   变成一枚突兀的按钮，破坏原有观感。自绘文本 + 手型光标最贴近原来的样子，
+//   用户看不出区别，只有鼠标移上去才发现「咦，能点」。
+//
+// 为什么重写 acceptsFirstMouse: 而不是只写 mouseDown:
+//   插件编辑器在 MuseScore 里是独立浮动窗口。窗口未激活时，AppKit 默认会把
+//   第一次点击【只用来激活窗口】而不派发给控件 —— 用户会遇到「第一次点没反应，
+//   得点第二次」。返回 YES 让第一次点击就生效。
+//
+// ⚠️ 别把它换成普通 NSTextField：`labelWithString:` 造出来的label 是
+//    non-editable / non-selectable 的，点上去没有任何反馈，也没人会想到要
+//    在父视图上做命中测试 —— 这功能会「看起来写了但其实点不动」。
+//------------------------------------------------------------------------------
+@interface BrandLinkField : NSTextField
+@end
+
+@implementation BrandLinkField
+
+/// 窗口未激活时，第一次点击也要直接生效（不要被「先激活窗口」吃掉）
+- (BOOL)acceptsFirstMouse:(NSEvent*)event
+{
+    (void) event;
+    return YES;
+}
+
+/// 鼠标移上去显示手型光标 —— 这是用户唯一能察觉「这里可以点」的线索
+- (void)resetCursorRects
+{
+    [self addCursorRect:self.bounds cursor:[NSCursor pointingHandCursor]];
+}
+
+- (void)mouseDown:(NSEvent*)event
+{
+    (void) event;
+    ap::openBrandHome ();
+}
+
+/// 只读（自测用）：本控件点击后会打开的地址。
+/// 自测用它确认「页脚确实接到了对的主页」—— 绝不能靠真的调用 mouseDown: 来验，
+/// 那会把浏览器弹出来（自动化测试里拉起浏览器是不可接受的副作用）。
+- (NSString*)brandUrl
+{
+    return [NSString stringWithUTF8String:ap::kBrandHomeUrl];
+}
+
+@end
+
+//------------------------------------------------------------------------------
 // 使用指南覆盖层
 //
 // 面板只有 640x384，完整的操作说明塞不进常驻布局（挤掉的会是波形区）。
@@ -1095,6 +1190,9 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (NSButton*)button:(NSString*)t action:(SEL)act;
 - (void)offsetChangedExternally:(double)sec;
 - (void)syncOffsetUI:(double)sec;
+- (void)syncControlsFromBackend;   ///< 视图重建后从后端回读 BPM/拍号/偏移/音量
+- (double)bpmFieldValue;          ///< 只读（自测用）：BPM 输入框当前值，0 = 空白
+- (NSString*)beatsSelection;      ///< 只读（自测用）：拍号下拉当前项，如 "4/4"
 - (void)volChanged:(id)s;
 - (void)bpmChanged:(id)s;
 - (void)bpmStep:(id)s;
@@ -1273,18 +1371,29 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         hint.frame = NSMakeRect (430, 320, 196, 14);
         [hint setTextColor:[NSColor colorWithCalibratedWhite:0.5 alpha:1.0]];
 
-        // ---- 底部页脚：B 站署名 + 欢迎语（作者引流）----
+        // ---- 底部页脚：B 站署名 + 欢迎语（作者引流，可点击跳主页）----
         // 放在面板最底部而非顶栏：不挤占主操作区，且用户每次打开界面都会看到。
         NSBox* sep = [[NSBox alloc] initWithFrame:NSMakeRect (14, 352, 612, 1)];
         sep.boxType = NSBoxSeparator;
         [self addSubview:sep];
 
-        NSTextField* footer = [self label:
-                               @"♪  B 站「大伟鼓谱」· 欢迎关注，鼓谱 / 教学 / 伴奏持续更新"
-                                                        size:11 align:NSTextAlignmentCenter];
-        footer.frame = NSMakeRect (14, 360, 612, 16);
+        // ⭐ 用 BrandLinkField（NSTextField 子类）而不是 label: —— 点一下会用系统
+        //    默认浏览器打开作者 B 站主页，鼠标移上去是手型光标。
+        //    尺寸/颜色与原来的 label 完全一致，所以布局与验证器断言都不用改。
+        BrandLinkField* footer =
+            [[BrandLinkField alloc] initWithFrame:NSMakeRect (14, 360, 612, 16)];
+        footer.stringValue = @"♪  B 站「大伟鼓谱」· 欢迎关注，鼓谱 / 教学 / 伴奏持续更新";
+        footer.font        = [NSFont systemFontOfSize:11];
+        footer.alignment   = NSTextAlignmentCenter;
+        // ⚠️ initWithFrame: 造出来的是「可编辑输入框」原形，这几项必须显式关掉：
+        //    否则页脚会变成一个带白底、能打字、会抢焦点的输入框。
+        footer.bezeled         = NO;
+        footer.drawsBackground = NO;
+        footer.editable        = NO;
+        footer.selectable      = NO;
         [footer setTextColor:[NSColor colorWithCalibratedRed:0.98 green:0.45 blue:0.60 alpha:1.0]];  // B 站粉
-        footer.toolTip = @"本插件作者：B 站「大伟鼓谱」——欢迎关注，获取更多鼓谱与教程";
+        footer.toolTip = @"点一下打开作者 B 站主页\n（本插件作者：大伟鼓谱 —— 鼓谱 / 教学 / 伴奏持续更新）";
+        [self addSubview:footer];
 
         // ---- 接受拖放 ----
         [self registerForDraggedTypes:@[ NSPasteboardTypeFileURL ]];
@@ -1294,6 +1403,9 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
         _st->helpOverlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         _st->helpOverlay.hidden = YES;
         [self addSubview:_st->helpOverlay];
+
+        // ---- 从后端回读已有设置（⭐ 关掉编辑器再打开时保持用户填的值）----
+        [self syncControlsFromBackend];
 
         // ---- 定时刷新播放头 ----
         _st->timer = [NSTimer scheduledTimerWithTimeInterval:0.05
@@ -1364,6 +1476,67 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 {
     _st->offsetLabel.stringValue = [NSString stringWithFormat:@"%+.2f 秒", sec];
 }
+
+//------------------------------------------------------------------------------
+// ⭐ 编辑器关闭再打开时，把后端里已有的设置回读到控件
+//
+// 为什么必须有：音频引擎（Processor）的寿命比编辑器视图长。在 MuseScore 里关掉
+// 插件界面只销毁 PlugView —— 日志里能看到「编辑器 removed」之后紧跟一条新的
+// 「PlugView 构造」，而后端指针地址不变。但视图里的控件是全新造的，若不回读：
+//   · BPM 显示成默认 120（后端其实还存着用户填的值），而输入框一失焦就会
+//     自动提交 → 把 120 写回后端 = 用户手填的 BPM 真的被抹掉了；
+//   · 拍号下拉回到 4/4，还被当成「用户没改过」→ 之后会被宿主给的拍号覆盖。
+// 所以这里把所有「存在后端里」的设置读回来，保证关掉再打开界面一模一样。
+// ⚠️ 新增任何「存在后端」的控件，都必须在这里补一行回读。
+//------------------------------------------------------------------------------
+- (void)syncControlsFromBackend
+{
+    ap::PlugView::Backend* b = _st->backend;
+
+    // 速度：只有手动值（>=1）才填进输入框；0 = 自动 → 留空（提示里写明「留空 = 自动」）。
+    // 不能指望 tick 里的「跟随乐谱速度」分支来填：那要求宿主提供速度，
+    // 而 MuseScore 不提供（实测 tempoN=0x0000），那条分支基本不会走。
+    const float bpm = b->gridBPM ();
+    if (bpm >= 1.0f)
+    {
+        _st->bpmField.stringValue = [NSString stringWithFormat:@"%.0f", bpm];
+        _st->bpmStepper.doubleValue = bpm;
+    }
+    else
+    {
+        _st->bpmField.stringValue = @"";
+        _st->bpmStepper.doubleValue = 120.0;
+    }
+    [self updateTempoSourceLabel];
+
+    // 拍号：后端不是 4/4 就说明用户改过 → 回读，并标记「用户改过」，
+    // 否则宿主一旦给出拍号，用户的选择会被自动覆盖。
+    const int beats = b->gridBeatsPerBar ();
+    const int denom = b->gridBeatDenominator ();
+    NSString* want = [NSString stringWithFormat:@"%d/%d", beats, denom];
+    for (NSInteger i = 0; i < _st->beatsPopup.numberOfItems; ++i)
+    {
+        if ([[_st->beatsPopup itemTitleAtIndex:i] isEqualToString:want])
+        {
+            [_st->beatsPopup selectItemAtIndex:i];
+            break;
+        }
+    }
+    if (beats != 4 || denom != 4)
+        _st->beatsUserSet = true;
+
+    // 起始偏移（只读显示）
+    [self syncOffsetUI:b->offsetSec ()];
+
+    // 音量
+    const float vol = b->volume ();
+    _st->volSlider.doubleValue = vol;
+    _st->volLabel.stringValue = [NSString stringWithFormat:@"%d %%", (int) (vol * 100)];
+}
+
+//---- 只读访问器（自测用，见 gui_repro.mm）------------------------------------
+- (double)bpmFieldValue { return _st->bpmField.stringValue.doubleValue; }
+- (NSString*)beatsSelection { return _st->beatsPopup.titleOfSelectedItem; }
 
 // 波形上 ⌘/⌥拖动网格 → 回写偏移显示，并实时提示对齐信息
 - (void)offsetChangedExternally:(double)sec
@@ -1725,15 +1898,47 @@ static NSString* fmtTime (double sec)
     // 都不影响跳转跟随。这里不再做任何跳变检测。
 
     // ---- 视野跟随：宿主播放时，波形视野自动滚到谱面播放头 ----
-    // 放大后（视野只有几秒），播放头会很快滚出画面。这里让视野跟着它走，
-    // 播放头始终留在画面内；完全滚出时即使用户在手动看别处也拉回。
-    // 用户手动操作超时后自动恢复跟随（播放/暂停都生效）。
+    // ⭐ 先区分「播放头自己在走」和「宿主把它挪走了」：前者画面只许顺滑滚，
+    //    后者画面该跟过去。20Hz 采样下正常前进每帧只有几十毫秒；超过
+    //    kHostJumpSec 就是宿主跳变（点小节 / 循环回卷 / 拖播放头）。
+    bool hostJumped = false;
+    if (tl.playheadValid)
+    {
+        if (_st->hasPrevPlayhead &&
+            std::fabs (tl.playheadSec - _st->prevPlayheadSec) > kHostJumpSec)
+            hostJumped = true;
+        _st->prevPlayheadSec = tl.playheadSec;
+        _st->hasPrevPlayhead = true;
+    }
+
+    // ---- 实时健康探针：音频线程有没有因为抢不到锁而丢块 ----
+    // 丢一块就少推进一个缓冲区的时间，误差【永久累积】→ 播放位置越来越落后
+    // 宿主，也就是用户看到的「一边拖波形一边分家」。音频线程绝不能做 I/O，
+    // 所以在那边只做原子自增，写日志的事放到这里（界面线程）。
+    // 正常情况下这个计数恒为 0；一旦增长，日志会直接点出方向。
+    {
+        const uint64_t drops = _st->backend->lockDropCount ();
+        if (drops > _st->lockDropSeen)
+        {
+            _st->lockDropSeen = drops;
+            const double nowT = [NSProcessInfo processInfo].systemUptime;
+            if ((nowT - _st->lockDropLoggedAt) > kLockDropLogGapSec)
+            {
+                _st->lockDropLoggedAt = nowT;
+                ap::crashLog ("⚠ 音频线程丢块：累计 %llu 块 —— 播放位置会落后宿主，"
+                              "排查：谁在锁内扫大段采样（画波形应走 audioSnapshot）",
+                              (unsigned long long) drops);
+            }
+        }
+    }
+
+    // 用户停止手动操作超时后自动恢复跟随（播放/暂停都生效）。
     [_st->wave recoverAutoFollow];
 
     if (tl.playheadValid && tl.playing)
     {
         const double audioT = tl.playheadSec + _st->backend->offsetSec ();
-        [_st->wave followPlayheadTo:audioT];
+        [_st->wave followPlayheadTo:audioT allowJump:(hostJumped ? YES : NO)];
     }
 
     if (!_st->backend->hasAudio ())
@@ -1758,6 +1963,37 @@ static NSString* fmtTime (double sec)
 @end
 
 namespace ap {
+
+//------------------------------------------------------------------------------
+// 打开作者 B 站主页（底部宣传语被点击时调用）
+//
+// 【为什么必须异步】宿主是实时音频程序，GUI 线程被拖住会直接影响音频回调调度。
+// LaunchServices 派发本身是异步的，这里再给个 completionHandler 只是为了在
+// 打开失败时留一条日志 —— 不阻塞、不等待浏览器。
+//
+// ⚠️ 打不开只记日志、不弹窗：插件里弹 NSAlert 会在宿主窗口上叠一个模态框，
+//    风险远大于收益（用户点个广告位不该有机会卡住宿主）。
+//------------------------------------------------------------------------------
+void openBrandHome ()
+{
+    NSString* str = [NSString stringWithUTF8String:kBrandHomeUrl];
+    NSURL* url = str ? [NSURL URLWithString:str] : nil;
+    if (!url)
+    {
+        crashLog ("作者主页地址无效，无法打开：%s", kBrandHomeUrl);
+        return;
+    }
+
+    crashLog ("打开作者主页：%s", kBrandHomeUrl);
+    [[NSWorkspace sharedWorkspace]
+        openURL:url
+        configuration:[NSWorkspaceOpenConfiguration configuration]
+        completionHandler:^(NSRunningApplication* app, NSError* err) {
+            (void) app;
+            if (err)
+                ap::crashLog ("作者主页打开失败：%s", err.localizedDescription.UTF8String);
+        }];
+}
 
 //==============================================================================
 // PlugView —— IPlugView 的实现

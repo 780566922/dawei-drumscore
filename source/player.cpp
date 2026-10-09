@@ -44,16 +44,29 @@ uint32_t Player::render(float** outL, float** outR, uint32_t numFrames, double h
     if (!outL || !outR || numFrames == 0)
         return 0;
 
+    // 先取一份【不可变】音频快照：只是一次引用计数 ++，不阻塞、不扫描。
+    // 之后读采样都走这份快照，与 GUI 是否正在画波形完全无关。
+    std::shared_ptr<const AudioData> snap = audioSnapshot();
+    if (!snap || snap->samples.empty() || snap->sampleRate == 0 || hostSampleRate <= 0.0)
+        return fillSilence(outL, outR, numFrames);
+    const AudioData& d = *snap;
+
     // 【实时安全】绝不阻塞：GUI 线程正在换文件时拿不到锁，本块直接输出
     // 静音并立刻返回，下一块再继续。宁可一小段听不出来的静音，
     // 也不能把音频线程卡住（那会导致宿主爆音甚至卡死）。
+    //
+    // ⚠️ 锁内现在只剩标量运算（读位置 / 偏移 / 播放状态），大段采样扫描
+    //    （GUI 画波形）已改走 audioSnapshot() 不再持此锁 —— 所以这里事实上
+    //    不会失败。保留 try_lock 是防线：将来若有人往锁内塞慢操作，
+    //    宁可丢一小段静音也不能让音频线程等锁。
     std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
     if (!lock.owns_lock())
+    {
+        // 记一笔：整块音频被丢掉了。这个数会通过 lockDropCount() 暴露给界面
+        // 线程写进日志 —— 否则「音频丢块 → 播放位置永久落后宿主」完全是隐形的。
+        m_lockDrops.fetch_add(1, std::memory_order_relaxed);
         return fillSilence(outL, outR, numFrames);
-
-    // 无音频：输出静音
-    if (m_data.samples.empty() || m_srcSampleRate == 0 || hostSampleRate <= 0.0)
-        return fillSilence(outL, outR, numFrames);
+    }
 
     // 偏移发生变化 → 重算读位置
     restartFromOffsetLocked();
@@ -62,7 +75,7 @@ uint32_t Player::render(float** outL, float** outR, uint32_t numFrames, double h
 
     // 播到结尾后会自动置为停止，读位置停在末尾。此时再按「播放」如果什么都不做，
     // 用户会觉得按钮坏了 —— 这里让「停止→播放」这个沿自动回到偏移起点重放。
-    if (playing && !m_wasPlaying && m_readPos >= static_cast<double>(m_data.numFrames()))
+    if (playing && !m_wasPlaying && m_readPos >= static_cast<double>(d.numFrames()))
     {
         m_offsetDirty = true;
         restartFromOffsetLocked();
@@ -76,11 +89,11 @@ uint32_t Player::render(float** outL, float** outR, uint32_t numFrames, double h
     const bool loop = m_params.looping.load(std::memory_order_relaxed);
     // 每输出 1 帧，消耗多少源帧 = srcSr / hostSr
     // （44.1k 源在 48k 宿主下应放慢一点，实际消耗 0.91875 源帧/输出帧）
-    const double step = static_cast<double>(m_srcSampleRate) / hostSampleRate;
+    const double step = static_cast<double>(snap->sampleRate) / hostSampleRate;
 
-    const size_t totalFrames = m_data.numFrames();
-    const double loopStartFrame = static_cast<double>(m_appliedOffset) * m_srcSampleRate;
-    const uint32_t ch = m_data.numChannels;
+    const size_t totalFrames = d.numFrames();
+    const double loopStartFrame = static_cast<double>(m_appliedOffset) * snap->sampleRate;
+    const uint32_t ch = d.numChannels;
 
     uint32_t i = 0;
 
@@ -130,16 +143,16 @@ uint32_t Player::render(float** outL, float** outR, uint32_t numFrames, double h
         float l = 0.0f, r = 0.0f;
         if (ch == 2)
         {
-            const float s0 = m_data.samples[i0 * 2 + 0];
-            const float s1 = m_data.samples[i1 * 2 + 0];
+            const float s0 = d.samples[i0 * 2 + 0];
+            const float s1 = d.samples[i1 * 2 + 0];
             l = static_cast<float>(s0 + (s1 - s0) * frac);
-            r = static_cast<float>(m_data.samples[i0 * 2 + 1] +
-                                    (m_data.samples[i1 * 2 + 1] - m_data.samples[i0 * 2 + 1]) * frac);
+            r = static_cast<float>(d.samples[i0 * 2 + 1] +
+                                    (d.samples[i1 * 2 + 1] - d.samples[i0 * 2 + 1]) * frac);
         }
         else // 单声道 → 双声道
         {
-            const float s0 = m_data.samples[i0];
-            const float s1 = m_data.samples[(i1 < totalFrames) ? i1 : i0];
+            const float s0 = d.samples[i0];
+            const float s1 = d.samples[(i1 < totalFrames) ? i1 : i0];
             l = r = static_cast<float>(s0 + (s1 - s0) * frac);
         }
 

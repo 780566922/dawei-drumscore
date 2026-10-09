@@ -286,6 +286,8 @@ private:
     void refreshLabels ();
     void openFileDialog ();
     void applyBpmFromEdit ();
+    /// ⭐ 视图重建后从后端回读 BPM / 拍号 / 音量（见实现处的说明）
+    void syncControlsFromBackend ();
     void zoomBy (double factor, double centerSec);
     void zoomFit ();
     /// 把视野挪到 sec（播放头落在画面 25% 处）。用于「回到播放头」。
@@ -536,7 +538,9 @@ bool WinView::create (HWND parent, int w, int h)
     ::SendMessageW (m_gridCheck, BM_SETCHECK, BST_CHECKED, 0);
     ::SendMessageW (m_numCheck, BM_SETCHECK, BST_CHECKED, 0);
 
-    m_bpmEdit = mk (L"EDIT", L"120", ES_AUTOHSCROLL | ES_NUMBER | WS_BORDER, IDC_BPM_EDIT);
+    // 初值留空 = 自动；真实值在 createControls 末尾由 syncControlsFromBackend()
+    // 从后端回读（关掉编辑器再打开时后端里还存着用户填的值）。
+    m_bpmEdit = mk (L"EDIT", L"", ES_AUTOHSCROLL | ES_NUMBER | WS_BORDER, IDC_BPM_EDIT);
     m_bpmUp   = mk (L"BUTTON", L"▲", BS_PUSHBUTTON, IDC_BPM_UP);
     m_bpmDown = mk (L"BUTTON", L"▼", BS_PUSHBUTTON, IDC_BPM_DOWN);
 
@@ -566,8 +570,16 @@ bool WinView::create (HWND parent, int w, int h)
     //   所以把 WMA 从这里拿掉腾位置 —— WMA 仍在文件对话框的筛选器和
     //   isSupportedAudioExtension 里，只是不再占用这行提示。
     m_fmtLabel    = mk (L"STATIC", L"支持 MP3/WAV/M4A/AAC/FLAC/OGG", SS_LEFT, 0);
+    // ⭐ SS_NOTIFY：让静态文本在被点击时给父窗口发 STN_CLICKED。
+    //    不加这个样式，STATIC 是「哑」的 —— 点它父窗口收不到任何 WM_COMMAND，
+    //    页脚就只是个纯装饰（这正是「可点击宣传语」必须改样式的原因）。
     m_brand       = mk (L"STATIC", L"♪ B 站「大伟鼓谱」· 欢迎关注，鼓谱 / 教学 / 伴奏持续更新",
-                        SS_LEFT, IDC_BRAND);
+                        SS_LEFT | SS_NOTIFY, IDC_BRAND);
+    // ⭐ 子类化只为把光标切成手型（见 brandSubclassProc 的说明：
+    //    STATIC 自己会吞掉 WM_SETCURSOR，父窗口收不到，判坐标无效）。
+    if (m_brand)
+        ::SetWindowSubclass (m_brand, brandSubclassProc, kBrandSubclassId,
+                             reinterpret_cast<DWORD_PTR> (this));
 
     // ⚠ 使用指南覆盖层必须【最后创建】：同层子窗口的 z 序 = 创建顺序，
     //   最后建的才盖得住前面所有控件。不加 WS_VISIBLE —— 默认隐藏。
@@ -577,6 +589,11 @@ bool WinView::create (HWND parent, int w, int h)
         ::SetWindowLongPtrW (m_help, GWLP_USERDATA, reinterpret_cast<LONG_PTR> (this));
 
     applyFontsToChildren ();
+
+    // ⭐ 控件回读：关掉编辑器再打开时，窗口和所有控件都会重建，但后端（Processor）
+    //    一直活着。不回读的话界面显示的是「初始值」，而后端里还存着用户填的值 ——
+    //    BPM 输入框一失焦就会自动提交，等于把用户填的 BPM 覆盖成 120。
+    syncControlsFromBackend ();
 
     ::DragAcceptFiles (m_hwnd, TRUE);
     if (m_wave)
@@ -592,6 +609,13 @@ void WinView::destroy ()
     if (m_hwnd)
     {
         ::KillTimer (m_hwnd, IDC_TIMER_UI);
+        // 先摘掉页脚的子类再销毁窗口：DestroyWindow 会把子窗口一并销毁，
+        // 之后再 RemoveWindowSubclass 就是在动已释放窗口的子类链了。
+        if (m_brand)
+        {
+            ::RemoveWindowSubclass (m_brand, brandSubclassProc, kBrandSubclassId);
+            m_brand = nullptr;
+        }
         ::DestroyWindow (m_hwnd);    // 子窗口（含覆盖层）随之销毁
         m_hwnd = nullptr;
     }
@@ -1289,6 +1313,48 @@ void WinView::applyBpmFromEdit ()
     ::InvalidateRect (m_wave, nullptr, FALSE);
 }
 
+void WinView::syncControlsFromBackend ()
+{
+    if (!m_backend)
+        return;
+
+    if (m_bpmEdit)
+    {
+        const float bpm = m_backend->gridBPM ();
+        if (bpm >= 1.0f)
+        {
+            wchar_t t[32] = {0};
+            std::swprintf (t, 32, L"%d", static_cast<int> (bpm + 0.5f));
+            ::SetWindowTextW (m_bpmEdit, t);
+        }
+        else
+        {
+            // 空框 = 自动（优先跟随宿主速度，宿主不给就用 120）。
+            // 不再预填 "120"：那会让「用户还没设过」看起来像「已经设成 120」，
+            // 而且一提交就真的变成手动 120 —— 与 macOS 端的语义对齐。
+            ::SetWindowTextW (m_bpmEdit, L"");
+        }
+    }
+
+    if (m_timesig)
+    {
+        const int beats = m_backend->gridBeatsPerBar ();
+        const int denom = m_backend->gridBeatDenominator ();
+        for (int i = 0; i < kTimeSigCount; ++i)
+        {
+            if (kTimeSigs[i].beats == beats && kTimeSigs[i].denom == denom)
+            {
+                ::SendMessageW (m_timesig, CB_SETCURSEL, i, 0);
+                break;
+            }
+        }
+    }
+
+    if (m_volSlider)
+        ::SendMessageW (m_volSlider, TBM_SETPOS, TRUE,
+                        static_cast<LPARAM> (static_cast<int> (m_backend->volume () * 100.0f + 0.5f)));
+}
+
 void WinView::onHScroll (HWND /*slider*/)
 {
     if (!m_backend || !m_volSlider)
@@ -1296,6 +1362,32 @@ void WinView::onHScroll (HWND /*slider*/)
     const int pos = static_cast<int> (::SendMessageW (m_volSlider, TBM_GETPOS, 0, 0));
     m_backend->setVolume (static_cast<float> (pos) / 100.0f);
     refreshLabels ();
+}
+
+//------------------------------------------------------------------------------
+// 打开作者 B 站主页（点底部页脚宣传语时调用）
+//
+// 用 ShellExecuteW 走系统「打开方式」关联，不引入任何 HTTP 客户端，
+// 也不用起线程 —— 它只是把请求交给 Shell，同步返回、不等待浏览器。
+//
+// ⚠️ 失败只记日志，绝不弹 MessageBox：
+//    插件跑在宿主的消息循环里，弹模态框会卡住宿主（实时音频程序卡一下就是爆音）。
+//    页脚是个「顺手的广告位」，点坏了最多是没反应，不该有能力影响宿主。
+// ⚠️ ShellExecuteW 的返回值 > 32 才算成功（<= 32 是错误码，这是 Win32 的老约定，
+//    不能按布尔判断）。
+//------------------------------------------------------------------------------
+static void openBrandHome ()
+{
+    const std::wstring url = utf8ToWide (ap::kBrandHomeUrl);
+    if (url.empty ())
+        return;
+
+    const HINSTANCE r = ::ShellExecuteW (nullptr, L"open", url.c_str (),
+                                         nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR> (r) <= 32)
+        ap::crashLog ("作者主页打开失败（ShellExecuteW 返回 %lld）：%s",
+                      static_cast<long long> (reinterpret_cast<INT_PTR> (r)),
+                      ap::kBrandHomeUrl);
 }
 
 HBRUSH WinView::onCtlColor (HDC dc, HWND ctl)
@@ -1308,6 +1400,30 @@ HBRUSH WinView::onCtlColor (HDC dc, HWND ctl)
     }
     return reinterpret_cast<HBRUSH> (nullptr);
 }
+
+// 鼠标是否停在页脚宣传语上。
+//
+// 【为什么需要】页脚是个 STATIC，默认光标是箭头 —— 用户看到一行小字，
+// 没有任何线索表明它可点。切成手型光标是唯一的「可点」提示。
+//
+// 【为什么在子类里判，而不是在父窗口的 WM_SETCURSOR 里判坐标】
+//   STATIC 控件自己会处理 WM_SETCURSOR（把类光标 = 箭头设上并返回 TRUE），
+//   父窗口**根本收不到**这条消息 —— 在父窗口里 GetCursorPos + PtInRect 是白写。
+//   所以必须用 SetWindowSubclass 把页脚截下来。子类只挂在页脚这一个控件上，
+//   因此「HTCLIENT」本身就等价于「光标在页脚上」，不需要再算坐标。
+static LRESULT CALLBACK brandSubclassProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                           UINT_PTR /*id*/, DWORD_PTR /*ref*/)
+{
+    if (msg == WM_SETCURSOR && LOWORD (lp) == HTCLIENT)
+    {
+        ::SetCursor (::LoadCursorW (nullptr, IDC_HAND));
+        return TRUE;
+    }
+    return ::DefSubclassProc (hwnd, msg, wp, lp);
+}
+
+/// SetWindowSubclass 的子类 ID（同一控件可以挂多个子类，用 ID 区分；必须唯一且非 0）
+static const UINT_PTR kBrandSubclassId = 1;
 
 void WinView::onCommand (int id, int notify)
 {
@@ -1354,6 +1470,12 @@ void WinView::onCommand (int id, int notify)
         case IDC_HELP_BTN:
             toggleHelp ();
             break;
+        case IDC_BRAND:
+            // 点底部页脚宣传语 → 用系统默认浏览器打开作者 B 站主页。
+            // STATIC 只在带 SS_NOTIFY 时才会发 STN_CLICKED（见 m_brand 创建处）。
+            if (notify == STN_CLICKED)
+                openBrandHome ();
+            break;
         case IDC_GRID_CHECK:
             m_showGrid = (::SendMessageW (m_gridCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             ::InvalidateRect (m_wave, nullptr, FALSE);
@@ -1363,28 +1485,27 @@ void WinView::onCommand (int id, int notify)
             ::InvalidateRect (m_wave, nullptr, FALSE);
             break;
         case IDC_BPM_UP:
-            if (m_bpmEdit)
-            {
-                wchar_t t[32] = {0};
-                ::GetWindowTextW (m_bpmEdit, t, 32);
-                double v = ::_wtof (t) + 1.0;
-                std::swprintf (t, 32, L"%d", static_cast<int> (v));
-                ::SetWindowTextW (m_bpmEdit, t);
-                applyBpmFromEdit ();
-            }
-            break;
         case IDC_BPM_DOWN:
+        {
+            // 两步合并：逻辑完全相同，只差符号。
+            // ⚠️ 必须先做下限钳制再看符号 —— 空框（= 自动）时 _wtof("") 得 0，
+            //    旧写法会算出「1 BPM」这种荒唐值。现在空框按 20 BPM 起步，
+            //    与 macOS 端步进器的范围（20~400）一致。
             if (m_bpmEdit)
             {
                 wchar_t t[32] = {0};
                 ::GetWindowTextW (m_bpmEdit, t, 32);
-                double v = ::_wtof (t) - 1.0;
-                if (v < 1.0) v = 1.0;
+                double v = ::_wtof (t);
+                if (v < 20.0) v = 20.0;
+                v += (id == IDC_BPM_UP) ? 1.0 : -1.0;
+                if (v < 20.0)  v = 20.0;
+                if (v > 400.0) v = 400.0;
                 std::swprintf (t, 32, L"%d", static_cast<int> (v));
                 ::SetWindowTextW (m_bpmEdit, t);
                 applyBpmFromEdit ();
             }
             break;
+        }
         case IDC_BPM_EDIT:
             if (notify == EN_KILLFOCUS)
                 applyBpmFromEdit ();

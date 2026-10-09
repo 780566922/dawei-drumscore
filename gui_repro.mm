@@ -106,6 +106,7 @@ public:
 
     // 假的宿主时间轴：默认「宿主没给」，测试时可按需打开，
     // 用来走通「自动跟随乐谱速度 + 画谱面播放头」这条分支。
+    // fakePlayheadSec 可改：用来分别驱动「播放头自己在走」和「宿主把它挪走了」。
     ap::PlugView::Backend::HostTimeline hostTimeline () const override
     {
         ap::PlugView::Backend::HostTimeline t;
@@ -114,12 +115,13 @@ public:
         t.timeSigValid = fakeTimeline;
         t.beatsPerBar = 4;
         t.playheadValid = fakeTimeline;
-        t.playheadSec = 3.5;
+        t.playheadSec = fakePlayheadSec;
         t.playing = true;
         return t;
     }
 
     bool fakeTimeline = false;
+    double fakePlayheadSec = 3.5;   ///< 假宿主播放头位置（秒）
     int  seekCalls = 0;   ///< seekTo 被调用次数 —— 回归防线：拖动波形不该 seek
 
 private:
@@ -162,6 +164,9 @@ private:
 - (void)tick;
 - (void)stopTimer;
 - (void)stopDrag;
+// 只读自测访问器（实现在 gui.mm 的 GUIView 里）
+- (double)bpmFieldValue;
+- (NSString*)beatsSelection;
 @end
 
 //------------------------------------------------------------------------------
@@ -374,6 +379,41 @@ int main (int argc, char** argv)
         if (fields < 5)    { std::printf ("[复现] ✗ 文本框缺失\n"); rc = 8; }
         if (popups < 1)    { std::printf ("[复现] ✗ 拍号下拉缺失\n"); rc = 9; }
         if (steppers < 1)  { std::printf ("[复现] ✗ BPM 步进缺失\n"); rc = 10; }
+
+        // ---- 页脚宣传语：必须是「可点击链接」，且接到正确的主页地址 ----
+        // ⚠️ 只验接线，绝不调用 mouseDown: —— 那会把浏览器真的拉起来。
+        //    自动化测试里弹浏览器是不可接受的副作用，所以走只读的 brandUrl 访问器。
+        {
+            NSView* brand = nil;
+            for (NSView* sv in [guiView subviews])
+            {
+                if ([[[sv class] description] isEqualToString:@"BrandLinkField"])
+                {
+                    brand = sv;
+                    break;
+                }
+            }
+
+            SEL selUrl = NSSelectorFromString (@"brandUrl");
+            NSString* u = (brand && [brand respondsToSelector:selUrl])
+                        ? ((id (*) (id, SEL)) objc_msgSend) (brand, selUrl) : nil;
+
+            if (!brand)
+            {
+                std::printf ("[复现] ✗ 页脚宣传语不是可点击控件（BrandLinkField 缺失）\n");
+                rc = 31;
+            }
+            else if (!u || std::strcmp ([u UTF8String], ap::kBrandHomeUrl) != 0)
+            {
+                std::printf ("[复现] ✗ 页脚跳转地址不对：%s（期望 %s）\n",
+                             u ? [u UTF8String] : "(nil)", ap::kBrandHomeUrl);
+                rc = 31;
+            }
+            else
+            {
+                step ("页脚宣传语是可点击链接，地址正确");
+            }
+        }
 
         // ---- 网格绘制：宿主没给时间轴（退回默认 120 BPM / 4/4）----
         backend.fakeTimeline = false;
@@ -618,6 +658,137 @@ int main (int argc, char** argv)
             {
                 std::printf ("[复现] ✗ ⌥拖动网格没有改变起始偏移\n");
                 rc = 17;
+            }
+        }
+
+        // ---- ⭐ 编辑器关掉再打开：手填的 BPM / 拍号必须还在 ----
+        // 用户实测：「把插件界面关掉之后再打开，之前手动输入的 BPM 就没了，回到 120」。
+        // 根因：后端（Processor）比编辑器视图长寿 —— 关掉界面只销毁 PlugView
+        //       （日志里「编辑器 removed」之后紧跟新的「PlugView 构造」，后端指针不变），
+        //       但新视图的控件都是新建的、没有从后端回读 → 显示默认 120；而 BPM
+        //       输入框一失焦就会自动提交，于是把 120 写回后端 = 手填值真的丢了。
+        // 复刻方式：同一个后端再挂一个编辑器（等价于 MuseScore 重新打开界面）。
+        @autoreleasepool
+        {
+            backend.setGridBPM (96.0f);             // = 用户在界面上填 96
+            backend.setGridBeatsPerBar (12);
+            backend.setGridBeatDenominator (8);     // 顺手选个非默认拍号，一并验
+
+            NSWindow* w2 = [[NSWindow alloc] initWithContentRect:NSMakeRect (0, 0, 620, 460)
+                                                       styleMask:NSWindowStyleMaskBorderless
+                                                         backing:NSBackingStoreBuffered
+                                                           defer:NO];
+            auto* pv2 = new ap::PlugView (&backend, nullptr);
+            pv2->addRef ();
+            pv2->attached ((__bridge void*) [w2 contentView], Steinberg::kPlatformTypeNSView);
+
+            NSArray* subs2 = [[w2 contentView] subviews];
+            NSView* panel2 = subs2.count > 0 ? [[subs2 objectAtIndex:subs2.count - 1] retain] : nil;
+
+            if (!panel2)
+            {
+                std::printf ("[复现] ✗ 第二个编辑器视图未挂载，无法验证回读\n");
+                rc = 26;
+            }
+            else
+            {
+                const double bpmShown = [panel2 bpmFieldValue];
+                NSString* tsShown = [panel2 beatsSelection];
+                std::printf ("  · 重开编辑器后界面显示：BPM=%g，拍号=%s（期望 96 / 12/8）\n",
+                             bpmShown, tsShown ? [tsShown UTF8String] : "(nil)");
+
+                if (std::fabs (bpmShown - 96.0) > 0.5)
+                {
+                    std::printf ("[复现] ✗ 重开编辑器后 BPM 没有从后端回读（手填值会丢）\n");
+                    rc = 27;
+                }
+                else if (!tsShown || ![tsShown isEqualToString:@"12/8"])
+                {
+                    std::printf ("[复现] ✗ 重开编辑器后拍号没有从后端回读\n");
+                    rc = 28;
+                }
+
+                if ([panel2 respondsToSelector:NSSelectorFromString (@"stopTimer")])
+                    [panel2 stopTimer];
+                [panel2 release];
+            }
+            [w2 release];
+        }
+
+        // ---- ⭐ 播放中把视野拖到别处：画面不许把播放头「拽」回来 ----
+        // 用户实测：「播放中左右调动波形会抽搐，而抽搐的过程中两个播放头就分家了」。
+        // 旧规则在「播放头完全跑出画面」时【无条件】把视野拉回 → 与用户的手来回
+        // 拉锯（抽搐），每次拉回还要重取样，音频线程被饿到丢块（真分家）。
+        // 新规则：手动操作时播放头允许待在画面外；即使跟随超时自动恢复，也只在
+        // 播放头【还在画面附近】时才顺滑滚动，绝不会突然跳回去抢走用户看的位置。
+        @autoreleasepool
+        {
+            backend.fakeTimeline = true;       // 谱面播放头存在，且 playing = true
+            backend.fakePlayheadSec = 3.5;
+            backend.setOffsetSec (0.0f);
+            backend.setGridBPM (0.0f);
+
+            SEL selFit   = NSSelectorFromString (@"fitAll");
+            SEL selZoom  = NSSelectorFromString (@"zoomBy:aroundX:");
+            SEL selStart = NSSelectorFromString (@"viewStartSec");
+
+            ((void (*) (id, SEL)) objc_msgSend) (wave, selFit);
+            // 放到 40 倍（视野约 0.2 秒）：播放头 3.5 秒必然远在画面之外
+            ((void (*) (id, SEL, double, CGFloat)) objc_msgSend) (wave, selZoom, 40.0, (CGFloat) 0.0);
+
+            const NSInteger wn = g_hostWindow.windowNumber;
+            NSEvent* down = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                               location:NSMakePoint (100, 60)
+                                          modifierFlags:0 timestamp:0 windowNumber:wn
+                                                context:nil eventNumber:1 clickCount:1 pressure:1.0];
+            NSEvent* dragg = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDragged
+                                                location:NSMakePoint (600, 60)
+                                           modifierFlags:0 timestamp:0.01 windowNumber:wn
+                                                 context:nil eventNumber:2 clickCount:1 pressure:1.0];
+            NSEvent* up = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+                                             location:NSMakePoint (600, 60)
+                                        modifierFlags:0 timestamp:0.02 windowNumber:wn
+                                              context:nil eventNumber:3 clickCount:1 pressure:1.0];
+            step ("播放中无修饰键拖动视野（拖到远离播放头的位置）");
+            [wave mouseDown:down];
+            [wave mouseDragged:dragg];
+            [wave mouseUp:up];
+
+            const double startPanned = ((double (*) (id, SEL)) objc_msgSend) (wave, selStart);
+            // 连跑 10 次 tick = 播放中过了 0.5 秒。
+            // ⚠️ fakeTimeline 的鼠标事件时间戳是 0，而系统已运行很久 →
+            //    recoverAutoFollow 会立刻判定「用户早就停手了」并恢复跟随。
+            //    这正是我们想覆盖的更严苛路径：跟随已恢复也不许把视野拽回去。
+            for (int i = 0; i < 10; ++i)
+                [guiView tick];
+            const double startAfter = ((double (*) (id, SEL)) objc_msgSend) (wave, selStart);
+
+            std::printf ("  · 拖动后视野起点 %.3f 秒；连跑 10 次 tick 后 %.3f 秒（应不变）\n",
+                         startPanned, startAfter);
+
+            if (std::fabs (startAfter - startPanned) > 0.01)
+            {
+                std::printf ("[复现] ✗ 播放中被自动跟随拉回了视野 —— 用户看到的就是抽搐\n");
+                rc = 29;
+            }
+
+            // ---- 反向用例：宿主【自己】把播放头挪走（点小节 / 循环回卷）→ 画面该跟 ----
+            // 只有这种情况才允许画面跳转，否则用户会「找不到播放头」。
+            backend.fakePlayheadSec = 6.5;      // 距上一帧 3.0 秒 > kHostJumpSec(0.25)
+            for (int i = 0; i < 2; ++i)
+                [guiView tick];
+            const double startAfterJump = ((double (*) (id, SEL)) objc_msgSend) (wave, selStart);
+            std::printf ("  · 宿主把播放头挪到 6.5 秒后，视野起点 = %.3f 秒（应跟到 6.3 附近）\n",
+                         startAfterJump);
+
+            if (backend.durationSec () < 7.0)
+            {
+                std::printf ("  · （测试音频太短，跳过「跟随宿主跳转」断言）\n");
+            }
+            else if (startAfterJump < 5.5)
+            {
+                std::printf ("[复现] ✗ 宿主主动跳转播放头后，画面没有跟过去\n");
+                rc = 30;
             }
         }
 

@@ -20,6 +20,7 @@
 #include "pluginterfaces/gui/iplugview.h"
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,16 @@ using Steinberg::uint32;
 using Steinberg::ViewRect;
 using Steinberg::IPlugFrame;
 using Steinberg::IPlugView;
+
+//------------------------------------------------------------------------------
+// 作者 B 站主页 —— 底部「♪ B 站「大伟鼓谱」· 欢迎关注…」那条粉色宣传语的跳转目标。
+//
+// ⭐ 三端（macOS / Windows / Linux）共用这一个常量，不要在各自的 gui 文件里
+//    再各写一份 URL 字符串。本项目已经反复栽在「同一语义在三端各写一遍、
+//    改的时候漏掉一端」上（见 MEMORY 铁律 9：必须逐端比对）—— 地址只此一处，
+//    改地址就改这一行。
+//------------------------------------------------------------------------------
+inline constexpr const char* kBrandHomeUrl = "https://space.bilibili.com/65320474";
 
 // 注意：不要显式再继承 Steinberg::FUnknown —— IPlugView 已经继承它，
 // 重复继承会触发 MSVC C4584（base-class already a base-class）。
@@ -105,6 +116,16 @@ public:
             uint32 rawState = 0;
         };
         virtual HostTimeline hostTimeline () const = 0;
+
+        //---- 实时健康探针（可选实现，默认 0）------------------------------------
+        // 「音频线程因抢不到播放器的锁而整块丢弃音频」的累计次数。
+        //
+        // 为什么需要它：音频线程的 render() 用 try_lock，抢不到就整块输出静音
+        // 并 return —— 每丢一块，播放位置就永久落后宿主约一个缓冲区的时长。
+        // 表现是「播放中左右拖动波形越拖越错位 / 音频发抖」，而界面上完全看不
+        // 出原因。有了这个计数，界面线程就能把这个隐形故障变成一条日志。
+        // 正常情况下必须恒为 0（GUI 扫波形已改走不可变快照，不再持锁）。
+        virtual uint64_t lockDropCount () const { return 0; }
     };
 
     // 后端解析器：宿主可能先 createView（此时后端还没接上）后 connect，

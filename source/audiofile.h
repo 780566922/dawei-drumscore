@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -99,19 +100,34 @@ public:
     SharedParams& params() { return m_params; }
 
     //---- 载入 ------------------------------------------------------------
-    // 【线程安全】之前这里假设「只在音频线程未运行时调用」，是错的 ——
-    // 在 MuseScore 里插件始终处于激活状态，音频线程一直在 render() 读
-    // m_data.samples。GUI 线程载入文件时直接换掉 m_data 会释放旧缓冲，
-    // 音频线程随即读到已释放内存 → 整个宿主闪退。
-    // 现在所有会碰到 m_data 的路径都持同一把锁。
+    // 【线程安全 · 不可变快照模型】
+    //
+    // 历史教训（两次都栽在这里，别再退回旧写法）：
+    //   ① 早期假设「只在音频线程未运行时载入」→ GUI 换文件时直接覆盖缓冲，
+    //      音频线程读到已释放内存 → 整个宿主闪退。
+    //   ② 修法改成「所有碰到音频数据的路径都持同一把锁」→ 不再崩，但引入了
+    //      更隐蔽的故障：GUI 画波形要遍历几十万次采样，长时间持锁；音频线程
+    //      render() 用的是 try_lock，抢不到就【整块输出静音并返回】——
+    //      每撞一次就丢约 10ms 音频，且 m_readPos 不前进 → 播放位置永久落后
+    //      宿主。表现就是「播放中左右拖动波形越拖越错位 / 音频发抖」。
+    //
+    // 现在的模型：解码结果一经发布就【不可变】，用 shared_ptr<const AudioData>
+    // 持有。读者只需原子地取一份 shared_ptr（微秒级），之后随便遍历多久都与
+    // 音频线程无关；旧数据在最后一个读者释放后自然回收。
+    // 锁只保护「指针的读写」和「标量播放状态」，不再保护大段采样扫描。
     bool setAudio(AudioData&& data)
     {
         if (data.samples.empty() || data.sampleRate == 0 || data.numChannels == 0)
             return false;
 
+        auto snap = std::make_shared<const AudioData>(std::move(data));
+
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_data = std::move(data);
-        m_srcSampleRate = m_data.sampleRate;
+        {
+            std::lock_guard<std::mutex> sl(m_snapMutex);
+            m_audio = snap;
+        }
+        m_srcSampleRate = snap->sampleRate;
         m_offsetDirty = true;             // 强制按当前偏移重算起点
         restartFromOffsetLocked();
         return true;
@@ -122,7 +138,10 @@ public:
     void clearAudio()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_data = AudioData();
+        {
+            std::lock_guard<std::mutex> sl(m_snapMutex);
+            m_audio.reset();
+        }
         m_srcSampleRate = 0;
         m_readPos = 0.0;
         m_silenceSecLeft = 0.0;
@@ -130,26 +149,38 @@ public:
         m_appliedOffset = 0.0f;
     }
 
+    /// 取一份只读音频快照。可跨线程安全持有、安全遍历，**不需要任何锁**。
+    /// 这是唯一允许大范围扫描采样的入口（见上面「不可变快照模型」）。
+    std::shared_ptr<const AudioData> audioSnapshot() const
+    {
+        std::lock_guard<std::mutex> sl(m_snapMutex);
+        return m_audio;      // 仅做一次引用计数 ++，持锁时间以纳秒计
+    }
+
     bool hasAudio() const
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return !m_data.samples.empty();
+        std::shared_ptr<const AudioData> s = audioSnapshot();
+        return s && !s->samples.empty();
     }
 
     // 音频总时长（秒）
     double durationSec() const
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_data.durationSec();
+        std::shared_ptr<const AudioData> s = audioSnapshot();
+        return s ? s->durationSec() : 0.0;
     }
 
-    // 在锁内访问音频数据。**绝不把引用交出去** —— 否则调用方拿着引用
-    // 读的时候，音频线程可能已经把底层缓冲换掉并释放了。
+    // 访问音频数据。
+    // ⚠️ 与旧版语义不同：这里交出去的引用指向【不可变】数据，且调用期间由本
+    // 函数持有的 shared_ptr 保活，所以调用方可以长时间遍历。**唯一的要求是
+    // 不要缓存这个引用**（出了回调它就失效），需要长期保存就留一份
+    // audioSnapshot() 的 shared_ptr。
     template <typename F>
     void withAudio(F&& fn) const
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        fn(m_data);
+        std::shared_ptr<const AudioData> s = audioSnapshot();
+        if (s)
+            fn(*s);
     }
 
     //---- 当前播放位置（秒，源时间轴）--------------------------------------
@@ -159,6 +190,14 @@ public:
         if (!m_srcSampleRate) return 0.0;
         return static_cast<double>(m_readPos) / m_srcSampleRate;
     }
+
+    /// 音频线程因抢不到锁而【整块丢弃音频】的累计次数（只读，多线程安全）。
+    ///
+    /// 这是「播放位置落后宿主 / 音频发抖」的唯一直接指标：
+    /// render() 每丢一块就少推进一个缓冲区的时间，误差会永久累积。
+    /// 正常情况下必须恒为 0 —— 一旦增长，说明有别的线程在长时间持 m_mutex，
+    /// 排查方向：谁在锁内扫描大段采样（画波形应走 audioSnapshot()）。
+    uint64_t lockDropCount() const { return m_lockDrops.load(std::memory_order_relaxed); }
 
     //---- 播放 ------------------------------------------------------------
     // 输出格式：与宿主一致（hostSampleRate, 2 声道 float）
@@ -170,10 +209,12 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_srcSampleRate) return;
+        std::shared_ptr<const AudioData> s = audioSnapshot();
+        const double total = s ? static_cast<double>(s->numFrames()) : 0.0;
+        if (total <= 0.0) return;
         // 手动定位就代表「从现在开始听」，负偏移欠的那段静音作废
         m_silenceSecLeft = 0.0;
         double p = sec * m_srcSampleRate;
-        const double total = static_cast<double>(m_data.numFrames());
         if (p < 0.0) p = 0.0;
         if (p > total - 1.0) p = std::max(0.0, total - 1.0);
         m_readPos = p;
@@ -217,8 +258,11 @@ private:
         }
     }
 
-    mutable std::mutex m_mutex;  ///< 保护 m_data / m_srcSampleRate / m_readPos / m_appliedOffset
-    AudioData m_data;
+    mutable std::mutex m_mutex;  ///< 保护标量播放状态（m_readPos / m_appliedOffset / m_srcSampleRate 等）
+                                 ///< ⚠️ 绝不要在持此锁期间扫描大段采样 —— 音频线程 render() 用 try_lock，
+                                 ///<    抢不到就丢块，会表现为播放位置落后宿主（「分家」）。
+    mutable std::mutex m_snapMutex;                  ///< 只保护 m_audio 这个指针的读写
+    std::shared_ptr<const AudioData> m_audio;        ///< 不可变音频快照（读者用它就不需要 m_mutex）
     SharedParams m_params;
 
     uint32_t m_srcSampleRate = 0;
@@ -227,6 +271,8 @@ private:
     float    m_appliedOffset = 0.0f;   ///< 已生效的偏移，用于检测变化
     bool     m_offsetDirty = true;     ///< 强制重新套用偏移（换文件/卸载后）
     bool     m_wasPlaying = false;     ///< 上一块的播放状态，用于识别「恢复播放」
+
+    std::atomic<uint64_t> m_lockDrops {0};   ///< 抢不到锁而丢块的累计次数（只增不改）
 };
 
 //------------------------------------------------------------------------------

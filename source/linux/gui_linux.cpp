@@ -46,6 +46,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -221,7 +222,13 @@ namespace ap {
 class X11View
 {
 public:
-    explicit X11View (PlugView::Backend* backend) : m_backend (backend) {}
+    explicit X11View (PlugView::Backend* backend) : m_backend (backend)
+    {
+        // ⭐ 视图是「关掉编辑器再打开」时重建的，而拍号存在后端（Processor）里。
+        //    不回读就会出现「网格按 12/8 画、按钮上却写着 4/4」，而且点一下会从
+        //    错误的项开始循环。BPM 不需要回读 —— 显示值是每次绘制时算的。
+        syncTimeSigFromBackend ();
+    }
     ~X11View () { destroy (); }
 
     bool create (Window parent, int w, int h);
@@ -271,6 +278,8 @@ private:
     void toggleHelp ();
     void clampView ();
     void afterLoad ();
+    /// 从后端回读拍号并选中对应项（见构造处的说明）
+    void syncTimeSigFromBackend ();
     void refreshCache ();
 
     //---- 拖放（XDND）---------------------------------------------------
@@ -1212,6 +1221,55 @@ void X11View::toggleHelp ()
 //------------------------------------------------------------------------------
 // 交互
 //------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// 打开作者 B 站主页（点底部页脚宣传语时调用）
+//
+// Linux 没有「用默认程序打开 URL」的系统 API，事实标准是拉 xdg-open。
+//
+// ⚠️ 三个必须点，缺一个都会出问题：
+//  1) 不能用 system()：它同步等命令退出，GUI 线程会被拖住，直接影响音频调度
+//     （宿主是实时音频程序）。所以 fork 之后父进程立刻返回。
+//  2) 子进程里 exec 失败必须 _exit(127)，绝不能 return —— return 会一路退回
+//     宿主的调用栈上继续执行，等于把宿主进程又跑一遍，行为完全不可预期。
+//  3) 用「双 fork」而不是给 SIGCHLD 设 SIG_IGN：后者改的是**整个宿主进程**的
+//     全局信号处置，会破坏宿主自己的子进程管理（它可能有音频/更新子进程）。
+//     双 fork 让真正干活的孙子进程被 init 收养；父进程只回收中间那层，
+//     而中间层 fork 完就 _exit，所以 waitpid 是微秒级、不会卡住界面。
+//
+// ⚠️ 已知差异：本端没有做「鼠标移上去变手型」。X11 要按区域换光标必须自己
+//    XCreateFontCursor + 在 motion 事件里 XDefineCursor/XUndefineCursor 来回切，
+//    而 Linux 端从未在真机验证过 —— 宁可不写，也不加一段没人验证过的光标逻辑。
+//    点击本身可用；macOS / Windows 两端是有手型光标的。
+//------------------------------------------------------------------------------
+static void openBrandHome ()
+{
+    const pid_t mid = ::fork ();
+    if (mid < 0)
+    {
+        ap::crashLog ("作者主页打开失败：fork 失败（%s）", ap::kBrandHomeUrl);
+        return;
+    }
+
+    if (mid == 0)
+    {
+        // ---- 中间层子进程：只负责再 fork 一次，然后立刻退出 ----
+        const pid_t child = ::fork ();
+        if (child == 0)
+        {
+            // ---- 真正干活的孙子进程 ----
+            ::setsid ();   // 脱离会话：宿主退出时不会顺手把浏览器带走
+            ::execlp ("xdg-open", "xdg-open", ap::kBrandHomeUrl, nullptr);
+            // 精简桌面环境里可能没有 xdg-open，退而用 GNOME 的 gio
+            ::execlp ("gio", "gio", "open", ap::kBrandHomeUrl, nullptr);
+            ::_exit (127);   // 两个都没有：直接死掉，别再往下走
+        }
+        ::_exit (0);
+    }
+
+    int status = 0;
+    ::waitpid (mid, &status, 0);   // 只等中间层（它 fork 完就退了），不会阻塞
+}
+
 void X11View::onButtonPress (int x, int y, unsigned state)
 {
     // 使用指南铺满整块面板，任何点击都只表示「知道了」。
@@ -1231,6 +1289,14 @@ void X11View::onButtonPress (int x, int y, unsigned state)
     }
 
     m_pressedId = ID_NONE;
+
+    // 页脚宣传语：点一下用系统默认浏览器打开作者 B 站主页。
+    // ⚠️ 必须放在「波形区」之前判：rBrand 紧贴在波形区下方，命中域不能重叠。
+    if (rBrand.hit (x, y))
+    {
+        openBrandHome ();
+        return;
+    }
 
     // 波形区
     if (Rect { kWaveX, kWaveY, kWaveW, kWaveH }.hit (x, y) && m_backend && m_backend->hasAudio ())
@@ -1502,6 +1568,23 @@ void X11View::centerViewOn (double sec)
         return;                 // 全览：整段都在画面里，无需滚动
     m_viewStart = sec - m_viewSpan * 0.25;
     clampView ();
+}
+
+void X11View::syncTimeSigFromBackend ()
+{
+    if (!m_backend)
+        return;
+    const int beats = m_backend->gridBeatsPerBar ();
+    const int denom = m_backend->gridBeatDenominator ();
+    for (int i = 0; i < kTimeSigCount; ++i)
+    {
+        if (kTimeSigs[i].beats == beats && kTimeSigs[i].denom == denom)
+        {
+            m_timeSigIndex = i;
+            return;
+        }
+    }
+    // 后端里的组合不在列表里（理论上不会）：保持默认项，不猜。
 }
 
 void X11View::afterLoad ()

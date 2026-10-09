@@ -62,4 +62,43 @@ else
   echo "✗ 安装失败：文件未正确复制"
 fi
 
+#------------------------------------------------------------------------------
+# ⭐ 跨域重复检查
+# MuseScore 会同时扫描 /Library/Audio/Plug-Ins/VST3（系统域）和
+# ~/Library/Audio/Plug-Ins/VST3（用户域）。若两处都有同名 bundle，
+# 混音器 Sound 列会出现【两个一模一样的条目】，点开哪一个取决于列表顺序 ——
+# 典型症状就是「新版本明明装了，打开却发现是旧版」。这里主动提示并清理。
+#------------------------------------------------------------------------------
+SYSDEST="/Library/Audio/Plug-Ins/VST3"
+SYS_FOUND=0
+for NAME in "$BUNDLE_NAME" "APLAY.vst3" "DaweiDrumScore.vst3"; do
+  if [ -e "$SYSDEST/$NAME" ]; then SYS_FOUND=1; fi
+done
+
+if [ "$SYS_FOUND" = "1" ]; then
+  echo ""
+  echo "⚠️  检测到【系统目录】里也装了一份插件："
+  ls -1 "$SYSDEST" 2>/dev/null | sed 's/^/      /'
+  echo ""
+  echo "    这会让 MuseScore 里出现两个同名插件（其中一个是旧版）。"
+  echo "    建议只保留一份 —— 删掉系统目录里的版本，只留用户目录这一份。"
+  echo ""
+  printf "    现在删除系统目录里的旧版本？（需要输入开机密码）[y/N] "
+  read -r SYS_ANS
+  case "$SYS_ANS" in
+    y|Y|yes|YES)
+      if sudo rm -rf "$SYSDEST/$BUNDLE_NAME" "$SYSDEST/APLAY.vst3" "$SYSDEST/DaweiDrumScore.vst3"; then
+        echo "    ✓ 系统目录已清理，现在全机只剩用户目录这一份"
+      else
+        echo "    ✗ 清理未成功（密码错误或已取消）。请稍后手动执行："
+        echo "        sudo rm -rf \"$SYSDEST/$BUNDLE_NAME\""
+      fi
+      ;;
+    *)
+      echo "    已跳过。若 MuseScore 里仍有两个条目，请手动执行："
+      echo "        sudo rm -rf \"$SYSDEST/$BUNDLE_NAME\""
+      ;;
+  esac
+fi
+
 read -r -p "按回车关闭..." _

@@ -1,27 +1,50 @@
 #!/bin/bash
 #==============================================================================
-# postinstall — 安装后清理旧版本残留
+# postinstall — 安装后清理旧版本 / 重复安装
 #
 # 由 macOS 安装器以 root 身份运行。作用：
-#   1. 移除同一目录下改名前/旧命名的插件（APLAY.vst3 / DaweiDrumScore.vst3），
-#      避免 MuseScore 里出现重复或陈旧条目。
-#   2. 清掉插件包的下载隔离属性（quarantine），保证宿主可正常加载。
-# 只操作 /Library/Audio/Plug-Ins/VST3 下我们自己的插件，不碰用户其它文件。
+#   1. 移除【系统域】里改名前/旧命名的插件（APLAY.vst3 / DaweiDrumScore.vst3）。
+#   2. ⭐ 移除【每个用户域】里的同名/旧命名插件。
+#      原因：MuseScore 同时扫描 /Library/... 和 ~/Library/... 两个 VST3 目录，
+#      若两处都有同名 bundle，混音器 Sound 列会出现【两个一模一样的条目】，
+#      而且点开哪一个取决于列表顺序 —— 用户很可能是打开了【旧的那份】，
+#      表现为「新版本没装上 / 打开的版本不对」。
+#      pkg 是系统级安装，应保证全机只存在一份。
+#   3. 清掉插件包的下载隔离属性（quarantine），保证宿主可正常加载。
+# 只操作 Audio/Plug-Ins/VST3 下我们自己的插件，不碰用户其它文件。
 #==============================================================================
 set -u
 
 DEST="/Library/Audio/Plug-Ins/VST3"
 CUR="$DEST/大伟鼓谱MuseScore音频播放器.vst3"
+VST3_SUFFIX="Library/Audio/Plug-Ins/VST3"
 
-# 清掉旧命名残留（改名前叫 APLAY，中间一版叫 DaweiDrumScore）
+# 我们自己用过的所有 bundle 名（改名前叫 APLAY，中间一版叫 DaweiDrumScore）
+NAMES=("大伟鼓谱MuseScore音频播放器.vst3" "APLAY.vst3" "DaweiDrumScore.vst3")
+
+#---- 1. 系统域：清掉旧命名残留 -------------------------------------------------
 for OLD in "APLAY.vst3" "DaweiDrumScore.vst3"; do
     if [ -d "$DEST/$OLD" ]; then
         rm -rf "$DEST/$OLD"
-        echo "已移除旧版本：$OLD"
+        echo "已移除旧版本：$DEST/$OLD"
     fi
 done
 
-# 去除下载隔离属性，避免宿主加载被 Gatekeeper 拦
+#---- 2. 用户域：清掉同名/旧命名插件（防重复条目）--------------------------------
+for HOMEDIR in /Users/*; do
+    [ -d "$HOMEDIR/$VST3_SUFFIX" ] || continue
+    for NAME in "${NAMES[@]}"; do
+        TARGET="$HOMEDIR/$VST3_SUFFIX/$NAME"
+        if [ -e "$TARGET" ]; then
+            rm -rf "$TARGET"
+            echo "已移除用户域中的重复安装：$TARGET"
+        fi
+    done
+    # 目录空了就顺手删掉，避免留下空壳
+    rmdir "$HOMEDIR/$VST3_SUFFIX" 2>/dev/null || true
+done
+
+#---- 3. 去隔离属性 ------------------------------------------------------------
 if [ -d "$CUR" ]; then
     xattr -dr com.apple.quarantine "$CUR" 2>/dev/null || true
 fi
