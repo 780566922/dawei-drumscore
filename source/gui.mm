@@ -290,6 +290,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)followPlayheadTo:(double)audioSec allowJump:(BOOL)allowJump;
 - (void)recoverAutoFollow;     ///< 用户停止手动操作超时后，自动恢复跟随
 - (void)centerOn:(double)audioSec;   ///< 把视野挪到 audioSec（用于「回到播放头」）
+- (void)centerOnIfOffscreen:(double)audioSec;   ///< 只在播放头跑出画面时才挪（用于「偏移归零」）
 - (void)noteBackToPlayhead;          ///< 记下「刚点过回到播放头」，供升级提示用
 - (void)checkFollow;                 ///< 由面板 tick 调用：判定点完按钮后是否仍错位
 - (BOOL)followFailActive;            ///< 是否处于「点了按钮仍错位」状态（只读，自测用）
@@ -422,6 +423,22 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     [self clampView];
     [self refreshPeaks];
     [self setNeedsDisplay:YES];
+}
+
+// 只在播放头【跑出画面】时才把视野挪过去。
+// 给「偏移归零」用：归零会让音频一下跳回「谱面位置 + 0」，播放头可能瞬间跑到画面
+// 外面（那正是用户接下来想看的地方）；但用户正盯着别处时不该被抢走视野 ——
+// 所以与 centerOn: 的区别就是多这一道「本来就在画面里就什么都不做」的判断。
+- (void)centerOnIfOffscreen:(double)audioSec
+{
+    if (!(_st->viewLen > 0.0))
+    {
+        [self fitAll];
+        return;
+    }
+    if (audioSec >= _st->viewStart && audioSec <= _st->viewStart + _st->viewLen)
+        return;
+    [self centerOn:audioSec];
 }
 
 // 直接设定视野时长与起点（用于「默认放大到前几小节」）。
@@ -1160,8 +1177,8 @@ namespace ap { void openBrandHome (); }
         @"     跟谱子的小节对上。留空 = 自动：跟着乐谱走，乐谱没给就 120。",
         @"",
         @"#3  对拍子：按住 ⌘（或 ⌥）在波形上左右拖网格，把「1」那条",
-        @"     小节线拖到音乐的第一拍上（对准波形里的鼓点）。按住 ⇧ 拖",
-        @"     = 微调。音频开头被跳过的那一段会画成灰色，是正常的。",
+        @"     小节线拖到音乐的第一拍上（对准波形里的鼓点）。⇧ 拖 = 微调，",
+        @"     调坏了点右边的「归零」。开头被跳过的那段画成灰色，是正常的。",
         @"",
         @"#4  波形区其它操作：直接拖 = 平移视野",
         @"     滚轮 / 双指左右滑 = 平移；⌘/⌥+滚轮 或 双指捏合 = 缩放；",
@@ -1224,6 +1241,7 @@ namespace ap { void openBrandHome (); }
 - (void)zoomOut:(id)s;
 - (void)zoomFit:(id)s;
 - (void)backToPlayhead:(id)s;
+- (void)offsetZero:(id)s;     ///< 「归零」：起始偏移一键清零
 - (void)helpToggle:(id)s;
 - (void)openFile:(id)s;
 - (void)loadPath:(NSString*)path;
@@ -1318,10 +1336,21 @@ namespace ap { void openBrandHome (); }
         _st->offsetLabel.toolTip = @"当前起始偏移（正值=跳过前奏，负值=先垫静音）\n"
                                     @"改偏移：在波形上按住 ⌘（或 ⌥）拖动网格";
 
+        // 「归零」：把起始偏移一键清零。
+        // 之前唯一的改偏移入口是「在波形上 ⌘/⌥ 拖动」—— 手滑拖到很大的值
+        // （或者只想回到初始状态）就只能反向拖回去，而拖回来的距离可能是好几个屏。
+        // 用户实测点名要这个按钮。
+        NSButton* offsetZero = [self button:@"归零" action:@selector (offsetZero:)];
+        offsetZero.frame = NSMakeRect (168, 186, 50, 20);
+        offsetZero.font = [NSFont systemFontOfSize:11];
+        offsetZero.toolTip = @"把起始偏移清零（音频 0 秒 对 谱面 0 秒）";
+
         // ---- 快捷键提示 ----
-        NSTextField* hintKeys = [self label:@"拖动=平移视图　⌘/⌥拖动=改偏移　⇧=微调　滚轮=平移　⌘/⌥滚轮=缩放　双击=全览"
+        // ⚠️ 宽度受「归零」按钮挤压（原来从 x=170 起、450 宽）。文案里的
+        //    「⇧=微调」已挪进 toolTip / 帮助覆盖层，这里只留最要紧的几条。
+        NSTextField* hintKeys = [self label:@"拖动=平移视图　⌘/⌥拖动=改偏移　滚轮=平移　⌘/⌥滚轮=缩放　双击=全览"
                                      size:10 align:NSTextAlignmentLeft];
-        hintKeys.frame = NSMakeRect (170, 189, 450, 16);
+        hintKeys.frame = NSMakeRect (226, 189, 394, 16);
         [hintKeys setTextColor:[NSColor colorWithCalibratedWhite:0.55 alpha:1.0]];
 
         // ---- 速度（BPM）+ 拍号（N/M）----
@@ -1732,6 +1761,27 @@ namespace ap { void openBrandHome (); }
                                                          green:0.85
                                                           blue:0.55
                                                          alpha:1.0]];
+    [_st->wave setNeedsDisplay:YES];
+}
+
+// 「归零」：把起始偏移一键清零。
+// 为什么要它：改偏移的唯一入口是「在波形上 ⌘/⌥ 拖动」，一旦手滑拖到很大的值
+//（或只想回到初始状态），就只能反向拖回去 —— 可能要拖好几个屏。用户实测点名要。
+- (void)offsetZero:(id)s
+{
+    (void) s;
+    if (!_st->backend)
+        return;
+
+    _st->backend->setOffsetSec (0.0f);
+    [self offsetChangedExternally:0.0];     // 刷新偏移数值 + 状态栏
+
+    // 归零会让音频跳回「谱面位置 + 0」，播放头可能一下跑到画面外 —— 那种情况就
+    // 把它带回画面（本来就在画面里则什么都不做，别抢用户正在看的视野）。
+    const ap::PlugView::Backend::HostTimeline tl = _st->backend->hostTimeline ();
+    if (tl.playheadValid)
+        [_st->wave centerOnIfOffscreen:tl.playheadSec];
+
     [_st->wave setNeedsDisplay:YES];
 }
 

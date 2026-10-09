@@ -54,13 +54,25 @@ namespace {
 
 //------------------------------------------------------------------------------
 // 尺寸与颜色
+//
+// ⭐ 面板不再写死：宿主或用户都可以把窗口拖大，布局由 layoutAll() 按【实际窗口
+//    尺寸】重算 —— 波形区随宽度一起变宽（音频工具最需要横向分辨率）。
+//    · kPanelW/H    = 默认尺寸（宽度 340 → 680）
+//    · kPanel*Min   = 下限（宽度沿用旧的 340，所有控件在那时刚好排得下）
+//    · kPanel*Max   = 上限（挡住宿主报来的荒唐尺寸）
 //------------------------------------------------------------------------------
-const int kPanelW = 340;   ///< 面板宽（与 macOS / Windows 版一致）
-const int kPanelH = 384;   ///< 面板高（含底部 B 站署名）
-const int kWaveX  = 10;
-const int kWaveY  = 34;
-const int kWaveW  = 320;
-const int kWaveH  = 118;
+const int kPanelW = 680;   ///< 默认面板宽
+const int kPanelH = 384;   ///< 默认面板高（含底部 B 站署名）
+const int kPanelWMin = 340;
+const int kPanelHMin = 384;
+const int kPanelWMax = 1700;
+const int kPanelHMax = 1200;
+
+// 波形区（由 layoutAll() 重算，不是常量 —— 宽度跟着面板走）
+int kWaveX  = 10;
+int kWaveY  = 34;
+int kWaveW  = 320;
+int kWaveH  = 118;
 
 struct RGB8 { unsigned char r, g, b; };
 
@@ -85,6 +97,9 @@ const RGB8 kWhite     = { 255, 255, 255 };
 
 //------------------------------------------------------------------------------
 // 控件矩形（与 Windows 版一一对应，便于对照维护）
+//
+// ⚠️ 这些【不是常量】—— 由 X11View::layoutAll() 按当前窗口尺寸重算。
+//    下面给的初值就是 340×384 下的旧布局（GUI 还没建好时的兜底值）。
 //------------------------------------------------------------------------------
 struct Rect
 {
@@ -95,28 +110,29 @@ struct Rect
     }
 };
 
-const Rect rOpenBtn  = { 240,   6,  90, 24 };
-const Rect rHelpBtn  = { 172,   6,  62, 24 };   ///< 「？帮助」：唤出使用指南覆盖层
-const Rect rTime     = {  10, 158,  92, 18 };
-const Rect rZoomOut  = { 104, 155,  38, 22 };
-const Rect rZoomIn   = { 144, 155,  38, 22 };
-const Rect rZoomFit  = { 184, 155,  38, 22 };
-const Rect rBack     = { 224, 155,  80, 22 };
-const Rect rGridChk  = {  10, 182,  62, 20 };
-const Rect rNumChk   = {  74, 182,  72, 20 };
-const Rect rOffset   = { 150, 182, 126, 18 };
-const Rect rHint     = {  10, 204, 320, 18 };
-const Rect rBpmBox   = {  46, 226,  44, 22 };
-const Rect rBpmUp    = {  91, 226,  18, 11 };
-const Rect rBpmDown  = {  91, 237,  18, 11 };
-const Rect rTimeSig  = { 150, 224,  70, 22 };
-const Rect rSrc      = { 228, 226, 106, 18 };
-const Rect rVolume   = {  46, 252, 188, 24 };
-const Rect rVolLabel = { 238, 254,  52, 18 };
-const Rect rFile     = {  10, 280, 320, 18 };
-const Rect rStatus   = {  10, 300, 130, 18 };
-const Rect rFmt      = { 140, 300, 190, 18 };
-const Rect rBrand    = {  10, 358, 320, 18 };
+Rect rOpenBtn  = { 240,   6,  90, 24 };
+Rect rHelpBtn  = { 172,   6,  62, 24 };   ///< 「？帮助」：唤出使用指南覆盖层
+Rect rTime     = {  10, 158,  92, 18 };
+Rect rZoomOut  = { 104, 155,  38, 22 };
+Rect rZoomIn   = { 144, 155,  38, 22 };
+Rect rZoomFit  = { 184, 155,  38, 22 };
+Rect rBack     = { 224, 155,  80, 22 };
+Rect rGridChk  = {  10, 182,  62, 20 };
+Rect rNumChk   = {  74, 182,  72, 20 };
+Rect rOffset   = { 150, 182, 126, 18 };
+Rect rOffsetZero = { 280, 182, 50, 20 };  ///< 「归零」：起始偏移一键清零
+Rect rHint     = {  10, 204, 320, 18 };
+Rect rBpmBox   = {  46, 226,  44, 22 };
+Rect rBpmUp    = {  91, 226,  18, 11 };
+Rect rBpmDown  = {  91, 237,  18, 11 };
+Rect rTimeSig  = { 150, 224,  70, 22 };
+Rect rSrc      = { 228, 226, 106, 18 };
+Rect rVolume   = {  46, 252, 188, 24 };
+Rect rVolLabel = { 238, 254,  52, 18 };
+Rect rFile     = {  10, 280, 320, 18 };
+Rect rStatus   = {  10, 300, 130, 18 };
+Rect rFmt      = { 140, 300, 190, 18 };
+Rect rBrand    = {  10, 358, 320, 18 };
 
 //------------------------------------------------------------------------------
 // 分家检测阈值（秒）
@@ -137,6 +153,14 @@ const double kDivergenceWarnSec = 0.25;
 //    （跳变场景的自动硬 seek 在 aplaysdk.cpp 的 captureHostTimeline 里。）
 const double kFollowFailWindowSec = 3.0;
 const double kFollowFailLogGapSec = 5.0;
+
+//---- 视野自动跟随（与 macOS / Windows 端同一套规则，见 followPlayheadTo）------
+// ① 用户手动操作（拖波形 / 缩放 / 滚轮）后暂停跟随 2 秒；
+// ② 播放头远在画面之外（超一整个屏）→ 不追，绝不把用户的视野抢回来；
+// ③ 唯一例外：相邻两帧的【谱面位置】差 > kHostJumpSec，即宿主自己跳转了
+//    （点小节 / 循环回卷 / 拖播放头）—— 那种情况用户正等着画面跟过去。
+const double kHostJumpSec      = 0.25;
+const double kUserScrollHoldSec = 2.0;
 
 // 拍号选项（与 macOS / Windows 端一致）
 struct TimeSig { const char* label; int beats; int denom; };
@@ -237,6 +261,12 @@ public:
 
     Window window () const { return m_win; }
 
+    // 当前面板尺寸。getSize 必须如实汇报它 —— 窗口可以被用户拖大，宿主随时会来
+    // 问「你现在多大」；这时若还报「默认尺寸」，宿主会照着旧尺寸折腾窗口，用户
+    // 刚拖好的宽度就被弹回去。
+    int panelW () const { return m_w; }
+    int panelH () const { return m_h; }
+
 private:
     //---- 线程 ----------------------------------------------------------
     static void* threadEntry (void* self);
@@ -267,13 +297,20 @@ private:
     void onButtonPress (int x, int y, unsigned state);
     void onButtonRelease (int x, int y, unsigned state);
     void onMotion (int x, int y, unsigned state);
-    void onScroll (int x, int y, int dir, unsigned state);
+    void onScroll (int x, int y, int dir, unsigned state, bool horizontal = false);
 
     void actionFor (int id);
     void zoomBy (double factor, double centerSec);
     void zoomFit ();
     /// 把视野挪到 sec（播放头落在画面 25% 处）。用于「回到播放头」。
     void centerViewOn (double sec);
+    /// 按当前窗口尺寸重算所有控件矩形（面板可由宿主/用户调整大小）。
+    void layoutAll ();
+    //---- 视野自动跟随（规则见 kHostJumpSec 处的说明）----
+    void markUserScrolling ();
+    void recoverAutoFollow (double now);
+    /// 返回值 = 视野是否真的动了（动了就要重绘）。
+    bool followPlayheadTo (double audioSec, bool allowJump);
     /// 显示/隐藏使用指南覆盖层。
     void toggleHelp ();
     void clampView ();
@@ -318,6 +355,13 @@ private:
 
     double m_viewStart = 0.0;   ///< 视野起点（秒）
     double m_viewSpan  = 8.0;   ///< 视野跨度（秒）
+
+    //---- 视野自动跟随（规则与 macOS / Windows 端一致）----
+    bool   m_followScroll = true;     ///< 总开关（现阶段恒为 true）
+    bool   m_userScrolling = false;   ///< 用户手动操作期间暂停跟随
+    double m_lastUserScrollAt = 0.0;  ///< 用户最后一次手动操作的时刻（做超时恢复）
+    bool   m_hasPrevPlayhead = false; ///< 是否已有上一帧谱面位置（判断宿主跳变）
+    double m_prevPlayheadSec = 0.0;
 
     //---- 「点完『回到播放头』仍错位」检测（渲染循环维护，paint 只读）----
     double m_lastBackAt = -1.0e9;       ///< 上次点「回到播放头」的时刻（nowSec）
@@ -392,6 +436,7 @@ private:
     {
         ID_NONE = 0,
         ID_OPEN, ID_ZOOM_OUT, ID_ZOOM_IN, ID_ZOOM_FIT, ID_BACK, ID_HELP,
+        ID_OFFSET_ZERO,        // 「归零」：把起始偏移一键清零
         ID_GRID, ID_NUM, ID_BPM_BOX, ID_BPM_UP, ID_BPM_DOWN,
         ID_TIMESIG, ID_VOLUME,
         ID_BROWSER_UP, ID_BROWSER_CANCEL, ID_BROWSER_ITEM
@@ -413,6 +458,11 @@ bool X11View::create (Window parent, int w, int h)
     m_screen = DefaultScreen (m_dpy);
     m_w = w > 0 ? w : kPanelW;
     m_h = h > 0 ? h : kPanelH;
+    if (m_w < kPanelWMin) m_w = kPanelWMin;
+    if (m_h < kPanelHMin) m_h = kPanelHMin;
+    if (m_w > kPanelWMax) m_w = kPanelWMax;
+    if (m_h > kPanelHMax) m_h = kPanelHMax;
+    layoutAll ();      // 先按窗口尺寸把控件矩形算好，后面绘制/命中都用它
 
     const unsigned long black = BlackPixel (m_dpy, m_screen);
     m_win = ::XCreateSimpleWindow (m_dpy, parent, 0, 0,
@@ -567,9 +617,17 @@ void X11View::resize (int w, int h)
     if (!m_dpy || !m_win || w <= 0 || h <= 0)
         return;
 
+    // 与 create() 一致地钳到 [min, max]：宿主/用户把窗口拖到 0 或荒唐尺寸时，
+    // 布局按下限算（多余部分被裁），总比控件叠在一起好。
+    if (w < kPanelWMin) w = kPanelWMin;
+    if (h < kPanelHMin) h = kPanelHMin;
+    if (w > kPanelWMax) w = kPanelWMax;
+    if (h > kPanelHMax) h = kPanelHMax;
+
     ::XLockDisplay (m_dpy);
     m_w = w;
     m_h = h;
+    layoutAll ();
     ::XResizeWindow (m_dpy, m_win, static_cast<unsigned> (w), static_cast<unsigned> (h));
 
     if (m_pixmap)
@@ -583,6 +641,75 @@ void X11View::resize (int w, int h)
     m_dirty = true;
     ::XFlush (m_dpy);
     ::XUnlockDisplay (m_dpy);
+}
+
+//------------------------------------------------------------------------------
+// 布局：按【当前窗口尺寸】重算所有控件矩形
+//
+// 与 Windows 端 layoutChildren() 是同一套几何（一一对应，便于对照维护）：
+//   · 宽度方向：多数控件靠左固定；右侧那几个（打开音频 / 回到播放头 / 归零 /
+//     音量百分比 / 支持的格式）挂在「右边界 - 10」上，中间留白自动分配
+//     → 窗口拖大时【波形区跟着变宽】。
+//   · 高度方向：波形区吃掉上方全部余量，底部那一段（时间 / 缩放 / 网格 / BPM /
+//     音量 / 文件 / 状态 / 署名）保持固定高度并贴着面板底部。
+//   ⚠️ 底部区块里所有控件的 y 都写成「bottomTop + 偏移」，不能写绝对值 ——
+//      面板一旦被拉高，绝对值就飞了。
+//   ⚠️ 面板被宿主强行缩到比下限还小时，按【下限尺寸】排布（多余部分被裁）。
+//   下面括号里的数字 = 340×384 下算出来的结果，与旧版固定布局逐点吻合。
+//------------------------------------------------------------------------------
+void X11View::layoutAll ()
+{
+    const int pw  = std::max (m_w, kPanelWMin);
+    const int ph  = std::max (m_h, kPanelHMin);
+    const int pad = 10;
+    const int bottomTop = ph - 226;          // 384-226 = 158
+
+    // ---- 波形区：宽吃掉左右各 10 外的全部，高吃掉上下之间的一切 ----
+    kWaveX = pad;                            // 10
+    kWaveY = 34;
+    kWaveW = std::max (320, pw - pad * 2);   // 320
+    kWaveH = std::max (118, bottomTop - 34 - 6);   // 118
+
+    // ---- 顶栏（右对齐）----
+    rOpenBtn = Rect { pw - pad - 90, 6, 90, 24 };                    // 240
+    rHelpBtn = Rect { pw - pad - 90 - 6 - 62, 6, 62, 24 };           // 172
+
+    // ---- 时间 / 缩放 / 回到播放头 ----
+    rTime    = Rect { 10, bottomTop, 92, 18 };                       // 158
+    rZoomOut = Rect { 104, bottomTop - 3, 38, 22 };                  // 155
+    rZoomIn  = Rect { 144, bottomTop - 3, 38, 22 };
+    rZoomFit = Rect { 184, bottomTop - 3, 38, 22 };
+    rBack    = Rect { pw - pad - 80, bottomTop - 3, 80, 22 };        // 250（旧版 224）
+
+    // ---- 网格 / 小节号 / 偏移（+ 归零）----
+    rGridChk = Rect { 10, bottomTop + 24, 62, 20 };                  // 182
+    rNumChk  = Rect { 74, bottomTop + 24, 72, 20 };
+    const int zeroW = 56;
+    const int zeroX = pw - pad - zeroW;
+    rOffsetZero = Rect { zeroX, bottomTop + 24, zeroW, 20 };         // 274
+    rOffset = Rect { 150, bottomTop + 24, zeroX - 4 - 150, 18 };     // 150..270
+
+    rHint = Rect { 10, bottomTop + 46, pw - pad * 2, 18 };           // 204
+
+    // ---- 速度 / 拍号 ----
+    rBpmBox  = Rect { 46, bottomTop + 68, 44, 22 };                  // 226
+    rBpmUp   = Rect { 91, bottomTop + 68, 18, 11 };
+    rBpmDown = Rect { 91, bottomTop + 79, 18, 11 };                  // 237
+    rTimeSig = Rect { 150, bottomTop + 66, 70, 22 };                 // 224
+    rSrc     = Rect { 228, bottomTop + 68, pw - pad - 228, 18 };     // 228..330
+
+    // ---- 音量 ----
+    const int volLabelX = pw - pad - 52;
+    rVolLabel = Rect { volLabelX, bottomTop + 96, 52, 18 };          // 278（旧版 238）
+    rVolume   = Rect { 46, bottomTop + 94, volLabelX - 6 - 46, 24 }; // 46..272
+
+    // ---- 文件名 / 状态 / 支持格式 ----
+    rFile   = Rect { 10, bottomTop + 122, pw - pad * 2, 18 };        // 280
+    rStatus = Rect { 10, bottomTop + 142, 130, 18 };                 // 300
+    rFmt    = Rect { 140, bottomTop + 142, pw - pad - 140, 18 };     // 140..330
+
+    // ---- 页脚署名（贴面板底）----
+    rBrand = Rect { 10, ph - 26, pw - pad * 2, 18 };                 // 358
 }
 
 //------------------------------------------------------------------------------
@@ -621,6 +748,11 @@ void X11View::runLoop ()
                         // 此处已持有 X 锁，不能调 resize()（它会再加锁 → 死锁），就地处理
                         m_w = ev.xconfigure.width;
                         m_h = ev.xconfigure.height;
+                        if (m_w < kPanelWMin) m_w = kPanelWMin;
+                        if (m_h < kPanelHMin) m_h = kPanelHMin;
+                        if (m_w > kPanelWMax) m_w = kPanelWMax;
+                        if (m_h > kPanelHMax) m_h = kPanelHMax;
+                        layoutAll ();   // 控件矩形随窗口尺寸重算
                         if (m_pixmap)
                             ::XFreePixmap (m_dpy, m_pixmap);
                         m_pixmap = ::XCreatePixmap (m_dpy, m_win,
@@ -633,11 +765,16 @@ void X11View::runLoop ()
                     }
                     break;
                 case ButtonPress:
-                    // X11 的滚轮就是 Button4 / Button5
+                    // X11 的滚轮就是 Button4 / Button5；横向滚轮（触控板左右滑、
+                    // 部分鼠标的横滚轮）是 Button6 / Button7。
                     if (ev.xbutton.button == Button4)
                         onScroll (ev.xbutton.x, ev.xbutton.y,  1, ev.xbutton.state);
                     else if (ev.xbutton.button == Button5)
                         onScroll (ev.xbutton.x, ev.xbutton.y, -1, ev.xbutton.state);
+                    else if (ev.xbutton.button == Button6)
+                        onScroll (ev.xbutton.x, ev.xbutton.y, -1, ev.xbutton.state, true);
+                    else if (ev.xbutton.button == Button7)
+                        onScroll (ev.xbutton.x, ev.xbutton.y,  1, ev.xbutton.state, true);
                     else
                         onButtonPress (ev.xbutton.x, ev.xbutton.y, ev.xbutton.state);
                     break;
@@ -710,6 +847,32 @@ void X11View::runLoop ()
                 m_followFail = false;
             }
         }
+
+        // ---- 视野自动跟随：宿主播放时，波形视野自动滚到谱面播放头 ----
+        // ⭐ 先区分「播放头自己在走」和「宿主把它挪走了」：前者画面只许顺滑滚，
+        //    后者画面该跟过去。本循环约 30Hz，正常前进每帧只有几十毫秒；超过
+        //    kHostJumpSec 就是宿主跳变（点小节 / 循环回卷 / 拖播放头）。
+        //    本端过去完全没有这段 —— 用户实测「回到播放头后播放头直接跑到画面外」。
+        bool hostJumped = false;
+        if (m_tl.playheadValid)
+        {
+            if (m_hasPrevPlayhead &&
+                std::fabs (m_tl.playheadSec - m_prevPlayheadSec) > kHostJumpSec)
+                hostJumped = true;
+            m_prevPlayheadSec = m_tl.playheadSec;
+            m_hasPrevPlayhead = true;
+        }
+
+        // 用户停止手动操作超时后自动恢复跟随（播放 / 暂停都生效）。
+        recoverAutoFollow (t);
+
+        if (m_backend && m_tl.playheadValid && m_tl.playing)
+        {
+            const double audioT = m_tl.playheadSec + m_backend->offsetSec ();
+            if (followPlayheadTo (audioT, hostJumped))
+                m_dirty = true;      // 视野动了才重绘，不动就别白画
+        }
+
         if (m_backend && m_backend->hasAudio () && m_tl.playing)
         {
             if (t - lastPaint > 1.0 / 30.0)
@@ -1091,8 +1254,15 @@ void X11View::drawControls (XftDraw* xd)
     checkbox (xd, rNumChk,  "小节号", m_showNumbers, ID_NUM);
 
     drawText (xd, rOffset.x, rOffset.y + 14, m_offsetText.c_str (), xc (CText), m_fontSmall);
+
+    // 「归零」：把起始偏移一键清零。
+    // 为什么要它：改偏移的唯一入口是「Ctrl/Alt + 在波形上拖动」，一旦手滑拖到很大
+    // 的值（或只想回到初始状态），就只能反向拖回去 —— 可能要拖好几个屏。
+    // 用户实测明确提出「没有偏移归零的方式」，这里补上。三端同名同位置。
+    button (xd, rOffsetZero, "归零", ID_OFFSET_ZERO);
+
     drawText (xd, rHint.x, rHint.y + 14,
-              "拖动=平移视图 · Ctrl/Alt 拖动=改偏移 · 滚轮=平移/缩放 · 「全览」=整首",
+              "拖动=平移视图　Ctrl/Alt拖动=改偏移　滚轮=平移　Ctrl/Alt滚轮=缩放　「全览」=整首",
               xc (CTextDim), m_fontSmall);
 
     // BPM
@@ -1173,7 +1343,7 @@ void X11View::drawHelp (XftDraw* xd)
     //    【网格小节线有没有落在波形上的鼓点/第一拍】。
     static const char* kGuide[] = {
         "#1  装音频：点「打开音频」，或把音频文件直接拖进来。",
-        "     支持 MP3 / WAV / M4A / AAC / FLAC / OGG。",
+        "     支持 MP3 / WAV / FLAC / OGG（本端暂不能读 M4A / AAC）。",
         "     装好后在乐谱里按空格播放。",
         "",
         "#2  填速度：先填 BPM 和拍号（如 120、4/4）。",
@@ -1182,11 +1352,12 @@ void X11View::drawHelp (XftDraw* xd)
         "",
         "#3  对拍子：按住 Ctrl（或 Alt）在波形上左右拖网格，",
         "     把「1」那条小节线拖到音乐的第一拍上（对准波形里的",
-        "     鼓点）。按住 Shift 拖 = 微调。音频开头被跳过的",
-        "     那段会画成灰色，是正常的。",
+        "     鼓点）。按住 Shift 拖 = 微调。调坏了点右边的「归零」。",
+        "     音频开头被跳过的那段会画成灰色，是正常的。",
         "",
-        "#4  波形区其它操作：直接拖 = 平移视野；滚轮 = 平移；",
+        "#4  波形区：直接拖 = 平移视野；滚轮 = 平移；",
         "     Ctrl/Alt + 滚轮 = 缩放；整首全览点「全览」按钮。",
+        "     窗口边缘可以拖动 —— 拉宽它，波形区更大。",
         "",
         "#5  红线=音频播到哪，绿线=乐谱播到哪 —— 平时它俩就",
         "     黏在一起，分开或画面里找不到播放头了，点「回到",
@@ -1206,8 +1377,9 @@ void X11View::drawHelp (XftDraw* xd)
 
     fillRect (m_pixmap, Rect { 12, 26, m_w - 24, 1 }, px (CBtnEdge));
 
-    // 22 行 × 15px，从 y=32 起 → 末行底 ≈ 360，留 24px 余量（面板高 384）。
-    // ⚠️ 文案再加长就要同步这里，否则最后一行会被面板底边裁掉。
+    // 23 行 × 15px，从 y=32 起 → 末行文字顶 362、底 ≈377，仍在面板【最小】高 384 之内
+    //（面板可以拉更高，这里按最小高算才是紧的那一档）。
+    // ⚠️ 文案再加长就要同步这里（或改小 lh），否则最后一行会被面板底边裁掉。
     const int lh = 15;
     int y = 32;
     for (int i = 0; i < n; ++i)
@@ -1321,6 +1493,12 @@ void X11View::onButtonPress (int x, int y, unsigned state)
         m_dragOffset = ((state & ControlMask) != 0) || ((state & Mod1Mask) != 0);
         // 改偏移时记 offset，平移视野时记 viewStart —— 两者互斥，复用同一个字段。
         m_dragStartVal = m_dragOffset ? m_backend->offsetSec () : m_viewStart;
+
+        // 平移视野 = 用户在主动看别处 → 暂停自动跟随 2 秒（拖完自然恢复）。
+        // 改偏移【不算】：那只动网格锚点，播放头本身没被挪走。
+        if (!m_dragOffset)
+            markUserScrolling ();
+
         // 不再有「点击 / 拖动 = 定位播放头」：音频位置完全由宿主驱动，
         // 手动把它拽走只会和谱面播放头分家，还得再点一次「回到播放头」才能恢复。
         m_dirty = true;
@@ -1346,6 +1524,7 @@ void X11View::onButtonPress (int x, int y, unsigned state)
     else if (rZoomIn.hit (x, y))  id = ID_ZOOM_IN;
     else if (rZoomFit.hit (x, y)) id = ID_ZOOM_FIT;
     else if (rBack.hit (x, y))    id = ID_BACK;
+    else if (rOffsetZero.hit (x, y)) id = ID_OFFSET_ZERO;
     else if (rGridChk.hit (x, y)) id = ID_GRID;
     else if (rNumChk.hit (x, y))  id = ID_NUM;
     else if (rBpmUp.hit (x, y))   id = ID_BPM_UP;
@@ -1364,6 +1543,8 @@ void X11View::onButtonPress (int x, int y, unsigned state)
 void X11View::onButtonRelease (int x, int y, unsigned /*state*/)
 {
     (void) x; (void) y;
+    if (m_dragging)
+        m_lastUserScrollAt = nowSec ();   // 松手后再等 2 秒才恢复跟随
     m_dragging = false;
     m_dragVolume = false;
     m_pressedId = ID_NONE;
@@ -1390,6 +1571,7 @@ void X11View::onMotion (int x, int y, unsigned state)
             const double dxSec = (x - m_dragStartX) / static_cast<double> (kWaveW) * m_viewSpan;
             m_viewStart = m_dragStartVal - dxSec;
             clampView ();
+            markUserScrolling ();
         }
         m_dirty = true;
         return;
@@ -1424,6 +1606,7 @@ void X11View::onMotion (int x, int y, unsigned state)
     else if (rZoomIn.hit (x, y))  id = ID_ZOOM_IN;
     else if (rZoomFit.hit (x, y)) id = ID_ZOOM_FIT;
     else if (rBack.hit (x, y))    id = ID_BACK;
+    else if (rOffsetZero.hit (x, y)) id = ID_OFFSET_ZERO;
     else if (rGridChk.hit (x, y)) id = ID_GRID;
     else if (rNumChk.hit (x, y))  id = ID_NUM;
     else if (rBpmUp.hit (x, y))   id = ID_BPM_UP;
@@ -1437,7 +1620,7 @@ void X11View::onMotion (int x, int y, unsigned state)
     }
 }
 
-void X11View::onScroll (int x, int y, int dir, unsigned state)
+void X11View::onScroll (int x, int y, int dir, unsigned state, bool horizontal)
 {
     if (m_browserOpen)
     {
@@ -1463,9 +1646,18 @@ void X11View::onScroll (int x, int y, int dir, unsigned state)
     }
 
     if ((state & ControlMask) || (state & Mod1Mask))
+    {
         zoomBy (dir > 0 ? 0.8 : 1.25, m_backend->positionSec ());
+    }
     else
-        m_viewStart -= dir * m_viewSpan * 0.1;
+    {
+        // 滚轮平移 = 用户在主动看别处 → 暂停自动跟随 2 秒。
+        // 纵向滚轮（Button4/5）：向上 = 往更早看（与旧版一致）。
+        // 横向滚轮（Button6/7）：往更晚看 —— 与 Windows 端 WM_MOUSEHWHEEL 同向。
+        markUserScrolling ();
+        m_viewStart += horizontal ? dir * m_viewSpan * 0.1
+                                  : -dir * m_viewSpan * 0.1;
+    }
 
     clampView ();
     m_dirty = true;
@@ -1498,10 +1690,36 @@ void X11View::actionFor (int id)
                 m_backend->seekTo (target);
                 centerViewOn (target);      // 视野也回到播放位置
 
+                // 点这个按钮 = 「我要看播放头」，所以立刻恢复自动跟随 ——
+                // 否则刚滚过波形的人点了按钮还要再等 2 秒才跟，等于白点。
+                // （macOS / Windows 端同样处理，三端一致。）
+                m_userScrolling = false;
+                m_lastUserScrollAt = 0.0;
+
                 // 记下「刚刚手动对齐过」：若 3 秒内又发现错位，说明是跟随失效而非
                 // 一次性偏差 → 徽标升级提示 + 落一条日志。
                 m_lastBackAt = nowSec ();
                 m_followFail = false;
+            }
+            break;
+        case ID_OFFSET_ZERO:
+            // 「归零」：把起始偏移一键清零。
+            // 为什么要它：改偏移的唯一入口是「Ctrl/Alt + 在波形上拖动」，一旦手滑
+            // 拖到很大的值（或只想回到初始状态），就只能反向拖回去 —— 可能要拖好
+            // 几个屏。用户实测点名要。
+            if (m_backend)
+            {
+                m_backend->setOffsetSec (0.0f);
+
+                // 归零会让音频跳回「谱面位置 + 0」，播放头可能一下跑到画面外 ——
+                // 那种情况就把它带回画面（本来就在画面里则什么都不做，别抢用户
+                // 正在看的视野）。与 macOS 端 offsetZero: 的处理一致。
+                if (m_tl.playheadValid)
+                {
+                    const double tgt = m_tl.playheadSec;   // 偏移已归零 ⇒ 音频位置 = 谱面位置
+                    if (tgt < m_viewStart || tgt > m_viewStart + m_viewSpan)
+                        centerViewOn (tgt);
+                }
             }
             break;
         case ID_HELP:
@@ -1545,6 +1763,11 @@ void X11View::actionFor (int id)
 
 void X11View::zoomBy (double factor, double centerSec)
 {
+    // ⭐ 缩放也算「用户在看别处」：否则点「放大 / 缩小」按钮（它们不经过滚轮）
+    //    时播放头会被挤出画面，紧接着被自动跟随拽回去 → 画面抽搐。
+    //    放在这里就不漏任何缩放入口。
+    markUserScrolling ();
+
     const double oldSpan = m_viewSpan;
     m_viewSpan *= factor;
     if (m_viewSpan < 0.05)   m_viewSpan = 0.05;
@@ -1557,6 +1780,7 @@ void X11View::zoomFit ()
 {
     if (!m_backend)
         return;
+    markUserScrolling ();
     const double dur = m_backend->durationSec ();
     m_viewStart = 0.0;
     m_viewSpan = dur > 0.0 ? dur : 8.0;
@@ -1585,6 +1809,75 @@ void X11View::centerViewOn (double sec)
     clampView ();
 }
 
+//------------------------------------------------------------------------------
+// 视野自动跟随（与 macOS / Windows 端同一套规则 —— 改这里就要改那两端）
+//------------------------------------------------------------------------------
+void X11View::markUserScrolling ()
+{
+    m_userScrolling = true;
+    m_lastUserScrollAt = nowSec ();
+}
+
+// 用户停手 2 秒后自动恢复跟随。
+// ⚠️ 旧版（macOS 端曾踩过）一旦置 true 就永久停跟随，用户滚一下之后播放头就再也
+//    不跟了；这里必须有超时恢复。
+void X11View::recoverAutoFollow (double now)
+{
+    if (!m_userScrolling)
+        return;
+    if (m_dragging)             // 还在拖，别打断
+        return;
+    if ((now - m_lastUserScrollAt) >= kUserScrollHoldSec)
+        m_userScrolling = false;
+}
+
+// 让视野跟随播放头（audioSec = 播放头在【音频时间轴】上的位置）。
+//
+// 【反抽搐设计 · 定稿规则】画面**永远不会把播放头「拽」回来**，只有一条规则：
+//   · 用户正在手动操作（m_userScrolling）→ 完全不干预，播放头允许呆在画面之外。
+//     旧版曾加过「播放头完全跑出画面就强制拉回」，于是用户往左拖、画面被拽回右，
+//     来回拉锯 —— 视觉上就是抽搐。
+//   · 播放头远在画面之外（用户把视野拖到别处看）→ 什么都不做。想回来看播放头
+//     就点「回到播放头」—— 该按钮存在就是为了这件事，比偷偷自动跳转可预期。
+//   · 唯一例外 allowJump：**宿主自己**把播放头挪了（点小节 / 循环回卷 / 拖播放
+//     头）。这种跳变若不让画面跟过去，用户会「找不到播放头」，所以允许跟随。
+//     allowJump 由 runLoop 用「相邻两帧的谱面位置差」判定，见 kHostJumpSec。
+//
+// ⚠️ 本端过去**根本没有这个函数** —— 用户实测「回到播放头之后播放头直接就跑到
+//    画面外面去了」，根因就是 m_viewStart 只被用户操作和「回到播放头」改过。
+bool X11View::followPlayheadTo (double audioSec, bool allowJump)
+{
+    if (!m_followScroll)
+        return false;
+    if (m_dragging || m_helpVisible || m_browserOpen)
+        return false;
+    if (!(m_viewSpan > 0.0))
+        return false;
+
+    // ① 用户在看别处 → 不干预（宿主主动跳转时例外）
+    if (m_userScrolling && !allowJump)
+        return false;
+
+    const double before = m_viewStart;
+    const double v0 = m_viewStart;
+    const double v1 = v0 + m_viewSpan;
+    const double margin = m_viewSpan * 0.25;   // 播放头离边缘多远开始滚
+
+    // ② 远在画面之外、且不是宿主跳转 → 不追。这是「不抢用户视野」的关键一条。
+    //    容差取一个整屏：极端放大时播放头两帧之间就能移动大半屏，容差太小会漏跟。
+    if (!allowJump && (audioSec < v0 - m_viewSpan || audioSec > v1 + m_viewSpan))
+        return false;
+
+    // ③ 播放头落在画面左侧（循环回卷 / 向前跳转）→ 对到 25% 处，让它重新可见
+    if (audioSec < v0 || audioSec > v1 - margin)
+    {
+        m_viewStart = audioSec - margin;
+        clampView ();
+    }
+
+    return m_viewStart != before;
+}
+
 void X11View::syncTimeSigFromBackend ()
 {
     if (!m_backend)
@@ -1611,6 +1904,12 @@ void X11View::afterLoad ()
     if (m_viewSpan <= 0.0)
         m_viewSpan = 8.0;
     m_browserOpen = false;
+
+    // 换了文件 = 换了一条时间轴：上一首的播放头位置不能拿来判断「宿主跳变」，
+    // 否则新文件头一帧就会被误判成一次巨大的跳变。用户的手动滚动状态也一并清掉
+    // （新文件进来算是「重新开始看」）。与 macOS / Windows 端同一处理。
+    m_hasPrevPlayhead = false;
+    m_userScrolling = false;
     m_dirty = true;
 }
 
@@ -2013,8 +2312,18 @@ tresult PLUGIN_API PlugView::getSize (ViewRect* size)
         return Steinberg::kInvalidArgument;
     size->left = 0;
     size->top = 0;
-    size->right = kPanelW;
-    size->bottom = kPanelH;
+    // ⭐ 视图已经建好时【如实汇报当前尺寸】（与 Windows / macOS 端一致）。
+    if (m_view)
+    {
+        const X11View* v = static_cast<const X11View*> (m_view);
+        size->right  = v->panelW ();
+        size->bottom = v->panelH ();
+    }
+    else
+    {
+        size->right  = kPanelW;
+        size->bottom = kPanelH;
+    }
     return Steinberg::kResultOk;
 }
 
@@ -2034,21 +2343,30 @@ tresult PLUGIN_API PlugView::onFocus (Steinberg::TBool state)
 
 tresult PLUGIN_API PlugView::setFrame (IPlugFrame* frame)
 {
-    (void) frame;
+    m_frame = frame;
     return Steinberg::kResultOk;
 }
 
+// 允许宿主/用户把编辑器窗口拖大（旧版返回 false = 固定尺寸）。
+// 波形区随宽度自适应，面板窄到 340 也仍然排得下 —— 见 layoutAll()。
 tresult PLUGIN_API PlugView::canResize ()
 {
-    return Steinberg::kResultFalse;
+    return Steinberg::kResultTrue;
 }
 
 tresult PLUGIN_API PlugView::checkSizeConstraint (ViewRect* rect)
 {
     if (rect)
     {
-        rect->right = rect->left + kPanelW;
-        rect->bottom = rect->top + kPanelH;
+        // 与 create() / resize() 用同一套钳制范围，别两处各写一份。
+        int w = rect->right - rect->left;
+        int h = rect->bottom - rect->top;
+        if (w < kPanelWMin) w = kPanelWMin;
+        if (h < kPanelHMin) h = kPanelHMin;
+        if (w > kPanelWMax) w = kPanelWMax;
+        if (h > kPanelHMax) h = kPanelHMax;
+        rect->right  = rect->left + w;
+        rect->bottom = rect->top  + h;
     }
     return Steinberg::kResultOk;
 }

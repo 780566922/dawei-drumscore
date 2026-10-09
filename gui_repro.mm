@@ -372,13 +372,51 @@ int main (int argc, char** argv)
 
         // 偏移改由「波形上 ⌘/⌥拖动」操作，偏移滑块/微调按钮已删除。
         // 循环按钮已删除（「跟谱面走」模式下无实际作用）。
-        // 现在：1 个音量滑块，7 个按钮（打开/？帮助/－/＋/全览/回到播放头/播放），
-        // 1 个 BPM 步进器（恢复手动 BPM，拍号 N/M）。
+        // 需要存在的按钮：打开 / ？帮助 / 缩小 / 放大 / 全览 / 回到播放头 /
+        // 播放 / 归零（+ 网格、小节号两个勾选框），1 个 BPM 步进器，拍号 N/M。
         if (sliders < 1)   { std::printf ("[复现] ✗ 滑块缺失\n");   rc = 6; }
         if (buttons < 6)   { std::printf ("[复现] ✗ 按钮数量不足\n"); rc = 7; }
         if (fields < 5)    { std::printf ("[复现] ✗ 文本框缺失\n"); rc = 8; }
         if (popups < 1)    { std::printf ("[复现] ✗ 拍号下拉缺失\n"); rc = 9; }
         if (steppers < 1)  { std::printf ("[复现] ✗ BPM 步进缺失\n"); rc = 10; }
+
+        // ---- 「归零」按钮：起始偏移一键清零 ----
+        // 用户实测点名要的功能：改偏移只有「波形上 ⌘/⌥拖动」一个入口，手滑拖到
+        // 很大的值之后只能反向拖回去（可能要拖好几个屏）。这里真的点一下按钮，
+        // 检查后端里的偏移是否被清零（不是只验「控件存在」）。
+        {
+            NSButton* zeroBtn = nil;
+            for (NSView* sv in [guiView subviews])
+            {
+                if ([sv isKindOfClass:[NSButton class]] &&
+                    [[(NSButton*) sv title] isEqualToString:@"归零"])
+                {
+                    zeroBtn = (NSButton*) sv;
+                    break;
+                }
+            }
+
+            if (!zeroBtn)
+            {
+                std::printf ("[复现] ✗ 找不到「归零」按钮（偏移没法一键清零）\n");
+                rc = 32;
+            }
+            else
+            {
+                backend.setOffsetSec (12.5f);
+                [zeroBtn performClick:nil];
+                if (std::fabs (backend.offsetSec ()) > 1e-6f)
+                {
+                    std::printf ("[复现] ✗ 点了「归零」偏移仍为 %.3f\n",
+                                 (double) backend.offsetSec ());
+                    rc = 32;
+                }
+                else
+                {
+                    step ("「归零」按钮把起始偏移清零");
+                }
+            }
+        }
 
         // ---- 页脚宣传语：必须是「可点击链接」，且接到正确的主页地址 ----
         // ⚠️ 只验接线，绝不调用 mouseDown: —— 那会把浏览器真的拉起来。
