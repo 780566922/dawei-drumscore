@@ -732,9 +732,16 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     }
 
     // ---- 谱面播放头（宿主给位置时才有）----
-    // 这是「对齐」的核心可视化：绿线 = 谱面当前播到的位置（投影到音频时间轴），
-    // 红线 = 音频实际播到的位置。两条线重合 = 音频与谱面此刻对齐；
-    // 间距就是错位量，拖偏移（⌥拖动网格）可消除。
+    // 绿线 = 谱面当前播到的位置（投影到音频时间轴，含偏移），
+    // 红线 = 音频实际播到的位置。
+    //
+    // ⚠️ 这两条线【平时必然重合】，别拿它当「偏移调对了没」的判据：
+    //    绿线画在 (谱面位置 + 偏移)、音频也被插件驱动到 (谱面位置 + 偏移)，
+    //    两边同时随偏移平移 → 拖偏移时它们【各自都动，间距不动】。
+    //    所以「故意把偏移调错，两线还是黏在一起」是设计使然，不是 bug。
+    //    它们分开了 = 音频线程没跟上（丢块/跟随失效），是【故障指示】，
+    //    不是对齐指示 —— 点「回到播放头」修复。
+    //    判断偏移对不对，看【网格小节线有没有落在波形上的鼓点】。
     const ap::PlugView::Backend::HostTimeline tl = _st->backend->hostTimeline ();
     if (tl.playheadValid)
     {
@@ -1134,26 +1141,33 @@ namespace ap { void openBrandHome (); }
     NSRectFill (NSMakeRect (26, 32, NSWidth (r) - 52, 1));
 
     // 行首 "#" = 小标题（去掉井号后画）；其余为正文，统一缩进两格。
+    //
+    // ⚠️ 文案只讲「怎么点、怎么拖」，不讲原理 —— 目标用户是鼓手不是程序员。
+    // ⚠️ 绝不要写「红绿两线重合即对齐」：两条线【本来就是重合的】
+    //    （音频位置 = 谱面位置 + 偏移，永远如此），重合与否跟偏移调没调对
+    //    毫无关系 —— 它只在「跟随出故障」时才分开。判断是否调好偏移，
+    //    唯一的依据是【网格小节线有没有落在波形上的鼓点/第一拍】。
     NSArray<NSString*>* guide = @[
-        @"#1  载入：点「打开音频」，或把文件拖进窗口。",
+        @"#1  装音频：点「打开音频」，或把音频文件拖进窗口。",
         @"     支持 MP3 / WAV / M4A / AAC / FLAC / OGG",
         @"",
-        @"#2  对齐：绿线「谱面」=乐谱播到哪，",
-        @"     红线「音频」=音频播到哪。两线重合即对齐。",
-        @"     不重合就按住 ⌘/⌥ 在波形上左右拖动网格，",
-        @"     拖到两线贴合为止。偏移值见「偏移」一栏。",
+        @"#2  对拍子：按住 ⌘（或 ⌥）在波形上左右拖 ——",
+        @"     拖的就是这些网格线。把「1」那条小节线拖到",
+        @"     音乐的第一拍上（对准波形里的鼓点）就对好了。",
+        @"     音频开头被跳过的部分会画成灰色，是正常的。",
         @"",
-        @"#3  播放：在乐谱里按空格，插件自动跟着出声。",
-        @"     插件不能反向控制宿主，播放/暂停请用宿主。",
+        @"#3  播放：在乐谱里按空格，插件跟着出声。",
+        @"     暂停、停止也用宿主（插件管不了宿主）。",
         @"",
-        @"#4  视图：滚轮/拖动=平移　⌘/⌥+滚轮=缩放",
-        @"     双击波形=全览；视野会自动跟着播放头走。",
+        @"#4  看画面：滚轮=平移，⌘/⌥滚轮=缩放，双击=全览；",
+        @"     不按修饰键直接拖 = 只移画面（不会动偏移）。",
         @"",
-        @"#5  速度：默认自动跟随乐谱；乐谱没给速度时",
-        @"     手填 BPM 与拍号，网格小节线才对得上。",
+        @"#5  网格跟谱子的小节对不上？先填「速度」和「拍号」。",
+        @"     速度留空 = 自动跟着乐谱走。",
         @"",
-        @"#6  乱了：点「回到播放头」跳回播放位置并对齐。",
-        @"     若提示「跟随可能已失效」，请 ⌘Q 完全退出后重开。",
+        @"#6  两种线：红线=音频播到哪，绿线=乐谱播到哪。",
+        @"     平时它俩就黏在一起；分开了，或画面里找不到",
+        @"     播放头了，点「回到播放头」。还不行就 ⌘Q 重开。",
     ];
 
     CGFloat y = 42.0;
@@ -1275,7 +1289,7 @@ namespace ap { void openBrandHome (); }
         NSButton* backToPlayhead = [self button:@"回到播放头" action:@selector (backToPlayhead:)];
         backToPlayhead.frame = NSMakeRect (314, 157, 86, 20);
         backToPlayhead.font = [NSFont systemFontOfSize:11];
-        backToPlayhead.toolTip = @"把音频跳回谱面当前位置（+偏移）重新对齐，\n"
+        backToPlayhead.toolTip = @"把音频跳回谱面当前位置（+偏移）重新同步，\n"
                                   @"并把波形视野带回播放位置";
 
         _st->gridCheck = [NSButton checkboxWithTitle:@"网格" target:self action:@selector (gridToggled:)];
@@ -1538,21 +1552,22 @@ namespace ap { void openBrandHome (); }
 - (double)bpmFieldValue { return _st->bpmField.stringValue.doubleValue; }
 - (NSString*)beatsSelection { return _st->beatsPopup.titleOfSelectedItem; }
 
-// 波形上 ⌘/⌥拖动网格 → 回写偏移显示，并实时提示对齐信息
+// 波形上 ⌘/⌥拖动网格 → 回写偏移显示，并实时提示偏移结果
 - (void)offsetChangedExternally:(double)sec
 {
     [self syncOffsetUI:sec];
 
-    // 实时对齐提示：谱面播放头（若有）现在正对音频的哪一秒。
-    // 拖动网格（改偏移）时，这条信息随之变化，让用户一眼看到
-    // 「谱面当前这一小节」被对齐到了音频的哪个位置。
+    // 拖动网格（改偏移）时在状态栏实时显示结果，让用户一眼看到
+    // 「谱面当前这一小节」被放到了音频的哪个位置，以及偏移数字是多少。
+    // ⚠️ 这里【不要】说「对齐」：红绿两线本来就重合，跟偏移对不对无关（见
+    //    drawRect 里那段说明）。状态栏只报「偏移数值 + 当前映射」。
     const ap::PlugView::Backend::HostTimeline tl = _st->backend->hostTimeline ();
     if (tl.playheadValid)
     {
         const double audioT = tl.playheadSec + sec;
         _st->statusLabel.stringValue =
-            [NSString stringWithFormat:@"对齐：谱面播放头(%.2f秒) → 音频 %.2f 秒  偏移 %+.2f",
-                                       tl.playheadSec, audioT, sec];
+            [NSString stringWithFormat:@"偏移 %+.2f 秒（谱面位置 %.2f 秒 = 音频 %.2f 秒）",
+                                       sec, tl.playheadSec, audioT];
         [_st->statusLabel setTextColor:[NSColor colorWithCalibratedRed:0.55
                                                              green:0.85
                                                               blue:0.55
@@ -1561,7 +1576,7 @@ namespace ap { void openBrandHome (); }
     else
     {
         _st->statusLabel.stringValue =
-            [NSString stringWithFormat:@"偏移 %+.2f 秒（宿主未提供谱面位置，无法显示对齐）", sec];
+            [NSString stringWithFormat:@"偏移 %+.2f 秒（宿主未提供谱面位置，无法显示对应音频位置）", sec];
         [_st->statusLabel setTextColor:[NSColor colorWithCalibratedWhite:0.6 alpha:1.0]];
     }
 }
