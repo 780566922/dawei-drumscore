@@ -330,3 +330,11 @@ VST 是 Steinberg Media Technologies GmbH 的商标。本项目与 Steinberg、M
 - [Steinberg VST 3 SDK](https://github.com/steinbergmedia/vst3sdk)
 - [dr_libs](https://github.com/mackron/dr_libs)（Linux 版解码库，公共领域 / MIT-0）
 - 献给所有边看谱边练鼓的朋友 🥁
+
+---
+
+## 支持这个项目
+
+这个插件免费、开源、无广告，所有功能都不收费。如果它帮到了你，欢迎请作者喝杯饮料 ☕ 纯属自愿。
+
+<img src=".github/assets/donate.png" alt="捐赠二维码：左侧支付宝，右侧微信支付" width="600">

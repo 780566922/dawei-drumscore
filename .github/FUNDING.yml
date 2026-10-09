@@ -1,0 +1,12 @@
+# 仓库顶部的「Sponsor」按钮指向哪里。
+#
+# 说明：GitHub Sponsors 目前不支持中国大陆开发者收款（官方支持地区里有
+# 中国香港 / 中国澳门，没有中国大陆），所以这里不用 github: 键，
+# 改用 custom: 指向捐赠入口。
+#
+# 目前只有微信 / 支付宝收款码（图片，放在 README 的「支持这个项目」一节），
+# 所以这里指向 README 里那一节。
+#
+# 以后若开通了带网址的捐赠渠道（爱发电 / Ko-fi / PayPal / Buy Me a Coffee 等），
+# 把网址加到下面即可 —— custom 最多 4 条。
+custom: ["https://github.com/780566922/dawei-drumscore#支持这个项目"]
