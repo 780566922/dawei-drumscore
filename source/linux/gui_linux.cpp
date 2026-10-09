@@ -767,13 +767,15 @@ void X11View::runLoop ()
                 case ButtonPress:
                     // X11 的滚轮就是 Button4 / Button5；横向滚轮（触控板左右滑、
                     // 部分鼠标的横滚轮）是 Button6 / Button7。
+                    // ⚠️ `X.h` 只定义 `Button1`~`Button5`（没有 Button6/Button7 这两个宏，
+                    //    写了会直接编译失败）→ 横向的只能用字面量 6 / 7。
                     if (ev.xbutton.button == Button4)
                         onScroll (ev.xbutton.x, ev.xbutton.y,  1, ev.xbutton.state);
                     else if (ev.xbutton.button == Button5)
                         onScroll (ev.xbutton.x, ev.xbutton.y, -1, ev.xbutton.state);
-                    else if (ev.xbutton.button == Button6)
+                    else if (ev.xbutton.button == 6)
                         onScroll (ev.xbutton.x, ev.xbutton.y, -1, ev.xbutton.state, true);
-                    else if (ev.xbutton.button == Button7)
+                    else if (ev.xbutton.button == 7)
                         onScroll (ev.xbutton.x, ev.xbutton.y,  1, ev.xbutton.state, true);
                     else
                         onButtonPress (ev.xbutton.x, ev.xbutton.y, ev.xbutton.state);
