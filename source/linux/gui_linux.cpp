@@ -1384,7 +1384,7 @@ void X11View::drawHelp (XftDraw* xd)
     //    【网格小节线有没有落在波形上的鼓点/第一拍】。
     static const char* kGuide[] = {
         "#1  装音频：点「打开音频」，或把音频文件直接拖进来。",
-        "     支持 MP3 / WAV / FLAC / OGG（本端暂不能读 M4A / AAC）。",
+        "     支持 MP3 / WAV / FLAC / OGG。",
         "     装好后在乐谱里按空格播放。",
         "",
         "#2  填速度：先填 BPM 和拍号（如 120、4/4）。",
@@ -1394,7 +1394,7 @@ void X11View::drawHelp (XftDraw* xd)
         "#3  对拍子：按住 Ctrl（或 Alt）在波形上左右拖网格，",
         "     把「1」那条小节线拖到音乐的第一拍上（对准波形里的",
         "     鼓点）。按住 Shift 拖 = 微调。调坏了点右边的「归零」。",
-        "     音频开头被跳过的那段会画成灰色，是正常的。",
+        "     音频开头被跳过的那段会画成灰色。",
         "",
         "#4  波形区：直接拖 = 平移视野；滚轮 = 平移；",
         "     Ctrl/Alt + 滚轮 = 缩放；整首全览点「全览」按钮。",
@@ -1413,7 +1413,7 @@ void X11View::drawHelp (XftDraw* xd)
     fillRect (m_pixmap, Rect { 0, 0, m_w, m_h }, px (CWhite));
 
     drawText (xd, 12, 8 + m_font->ascent, "使用指南", xc (CCheckOn), m_font);
-    drawText (xd, 62, 10 + m_fontSmall->ascent, "（点一下关闭；滚轮不关）",
+    drawText (xd, 62, 10 + m_fontSmall->ascent, "（点一下关闭）",
               xc (CTextDim), m_fontSmall);
 
     fillRect (m_pixmap, Rect { 12, 26, m_w - 24, 1 }, px (CBtnEdge));

@@ -1187,7 +1187,7 @@ namespace ap { void openBrandHome (); }
                                   [NSColor colorWithCalibratedWhite:0.52 alpha:1.0] };
 
     [@"使用指南" drawAtPoint:NSMakePoint (26, 10) withAttributes:hAttrs];
-    [@"（点一下关闭；滚轮不关）" drawAtPoint:NSMakePoint (100, 14) withAttributes:dAttrs];
+    [@"（点一下关闭）" drawAtPoint:NSMakePoint (100, 14) withAttributes:dAttrs];
 
     [[NSColor colorWithCalibratedWhite:0.30 alpha:1.0] setFill];
     NSRectFill (NSMakeRect (26, 32, NSWidth (r) - 52, 1));
@@ -1206,14 +1206,14 @@ namespace ap { void openBrandHome (); }
     NSArray<NSString*>* guide = @[
         @"#1  装音频：点「打开音频」，或把音频文件直接拖进窗口。",
         @"     支持 MP3 / WAV / M4A / AAC / FLAC / OGG。装好后在乐谱里",
-        @"     按空格播放（播放、暂停都只能用宿主）。",
+        @"     按空格播放。",
         @"",
         @"#2  填速度：先填 BPM 和拍号（如 120、4/4），网格小节线才会",
         @"     跟谱子的小节对上。留空 = 自动：跟着乐谱走，乐谱没给就 120。",
         @"",
         @"#3  对拍子：按住 ⌘（或 ⌥）在波形上左右拖网格，把「1」那条",
         @"     小节线拖到音乐的第一拍上（对准波形里的鼓点）。⇧ 拖 = 微调，",
-        @"     调坏了点右边的「归零」。开头被跳过的那段画成灰色，是正常的。",
+        @"     调坏了点右边的「归零」。开头被跳过的那段画成灰色。",
         @"",
         @"#4  波形区其它操作：直接拖 = 平移视野",
         @"     滚轮 / 双指左右滑 = 平移；⌘/⌥+滚轮 或 双指捏合 = 缩放；",
@@ -1349,7 +1349,7 @@ namespace ap { void openBrandHome (); }
         NSButton* backToPlayhead = [self button:@"回到播放头" action:@selector (backToPlayhead:)];
         backToPlayhead.frame = NSMakeRect (314, 157, 86, 20);
         backToPlayhead.font = [NSFont systemFontOfSize:11];
-        backToPlayhead.toolTip = @"把音频跳回谱面当前位置（+偏移）重新同步，\n"
+        backToPlayhead.toolTip = @"把音频跳回谱面当前位置，\n"
                                   @"并把波形视野带回播放位置";
 
         _st->gridCheck = [NSButton checkboxWithTitle:@"网格" target:self action:@selector (gridToggled:)];
@@ -1396,7 +1396,7 @@ namespace ap { void openBrandHome (); }
         _st->bpmField.frame = NSMakeRect (50, 211, 56, 20);
         _st->bpmField.delegate = self;   // 失焦自动提交，避免焦点卡在输入框里吞掉空格
         _st->bpmField.toolTip = @"每分钟几拍（谱面速度）。填对了网格小节线才能对齐谱面真实小节；\n"
-                                 @"留空 = 自动（优先跟随宿主，宿主没给就用 120）";
+                                 @"留空 = 自动（默认 120）";
 
         _st->bpmStepper = [[NSStepper alloc] initWithFrame:NSMakeRect (108, 211, 18, 20)];
         _st->bpmStepper.minValue = 20;
@@ -1446,7 +1446,7 @@ namespace ap { void openBrandHome (); }
         _st->playBtn = [self button:@"▶  播放" action:nil];
         _st->playBtn.frame = NSMakeRect (14, 314, 110, 26);
         _st->playBtn.enabled = NO;   // 禁用点击，仅作指示灯
-        _st->playBtn.toolTip = @"插件无法反向控制宿主播放，此按钮仅显示宿主播放状态；\n请直接在宿主里播放/暂停";
+        _st->playBtn.toolTip = @"只显示乐谱当前是否在播放；\n播放 / 暂停请在乐谱里操作";
 
         // ---- 拖放提示 ----
         // 文案收紧成不带空格的形式：加上 OGG 后原串会顶到 196px 的框外。
@@ -1664,7 +1664,7 @@ namespace ap { void openBrandHome (); }
     else
     {
         _st->statusLabel.stringValue =
-            [NSString stringWithFormat:@"偏移 %+.2f 秒（宿主未提供谱面位置，无法显示对应音频位置）", sec];
+            [NSString stringWithFormat:@"偏移 %+.2f 秒", sec];
         [_st->statusLabel setTextColor:[NSColor colorWithCalibratedWhite:0.6 alpha:1.0]];
     }
 }

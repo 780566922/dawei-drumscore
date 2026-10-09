@@ -1261,7 +1261,7 @@ void WinView::paintHelp (HDC dc)
         L"#3  对拍子：按住 Ctrl（或 Alt）在波形上左右拖网格，",
         L"     把「1」那条小节线拖到音乐的第一拍上（对准波形里的",
         L"     鼓点）。按住 Shift 拖 = 微调。调坏了点右边的「归零」。",
-        L"     音频开头被跳过的那段会画成灰色，是正常的。",
+        L"     音频开头被跳过的那段会画成灰色。",
         L"",
         L"#4  波形区：直接拖 = 平移视野；滚轮 = 平移；",
         L"     Ctrl/Alt + 滚轮 = 缩放；双击 = 整首全览。",
@@ -1292,7 +1292,7 @@ void WinView::paintHelp (HDC dc)
 
     ::SelectObject (dc, m_fontSmall);
     ::SetTextColor (dc, RGB (133, 133, 133));
-    ::TextOutW (dc, px (62), px (10), L"（点一下关闭；滚轮不关）", 12);
+    ::TextOutW (dc, px (62), px (10), L"（点一下关闭）", 7);
 
     RECT sep = { px (12), px (26), client.right - px (12), px (27) };
     HBRUSH sp = ::CreateSolidBrush (RGB (77, 77, 77));

@@ -19,7 +19,7 @@
 #endif
 
 #define MyAppName      "大伟鼓谱 MuseScore 音频播放器"
-#define MyAppVersion   "1.2.3"
+#define MyAppVersion   "1.2.4"
 #define MyAppPublisher "大伟鼓谱"
 #define MyVst3Folder   "DaweiDrumScore.vst3"
 ; 作者 B 站主页。⭐ 与插件里页脚宣传语的跳转地址必须一致 ——
