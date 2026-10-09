@@ -77,6 +77,11 @@ static const double kFollowFailLogGapSec = 5.0;   ///< 日志冷却，避免抖�
 // 拖播放头 / 播放到结尾后回卷）。只有这种跳变才允许视野跟着跳。
 static const double kHostJumpSec = 0.25;
 
+/// 新载入音频的默认视野（秒）。不默认「整曲全览」：全览时波峰糊成一片，看不清
+/// 鼓点，用户每次都得先手动放大好多下。8 秒 ≈ 4 小节 @120BPM 4/4，一打开就能
+/// 看清对齐状况。曲长不足 8 秒时 zoomToSpan: 会回落到全览。三端同名同值。
+static const double kDefaultViewSpanSec = 8.0;
+
 //---- 音频丢块探针的日志冷却（秒）---------------------------------------------
 // 「音频线程抢不到锁 → 整块丢音频 → 播放位置永久落后宿主」是完全隐形的故障。
 // 这里把它变成一条日志（同一故障 5 秒内只记一次，避免刷屏）。
@@ -296,6 +301,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (BOOL)followFailActive;            ///< 是否处于「点了按钮仍错位」状态（只读，自测用）
 - (void)stopDrag;
 - (double)viewStartSec;        ///< 当前视野起点（秒），只读 —— 自测与状态展示用
+- (double)viewLenSec;          ///< 当前视野跨度（秒），只读 —— 自测用（默认视野断言）
 @end
 
 @implementation WaveformView
@@ -318,6 +324,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)setPanel:(void*)panel { _st->panel = panel; }
 
 - (double)viewStartSec { return _st->viewStart; }
+- (double)viewLenSec { return _st->viewLen; }
 - (void)setShowGrid:(BOOL)b { _st->showGrid = b ? true : false; [self setNeedsDisplay:YES]; }
 - (void)setShowNumbers:(BOOL)b { _st->showNumbers = b ? true : false; [self setNeedsDisplay:YES]; }
 
@@ -1133,6 +1140,12 @@ namespace ap { void openBrandHome (); }
 - (void)mouseDown:(NSEvent*)e       { (void) e; self.hidden = YES; }
 - (void)rightMouseDown:(NSEvent*)e  { (void) e; self.hidden = YES; }
 
+// 滚轮【只吞掉、不关闭】：指南就是固定的一屏文字，用户却习惯往下滚一滚看看
+// 还有没有（Windows 端实测反馈过「怕下面还有东西，一滚帮助就没了」）。
+// 不实现这条消息时，事件会沿 responder chain 上抛，可能顺带把下面的波形视野
+// 也滚走 —— 用户关掉指南才发现画面不在原处。这里一次解决这两件事。
+- (void)scrollWheel:(NSEvent*)e     { (void) e; }
+
 - (void)drawRect:(NSRect)dirty
 {
     (void) dirty;
@@ -1152,7 +1165,7 @@ namespace ap { void openBrandHome (); }
                                   [NSColor colorWithCalibratedWhite:0.52 alpha:1.0] };
 
     [@"使用指南" drawAtPoint:NSMakePoint (26, 10) withAttributes:hAttrs];
-    [@"（点任意处关闭）" drawAtPoint:NSMakePoint (100, 14) withAttributes:dAttrs];
+    [@"（点一下关闭；滚轮不关）" drawAtPoint:NSMakePoint (100, 14) withAttributes:dAttrs];
 
     [[NSColor colorWithCalibratedWhite:0.30 alpha:1.0] setFill];
     NSRectFill (NSMakeRect (26, 32, NSWidth (r) - 52, 1));
@@ -1184,9 +1197,9 @@ namespace ap { void openBrandHome (); }
         @"     滚轮 / 双指左右滑 = 平移；⌘/⌥+滚轮 或 双指捏合 = 缩放；",
         @"     双击 = 整首全览。",
         @"",
-        @"#5  红线=音频播到哪，绿线=乐谱播到哪 —— 平时它俩就黏在一起，",
-        @"     分开、或画面里找不到播放头了，点「回到播放头」。",
-        @"     还不行就 ⌘Q 完全退出 MuseScore 再打开。",
+        @"#5  在乐谱里点任意小节，画面会跟着跳过去（扒谱很方便）。",
+        @"     红线=音频播到哪，绿线=乐谱播到哪 —— 平时它俩就黏在一起；",
+        @"     分开或找不到播放头就点「回到播放头」，还不行 ⌘Q 重开。",
         @"",
         @"完全免费，只为方便大家制谱、练鼓。顺手的话点一下界面底部的",
         @"「大伟鼓谱」，到 B 站关注一下 —— 那就是最大的支持。",
@@ -1841,9 +1854,9 @@ namespace ap { void openBrandHome (); }
         }
 
         // 新文件默认放大到「前几小节」，从偏移处开始看，而不是整曲全览。
-        // 全览时波峰糊成一片，用户每次都得手动放大；直接给 8 秒视野
-        // （约 4 小节 @120BPM 4/4），一眼看清对齐状况。
-        [_st->wave zoomToSpan:8.0 fromStart:off];
+        // 全览时波峰糊成一片，用户每次都得手动放大；直接给 kDefaultViewSpanSec
+        // 秒视野（约 4 小节 @120BPM 4/4），一眼看清对齐状况。
+        [_st->wave zoomToSpan:kDefaultViewSpanSec fromStart:off];
         [self syncOffsetUI:off];
         [self updateTempoSourceLabel];
     }
@@ -2007,7 +2020,11 @@ static NSString* fmtTime (double sec)
     // 用户停止手动操作超时后自动恢复跟随（播放/暂停都生效）。
     [_st->wave recoverAutoFollow];
 
-    if (tl.playheadValid && tl.playing)
+    // ⭐ 宿主自己跳的（点小节 / 循环回卷 / 拖播放头）就算停在【暂停】状态也要把
+    //    画面带过去 —— 扒谱就是在暂停下一个小节一个小节地点的。以前这里写死了
+    //    tl.playing，于是暂停时换位置画面纹丝不动，「空白乐谱直接定位到音乐」
+    //    这件事根本做不到。自然播放推进（allowJump=NO）时仍然只许顺滑滚。
+    if (tl.playheadValid && (tl.playing || hostJumped))
     {
         const double audioT = tl.playheadSec + _st->backend->offsetSec ();
         [_st->wave followPlayheadTo:audioT allowJump:(hostJumped ? YES : NO)];

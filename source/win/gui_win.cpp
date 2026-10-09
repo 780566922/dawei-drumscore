@@ -96,6 +96,13 @@ const DWORD kFollowFailLogGapMs  = 5000;
 const double kHostJumpSec       = 0.25;
 const DWORD  kUserScrollHoldMs  = 2000;
 
+//---- 新载入音频的默认视野 ----------------------------------------------------
+// 不默认「整曲全览」：全览时波峰糊成一片，根本看不清鼓点，用户每次都得先手动
+// 放大好几下（实测要按 11~12 次）。默认直接给 8 秒视野（≈4 小节 @120BPM 4/4），
+// 一打开就能看清对齐状况。曲长不足 8 秒时仍回落到全览（见 afterLoad）。
+// 三端同名同值（macOS 端在载入处用的就是这个值）。
+const double kDefaultViewSpanSec = 8.0;
+
 //---- 重绘节流 ----------------------------------------------------------------
 // 拖动/滚轮时每收到一条鼠标消息就整块重绘，在虚拟机（软件 GDI + 抢占式调度）上
 // 会把音频线程饿到出 crackle/变调。这里把「鼠标驱动的重绘」限到 ~28fps，
@@ -1245,9 +1252,9 @@ void WinView::paintHelp (HDC dc)
         L"     Ctrl/Alt + 滚轮 = 缩放；双击 = 整首全览。",
         L"     窗口边缘可以拖动 —— 拉宽它，波形区更大。",
         L"",
-        L"#5  红线=音频播到哪，绿线=乐谱播到哪 —— 平时它俩就",
-        L"     黏在一起，分开或画面里找不到播放头了，点「回到",
-        L"     播放头」。还不行就完全退出宿主，再打开。",
+        L"#5  在乐谱里点任意小节，画面会跟着跳过去（扒谱方便）。",
+        L"     红线=音频播到哪，绿线=乐谱播到哪，平时黏在一起；分开",
+        L"     了或找不到播放头，点「回到播放头」；还不行就退出宿主重开。",
         L"",
         L"完全免费，只为方便大家制谱、练鼓。顺手的话点一下",
         L"界面底部的「大伟鼓谱」，到 B 站关注一下就是支持。",
@@ -1270,7 +1277,7 @@ void WinView::paintHelp (HDC dc)
 
     ::SelectObject (dc, m_fontSmall);
     ::SetTextColor (dc, RGB (133, 133, 133));
-    ::TextOutW (dc, px (62), px (10), L"（点任意处关闭）", 8);
+    ::TextOutW (dc, px (62), px (10), L"（点一下关闭；滚轮不关）", 12);
 
     RECT sep = { px (12), px (26), client.right - px (12), px (27) };
     HBRUSH sp = ::CreateSolidBrush (RGB (77, 77, 77));
@@ -1604,7 +1611,11 @@ void WinView::onTimer ()
 
     recoverAutoFollow ();
 
-    if (tl.playheadValid && tl.playing)
+    // ⭐ 宿主自己跳的（点小节 / 循环回卷 / 拖播放头）就算停在【暂停】状态也要把
+    //    画面带过去 —— 扒谱就是在暂停下一个小节一个小节点的。以前这里写死了
+    //    `tl.playing`，于是暂停时换位置画面纹丝不动，「空白乐谱直接定位到音乐」
+    //    这件事根本做不到。自然播放推进（allowJump=false）时仍然只许顺滑滚。
+    if (tl.playheadValid && (tl.playing || hostJumped))
         followPlayheadTo (tl.playheadSec + offNow, hostJumped);
 
     refreshLabels ();
@@ -1676,10 +1687,22 @@ void WinView::afterLoad ()
 {
     if (!m_backend || !m_backend->hasAudio ())
         return;
-    m_viewStart = 0.0;
-    m_viewSpan = m_backend->durationSec ();
-    if (m_viewSpan <= 0.0)
-        m_viewSpan = 8.0;
+
+    // 新文件默认放大到「前几小节」，从起始偏移处开始看，而不是整曲全览
+    // （全览时波峰糊成一片，看不清鼓点）。与 macOS 端的 `zoomToSpan:` 同一套。
+    const double dur = m_backend->durationSec ();
+    if (dur > 0.0 && dur <= kDefaultViewSpanSec)
+    {
+        m_viewStart = 0.0;                  // 本来就短，直接全览
+        m_viewSpan  = dur;
+    }
+    else
+    {
+        m_viewSpan  = kDefaultViewSpanSec;
+        m_viewStart = m_backend->offsetSec ();
+        clampView ();
+    }
+
     // 换了音频 = 换了时间轴：上一首的谱面位置不能拿来判「宿主跳变」。
     m_hasPrevPlayhead = false;
     m_userScrolling = false;
@@ -2110,11 +2133,11 @@ LRESULT CALLBACK mainProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             //   「滚轮不左右移动波形」。
             //   对策：在主窗口这一层按【光标位置】命中测试，落在波形区就自己处理。
             //   （没接住的那些会经 DefWindowProc 继续上抛给宿主，不抢它的滚轮。）
+            // ⚠️ 指南可见时滚轮【只吞掉、不关闭】：指南是固定的一屏文字，但用户
+            //    习惯性会往下滚一滚看看还有没有，一滚就关 = 用户报的「刚进去就没了」。
+            //    关闭只认鼠标按下（见下面 WM_LBUTTONDOWN 那组）。
             if (help)
-            {
-                if (v) v->hideHelp ();
                 return 0;
-            }
             if (v)
             {
                 const int sx = GET_X_LPARAM (lp);   // 滚轮的 lParam 是屏幕坐标

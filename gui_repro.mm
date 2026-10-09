@@ -116,11 +116,12 @@ public:
         t.beatsPerBar = 4;
         t.playheadValid = fakeTimeline;
         t.playheadSec = fakePlayheadSec;
-        t.playing = true;
+        t.playing = fakePlaying;
         return t;
     }
 
     bool fakeTimeline = false;
+    bool fakePlaying = true;        ///< 假宿主的播放/暂停（用来测「暂停时换小节」）
     double fakePlayheadSec = 3.5;   ///< 假宿主播放头位置（秒）
     int  seekCalls = 0;   ///< seekTo 被调用次数 —— 回归防线：拖动波形不该 seek
 
@@ -299,6 +300,37 @@ int main (int argc, char** argv)
             [guiView loadPath:path];
         }
         step ("loadPath: 正常返回");
+
+        // ---- ⭐ 新载入音频的默认视野：8 秒，而不是整曲全览 ----
+        // 用户实测：「默认把波形放大到按 12 次还是 11 次的大小」。
+        // 全览时波峰糊成一片，每次都要先手动放大好多下 —— 所以载入后直接给一个
+        // 能看清鼓点的视野（8 秒 ≈ 4 小节 @120BPM 4/4）。
+        // ⚠️ 期望值这里【独立写死 8.0】，故意不引用源码里的常量：测试要有自己的
+        //    判据，否则常量被改错了两边一起错，断言等于没写。
+        {
+            NSView* wv = findWaveView (guiView);
+            SEL selLen = NSSelectorFromString (@"viewLenSec");
+            const double dur = backend.durationSec ();
+            const double len = (wv && [wv respondsToSelector:selLen])
+                             ? ((double (*) (id, SEL)) objc_msgSend) (wv, selLen) : 0.0;
+
+            std::printf ("  · 载入后：曲长 %.2f 秒，默认视野 %.2f 秒（期望 8 秒）\n", dur, len);
+
+            if (dur <= 8.001)
+            {
+                std::printf ("  · （测试音频只有 %.2f 秒 ≤ 默认视野，按全览处理；跳过断言）\n", dur);
+            }
+            else if (len <= 0.0 || len > 8.05)
+            {
+                std::printf ("[复现] ✗ 载入后默认视野 %.3f 秒，期望 8 秒"
+                             "（全览的话波峰看不清，得手动放大）\n", len);
+                rc = 34;
+            }
+            else
+            {
+                step ("载入后默认视野放大到 8 秒（不是整曲全览）");
+            }
+        }
     }
     else if (std::strcmp (mode, "drag") == 0)
     {
@@ -827,6 +859,36 @@ int main (int argc, char** argv)
             {
                 std::printf ("[复现] ✗ 宿主主动跳转播放头后，画面没有跟过去\n");
                 rc = 30;
+            }
+
+            // ---- ⭐ 宿主【暂停】时换小节：画面同样要跟过去 ----
+            // 用户实测原话：「在宿主内换小节、换播放位置的时候，波形位置直接跳转到
+            // 对应的位置。这样乐谱是空白的，也可以直接定位到音乐的位置，扒谱方便。」
+            // 旧版跟随被 tl.playing 门控 —— 暂停时点小节画面纹丝不动，而扒谱恰恰
+            // 就是暂停着一个小节一个小节点的。这里把宿主设成暂停，再跳一次。
+            if (backend.durationSec () >= 7.0)
+            {
+                backend.fakePlaying = false;        // 宿主已暂停
+                backend.fakePlayheadSec = 7.0;      // 再挪一段（距 6.5 差 0.5 > kHostJumpSec）
+                const double beforePaused = ((double (*) (id, SEL)) objc_msgSend) (wave, selStart);
+                for (int i = 0; i < 2; ++i)
+                    [guiView tick];
+                const double afterPaused = ((double (*) (id, SEL)) objc_msgSend) (wave, selStart);
+
+                std::printf ("  · 暂停中宿主把播放头挪到 7.0 秒：视野 %.3f → %.3f 秒\n",
+                             beforePaused, afterPaused);
+
+                if (std::fabs (afterPaused - beforePaused) < 0.05)
+                {
+                    std::printf ("[复现] ✗ 暂停时宿主换位置，画面没有跟过去"
+                                 "（暂停下点小节定位不到音乐）\n");
+                    rc = 33;
+                }
+                else
+                {
+                    step ("暂停状态下宿主换位置，画面跟了过去");
+                }
+                backend.fakePlaying = true;         // 复原，别影响后面的用例
             }
         }
 

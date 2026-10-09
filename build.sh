@@ -143,8 +143,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key>                        <string>大伟鼓谱MuseScore音频播放器</string>
     <key>CFBundlePackageType</key>                 <string>BNDL</string>
     <key>CFBundleSignature</key>                   <string>????</string>
-    <key>CFBundleShortVersionString</key>          <string>1.2.1</string>
-    <key>CFBundleVersion</key>                     <string>1.2.1</string>
+    <key>CFBundleShortVersionString</key>          <string>1.2.2</string>
+    <key>CFBundleVersion</key>                     <string>1.2.2</string>
     <key>NSHumanReadableCopyright</key>            <string>Free for personal use</string>
 </dict>
 </plist>
@@ -235,7 +235,10 @@ fi
 echo "==> 验证 2：真实音频输出"
 TEST_AUDIO="/tmp/aplay_test.mp3"
 if command -v ffmpeg >/dev/null 2>&1; then
-  ffmpeg -v error -f lavfi -i "sine=frequency=440:duration=8" -ac 2 -ar 44100 \
+  # ⚠️ 时长必须【长于】源码里的默认视野（kDefaultViewSpanSec = 8 秒），否则
+  #    gui_repro 里「载入后默认视野 = 8 秒」那条断言会退化成「本来就短，全览」，
+  #    永远测不到真实行为（原来恰好是 8 秒，正卡在边界上 → 每次都被跳过）。
+  ffmpeg -v error -f lavfi -i "sine=frequency=440:duration=20" -ac 2 -ar 44100 \
           -c:a libmp3lame -b:a 192k "$TEST_AUDIO" -y 2>/dev/null
 else
   # 没有 ffmpeg 就用系统自带的 afconvert 生成 WAV

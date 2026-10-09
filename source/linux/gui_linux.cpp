@@ -162,6 +162,12 @@ const double kFollowFailLogGapSec = 5.0;
 const double kHostJumpSec      = 0.25;
 const double kUserScrollHoldSec = 2.0;
 
+//---- 新载入音频的默认视野 ----------------------------------------------------
+// 不默认「整曲全览」：全览时波峰糊成一片，看不清鼓点，用户每次都得先手动放大
+// 好多下。默认直接给 8 秒视野（≈4 小节 @120BPM 4/4），一打开就能看清对齐状况。
+// 曲长不足 8 秒时回落到全览（见 afterLoad）。三端同名同值。
+const double kDefaultViewSpanSec = 8.0;
+
 // 拍号选项（与 macOS / Windows 端一致）
 struct TimeSig { const char* label; int beats; int denom; };
 const TimeSig kTimeSigs[] = {
@@ -868,7 +874,11 @@ void X11View::runLoop ()
         // 用户停止手动操作超时后自动恢复跟随（播放 / 暂停都生效）。
         recoverAutoFollow (t);
 
-        if (m_backend && m_tl.playheadValid && m_tl.playing)
+        // ⭐ 宿主自己跳的（点小节 / 循环回卷 / 拖播放头）就算停在【暂停】状态也要
+        //    把画面带过去 —— 扒谱就是在暂停下一个小节一个小节点的。以前这里写死了
+        //    `m_tl.playing`，于是暂停时换位置画面纹丝不动。自然播放推进
+        //    （allowJump=false）时仍然只许顺滑滚，绝不抢用户的视野。
+        if (m_backend && m_tl.playheadValid && (m_tl.playing || hostJumped))
         {
             const double audioT = m_tl.playheadSec + m_backend->offsetSec ();
             if (followPlayheadTo (audioT, hostJumped))
@@ -1361,9 +1371,9 @@ void X11View::drawHelp (XftDraw* xd)
         "     Ctrl/Alt + 滚轮 = 缩放；整首全览点「全览」按钮。",
         "     窗口边缘可以拖动 —— 拉宽它，波形区更大。",
         "",
-        "#5  红线=音频播到哪，绿线=乐谱播到哪 —— 平时它俩就",
-        "     黏在一起，分开或画面里找不到播放头了，点「回到",
-        "     播放头」。还不行就完全退出宿主，再打开。",
+        "#5  在乐谱里点任意小节，画面会跟着跳过去（扒谱方便）。",
+        "     红线=音频播到哪，绿线=乐谱播到哪，平时黏在一起；分开",
+        "     了或找不到播放头，点「回到播放头」；还不行就退出宿主重开。",
         "",
         "完全免费，只为方便大家制谱、练鼓。顺手的话点一下",
         "界面底部的「大伟鼓谱」，到 B 站关注一下就是支持。",
@@ -1374,7 +1384,7 @@ void X11View::drawHelp (XftDraw* xd)
     fillRect (m_pixmap, Rect { 0, 0, m_w, m_h }, px (CWhite));
 
     drawText (xd, 12, 8 + m_font->ascent, "使用指南", xc (CCheckOn), m_font);
-    drawText (xd, 62, 10 + m_fontSmall->ascent, "（点任意处关闭）",
+    drawText (xd, 62, 10 + m_fontSmall->ascent, "（点一下关闭；滚轮不关）",
               xc (CTextDim), m_fontSmall);
 
     fillRect (m_pixmap, Rect { 12, 26, m_w - 24, 1 }, px (CBtnEdge));
@@ -1624,6 +1634,14 @@ void X11View::onMotion (int x, int y, unsigned state)
 
 void X11View::onScroll (int x, int y, int dir, unsigned state, bool horizontal)
 {
+    // 使用指南铺满整块面板：滚轮在这里【什么都不做】，也【绝不能】把它关掉 ——
+    // 指南是固定的一屏文字，用户却习惯往下滚一滚看看还有没有，一滚就关 =
+    // 用户报的「刚进去就没了」。原来这里没有判断，滚轮会偷偷把视野滚走，
+    // 等用户点一下关掉指南，波形已经不在原来的位置了。
+    // 关闭只认鼠标点击（见 onButtonPress）。
+    if (m_helpVisible)
+        return;
+
     if (m_browserOpen)
     {
         browserScroll (dir);
@@ -1901,10 +1919,21 @@ void X11View::afterLoad ()
 {
     if (!m_backend || !m_backend->hasAudio ())
         return;
-    m_viewStart = 0.0;
-    m_viewSpan = m_backend->durationSec ();
-    if (m_viewSpan <= 0.0)
-        m_viewSpan = 8.0;
+
+    // 新文件默认放大到「前几小节」，从起始偏移处开始看，而不是整曲全览
+    // （全览时波峰糊成一片，看不清鼓点）。与 macOS / Windows 端同一套。
+    const double dur = m_backend->durationSec ();
+    if (dur > 0.0 && dur <= kDefaultViewSpanSec)
+    {
+        m_viewStart = 0.0;                  // 本来就短，直接全览
+        m_viewSpan  = dur;
+    }
+    else
+    {
+        m_viewSpan  = kDefaultViewSpanSec;
+        m_viewStart = m_backend->offsetSec ();
+        clampView ();
+    }
     m_browserOpen = false;
 
     // 换了文件 = 换了一条时间轴：上一首的播放头位置不能拿来判断「宿主跳变」，
