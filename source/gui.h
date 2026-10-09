@@ -117,6 +117,17 @@ public:
         };
         virtual HostTimeline hostTimeline () const = 0;
 
+        //---- 视野状态（关掉编辑器再打开必须恢复）--------------------------------
+        // 编辑器视图的寿命比处理器短：宿主关界面只销毁 PlugView，重开时视图是
+        // 【新建】的，里面所有控件与状态都是初值。而「用户放大到多细、正看着哪
+        // 一段」和 BPM 一样是用户的操作结果，必须存在后端里 —— 不存的话重开界面
+        // 就回到默认视野（用户实测：「把插件界面关掉再打开，波形变成整曲全览」）。
+        //
+        // spanSec <= 0 表示「还没设置过」（或换了音频文件）→ 视图自己回落到
+        // 新载入的默认视野（见各端 kDefaultViewSpanSec）。
+        virtual void setViewState (double startSec, double spanSec) = 0;
+        virtual void getViewState (double& startSec, double& spanSec) const = 0;
+
         //---- 实时健康探针（可选实现，默认 0）------------------------------------
         // 「音频线程因抢不到播放器的锁而整块丢弃音频」的累计次数。
         //

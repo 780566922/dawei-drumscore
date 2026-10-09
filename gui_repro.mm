@@ -125,6 +125,21 @@ public:
     double fakePlayheadSec = 3.5;   ///< 假宿主播放头位置（秒）
     int  seekCalls = 0;   ///< seekTo 被调用次数 —— 回归防线：拖动波形不该 seek
 
+    // 视野状态：真实后端存在处理器里（关掉编辑器再打开要恢复，见 gui.h）。
+    // 这里同样存成员，才能复现「同一个后端上再挂一个编辑器视图」的场景。
+    void setViewState (double startSec, double spanSec) override
+    {
+        viewStartSaved = startSec;
+        viewSpanSaved = spanSec;
+    }
+    void getViewState (double& startSec, double& spanSec) const override
+    {
+        startSec = viewStartSaved;
+        spanSec = viewSpanSaved;
+    }
+    double viewStartSaved = 0.0;   ///< 后端里存的视野（测试直接读，便于打印诊断）
+    double viewSpanSaved  = 0.0;
+
 private:
     mutable ap::Player m_player;
     std::string m_path;
@@ -731,18 +746,38 @@ int main (int argc, char** argv)
             }
         }
 
-        // ---- ⭐ 编辑器关掉再打开：手填的 BPM / 拍号必须还在 ----
+        // ---- ⭐ 编辑器关掉再打开：手填的 BPM / 拍号 / 视野都必须还在 ----
         // 用户实测：「把插件界面关掉之后再打开，之前手动输入的 BPM 就没了，回到 120」。
         // 根因：后端（Processor）比编辑器视图长寿 —— 关掉界面只销毁 PlugView
         //       （日志里「编辑器 removed」之后紧跟新的「PlugView 构造」，后端指针不变），
         //       但新视图的控件都是新建的、没有从后端回读 → 显示默认 120；而 BPM
         //       输入框一失焦就会自动提交，于是把 120 写回后端 = 手填值真的丢了。
         // 复刻方式：同一个后端再挂一个编辑器（等价于 MuseScore 重新打开界面）。
+        //
+        // ⭐ 视野同理（用户第二次实测的反馈）：「关掉界面再打开，波形就变成全曲
+        //    全览了，而不是之前放大的那一段」。所以「关界面前的视野」也必须能被
+        //    新视图读回来 —— 这里一并断言。
         @autoreleasepool
         {
             backend.setGridBPM (96.0f);             // = 用户在界面上填 96
             backend.setGridBeatsPerBar (12);
             backend.setGridBeatDenominator (8);     // 顺手选个非默认拍号，一并验
+
+            // 关掉宿主演进轴：tick 里的自动跟随会在「宿主播放中」把视野挪到播放头，
+            // 那样测的就不是「用户手动摆的视野」了。我们要一个确定值。
+            backend.fakeTimeline = false;
+
+            ((void (*) (id, SEL, double, double)) objc_msgSend)
+                (wave, NSSelectorFromString (@"zoomToSpan:fromStart:"), 2.0, 5.0);
+            [guiView tick];     // 让 tick 把这份视野回存到后端（真实运行时的路径）
+
+            const double saveStart = ((double (*) (id, SEL)) objc_msgSend)
+                (wave, NSSelectorFromString (@"viewStartSec"));
+            const double saveLen = ((double (*) (id, SEL)) objc_msgSend)
+                (wave, NSSelectorFromString (@"viewLenSec"));
+            std::printf ("  · 关界面前视野 起点 %.3f / 跨度 %.3f 秒；"
+                         "后端里存着 %.3f / %.3f 秒\n",
+                         saveStart, saveLen, backend.viewStartSaved, backend.viewSpanSaved);
 
             NSWindow* w2 = [[NSWindow alloc] initWithContentRect:NSMakeRect (0, 0, 620, 460)
                                                        styleMask:NSWindowStyleMaskBorderless
@@ -776,6 +811,43 @@ int main (int argc, char** argv)
                 {
                     std::printf ("[复现] ✗ 重开编辑器后拍号没有从后端回读\n");
                     rc = 28;
+                }
+
+                // ---- ⭐ 视野：重开编辑器必须回到关之前的同一段（含放大倍数）----
+                // 期望值独立写死（2.0 / 5.0），故意不引用源码里的常量。
+                // ⚠️ 别把这条写成「太短就跳过」了事：build.sh 的测试音频是 20 秒，
+                //    必然走断言分支；若日志里出现「跳过」，说明测试音频被改短了。
+                NSView* wave2 = findWaveView (panel2);
+                SEL selLen2   = NSSelectorFromString (@"viewLenSec");
+                SEL selStart2 = NSSelectorFromString (@"viewStartSec");
+                const double durNow = backend.durationSec ();
+                if (!wave2)
+                {
+                    std::printf ("[复现] ✗ 第二个编辑器里找不到波形视图\n");
+                    rc = 35;
+                }
+                else if (durNow < 7.0)
+                {
+                    std::printf ("  · （测试音频只有 %.2f 秒，太短，跳过「视野恢复」断言）\n",
+                                 durNow);
+                }
+                else
+                {
+                    const double len2 = ((double (*) (id, SEL)) objc_msgSend) (wave2, selLen2);
+                    const double st2  = ((double (*) (id, SEL)) objc_msgSend) (wave2, selStart2);
+                    std::printf ("  · 重开编辑器后视野 起点 %.3f / 跨度 %.3f 秒"
+                                 "（期望 5.000 / 2.000）\n", st2, len2);
+
+                    if (std::fabs (len2 - 2.0) > 0.05 || std::fabs (st2 - 5.0) > 0.05)
+                    {
+                        std::printf ("[复现] ✗ 重开编辑器后视野没恢复（退回默认全览/默认跨度）"
+                                     "—— 用户会看到「波形变成全曲全览」\n");
+                        rc = 35;
+                    }
+                    else
+                    {
+                        step ("重开编辑器后视野恢复到关之前的同一段（放大倍数也一致）");
+                    }
                 }
 
                 if ([panel2 respondsToSelector:NSSelectorFromString (@"stopTimer")])

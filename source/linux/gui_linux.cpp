@@ -258,6 +258,10 @@ public:
         //    不回读就会出现「网格按 12/8 画、按钮上却写着 4/4」，而且点一下会从
         //    错误的项开始循环。BPM 不需要回读 —— 显示值是每次绘制时算的。
         syncTimeSigFromBackend ();
+
+        // ⭐ 视野也要回读：关掉编辑器再打开时后端里还存着「上次放大到多少、
+        //    正看着哪一段」，不回读就退回默认视野（用户实测反馈的就是这个）。
+        restoreViewState ();
     }
     ~X11View () { destroy (); }
 
@@ -321,6 +325,10 @@ private:
     void toggleHelp ();
     void clampView ();
     void afterLoad ();
+    /// ⭐ 视图重建后把后端里存的视野读回来（见实现处的说明）
+    void restoreViewState ();
+    /// 新载入音频的默认视野（afterLoad 与 restoreViewState 共用，避免两份规则漂移）
+    void applyDefaultView ();
     /// 从后端回读拍号并选中对应项（见构造处的说明）
     void syncTimeSigFromBackend ();
     void refreshCache ();
@@ -361,6 +369,13 @@ private:
 
     double m_viewStart = 0.0;   ///< 视野起点（秒）
     double m_viewSpan  = 8.0;   ///< 视野跨度（秒）
+
+    //---- 视野状态回存（关掉编辑器再打开要恢复到同一段视野）----
+    // 视图每次打开都是新建的，视野得存在后端（Processor）里；runLoop 里发现视野
+    // 变了就写回。改动入口很多（滚轮/拖动/缩放/全览/回到播放头/自动跟随），集中
+    // 在一处比对才不会漏（见 MEMORY 铁律 9）。-1 = 还没写过。
+    double m_pushedViewStart = -1.0;
+    double m_pushedViewSpan  = -1.0;
 
     //---- 视野自动跟随（规则与 macOS / Windows 端一致）----
     bool   m_followScroll = true;     ///< 总开关（现阶段恒为 true）
@@ -883,6 +898,20 @@ void X11View::runLoop ()
             const double audioT = m_tl.playheadSec + m_backend->offsetSec ();
             if (followPlayheadTo (audioT, hostJumped))
                 m_dirty = true;      // 视野动了才重绘，不动就别白画
+        }
+
+        // ---- 视野状态回存：关掉编辑器再打开要回到同一段视野 ----
+        // ⭐ 集中在这里比对是刻意的：视野的改动入口很多（滚轮 / 拖动 / 缩放 /
+        //    全览 / 回到播放头 / 自动跟随），逐个入口去写必然漏一个（见铁律 9）。
+        // ⚠️ 必须在 XUnlockDisplay 之后调用 —— setViewState 会拿后端的小锁，
+        //    不要在持有 X 显示锁时再去拿别的锁（本端对锁序历来敏感）。
+        if (m_backend && m_backend->hasAudio () && m_viewSpan > 0.0
+            && (std::fabs (m_viewStart - m_pushedViewStart) > 1e-6
+             || std::fabs (m_viewSpan - m_pushedViewSpan) > 1e-6))
+        {
+            m_pushedViewStart = m_viewStart;
+            m_pushedViewSpan  = m_viewSpan;
+            m_backend->setViewState (m_viewStart, m_viewSpan);
         }
 
         if (m_backend && m_backend->hasAudio () && m_tl.playing)
@@ -1915,13 +1944,12 @@ void X11View::syncTimeSigFromBackend ()
     // 后端里的组合不在列表里（理论上不会）：保持默认项，不猜。
 }
 
-void X11View::afterLoad ()
+// 新载入音频的默认视野：放大到「前几小节」，从起始偏移处开始看，而不是整曲全览
+// （全览时波峰糊成一片，看不清鼓点）。与 macOS / Windows 端同一套。
+// ⚠️ 这段规则被 afterLoad（用户换文件）和 restoreViewState（后端里没存过视野）
+//    两处共用，所以单独成函数 —— 写两份必然漂移。
+void X11View::applyDefaultView ()
 {
-    if (!m_backend || !m_backend->hasAudio ())
-        return;
-
-    // 新文件默认放大到「前几小节」，从起始偏移处开始看，而不是整曲全览
-    // （全览时波峰糊成一片，看不清鼓点）。与 macOS / Windows 端同一套。
     const double dur = m_backend->durationSec ();
     if (dur > 0.0 && dur <= kDefaultViewSpanSec)
     {
@@ -1934,6 +1962,42 @@ void X11View::afterLoad ()
         m_viewStart = m_backend->offsetSec ();
         clampView ();
     }
+}
+
+// ⭐ 视图重建后把后端里存的视野读回来。
+// 用户实测：「把插件界面关掉再打开，波形变成全曲全览了，而不是之前放大的那一段」。
+// 根因：关掉编辑器只销毁视图，后端（Processor）还活着 —— 视野是用户的操作结果，
+// 跟 BPM 一样必须存在后端里，重建视图时回读。
+void X11View::restoreViewState ()
+{
+    if (!m_backend || !m_backend->hasAudio ())
+        return;
+
+    double vs = 0.0, span = 0.0;
+    m_backend->getViewState (vs, span);
+    if (span > 0.0)
+    {
+        m_viewSpan  = span;
+        m_viewStart = vs;
+        clampView ();
+    }
+    else
+    {
+        applyDefaultView ();   // 后端里没存过（或刚换过音频）→ 默认视野
+    }
+
+    // 记成「已回存」，免得 runLoop 第一帧把同一份值再写一遍。
+    m_pushedViewStart = m_viewStart;
+    m_pushedViewSpan  = m_viewSpan;
+    m_dirty = true;
+}
+
+void X11View::afterLoad ()
+{
+    if (!m_backend || !m_backend->hasAudio ())
+        return;
+
+    applyDefaultView ();
     m_browserOpen = false;
 
     // 换了文件 = 换了一条时间轴：上一首的播放头位置不能拿来判断「宿主跳变」，

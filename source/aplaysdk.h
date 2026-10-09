@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <limits>
+#include <mutex>
 #include <string>
 
 // 历史上这些源码直接使用裸 uint32（原先由 macOS 的 Cocoa 头间接提供）。
@@ -103,6 +104,11 @@ public:
     int gridBeatDenominator () const override;
     ap::PlugView::Backend::HostTimeline hostTimeline () const override;
 
+    // 视野状态（见 gui.h 的说明）：编辑器视图每次打开都是新建的，所以
+    // 「正看着哪一段 / 放大到多少」必须存在处理器里，重开界面才回得去。
+    void setViewState (double startSec, double spanSec) override;
+    void getViewState (double& startSec, double& spanSec) const override;
+
     /// 实时健康探针：音频线程因抢不到锁而整块丢弃音频的累计次数（见 gui.h）。
     uint64_t lockDropCount () const override;
 
@@ -131,6 +137,14 @@ private:
     float m_gridBPM = 0.0f;
     int   m_gridBeats = 4;
     int   m_gridBeatDenominator = 4;   ///< 拍号分母 M（2/4/8/16）
+
+    //---- 视野状态（关掉编辑器再打开要恢复，见 gui.h）----
+    // 单独一把小锁：它只被界面线程读写，与音频线程毫无交集 ——
+    // 绝不是「音频线程要抢的锁」（对比铁律 12：持 m_mutex 扫采样会让 render() 丢块）。
+    // span <= 0 = 还没设置过（或刚换了音频文件）→ 视图回落到默认视野。
+    mutable std::mutex m_viewMutex;
+    double m_viewStart = 0.0;
+    double m_viewSpan  = 0.0;
 
     // 宿主时间轴缓存（音频线程写、界面线程读，所以用原子量）。
     // playheadSec 用 NaN 表示「宿主没给位置」。

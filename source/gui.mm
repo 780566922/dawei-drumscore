@@ -177,6 +177,12 @@ struct PanelState
     uint64_t lockDropSeen = 0;       ///< 上次记录的丢块计数（用于判断有没有增长）
     double   lockDropLoggedAt = -1.0e9;  ///< 上次为此写日志的时刻（冷却）
 
+    //---- 视野状态回存（关掉编辑器再打开要恢复到同一段视野）----
+    // 视图每次打开都是新建的，视野得存在后端里；tick 里发现视野变了就写回。
+    // -1 = 「还没写过」（视野起点可以是 0，所以不能用 0 当哨兵）。
+    double pushedViewStart = -1.0;
+    double pushedViewLen   = -1.0;
+
     // 注：跳转跟随（宿主拖播放头 → 音频 seek）已下沉到音频线程，
     // 不再需要 GUI 侧保存播放头历史。
 };
@@ -269,6 +275,22 @@ public:
     void setGridBeatDenominator (int) override {}
     int gridBeatDenominator () const override { return 4; }
     ap::PlugView::Backend::HostTimeline hostTimeline () const override { return {}; }
+
+    // 视野状态：空后端就存着自己（等于「没设置过」），视图会走默认视野。
+    void setViewState (double startSec, double spanSec) override
+    {
+        m_viewStart = startSec;
+        m_viewSpan = spanSec;
+    }
+    void getViewState (double& startSec, double& spanSec) const override
+    {
+        startSec = m_viewStart;
+        spanSec = m_viewSpan;
+    }
+
+private:
+    double m_viewStart = 0.0;
+    double m_viewSpan = 0.0;
 };
 
 // 保证界面拿到的 backend 永不为 null
@@ -1595,6 +1617,23 @@ namespace ap { void openBrandHome (); }
     const float vol = b->volume ();
     _st->volSlider.doubleValue = vol;
     _st->volLabel.stringValue = [NSString stringWithFormat:@"%d %%", (int) (vol * 100)];
+
+    // ⭐ 视野：视图是新建的，不回读就回到「全曲全览」——用户实测原话：「把插件
+    //    界面关掉再打开，波形就变成全蓝了（整曲全览），而不是之前放大的那一段」。
+    //    后端存着就用它（连放大倍数一起恢复）；没存过（或刚换了音频）就按
+    //    「新载入」的默认视野来，跟 loadPath: 里那条规则完全一致。
+    if (b->hasAudio ())
+    {
+        double vs = 0.0, vlen = 0.0;
+        b->getViewState (vs, vlen);
+        if (vlen > 0.0)
+            [_st->wave zoomToSpan:vlen fromStart:vs];
+        else
+            [_st->wave zoomToSpan:kDefaultViewSpanSec fromStart:b->offsetSec ()];
+        // 记成「已回存」，免得 tick 第一帧把同一份值再写一遍（无害但没必要）。
+        _st->pushedViewStart = [_st->wave viewStartSec];
+        _st->pushedViewLen   = [_st->wave viewLenSec];
+    }
 }
 
 //---- 只读访问器（自测用，见 gui_repro.mm）------------------------------------
@@ -2034,6 +2073,28 @@ static NSString* fmtTime (double sec)
     {
         _st->timeLabel.stringValue = @"0:00 / 0:00";
         return;
+    }
+
+    // ---- 视野状态回存：关掉编辑器再打开要回到同一段视野 ----
+    // ⭐ 放在 tick 里是刻意的：视野的改动入口很多（滚轮 / 拖动 / 缩放 / 全览 /
+    //    回到播放头 / 自动跟随），逐个入口去写必然漏一个（见 MEMORY 铁律 9）。
+    //    这里统一「发现变了就写回」，一个入口都不会漏。
+    // ⚠️ viewLen == 0 表示全览，此时有效跨度是整曲长度 —— 必须换算成真实秒数
+    //    再存，否则重开时后端拿到 span=0，会被当成「没设置过」。
+    {
+        double vs = [_st->wave viewStartSec];
+        double vl = [_st->wave viewLenSec];
+        const double dur = _st->backend->durationSec ();
+        if (!(vl > 0.0) && dur > 0.0)
+            vl = dur;
+        if (vl > 0.0
+            && (std::fabs (vs - _st->pushedViewStart) > 1e-6
+             || std::fabs (vl - _st->pushedViewLen) > 1e-6))
+        {
+            _st->pushedViewStart = vs;
+            _st->pushedViewLen   = vl;
+            _st->backend->setViewState (vs, vl);
+        }
     }
 
     _st->timeLabel.stringValue = [NSString stringWithFormat:@"%@ / %@",

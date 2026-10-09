@@ -28,7 +28,7 @@ using namespace Steinberg::Vst;
 static constexpr uint32 kAPlayDistributable = 1 << 0;
 
 // 插件版本字符串（FULL_VERSION_STR 是 CMake 生成的，这里手写）
-#define APLAY_VERSION_WSTR STR16 ("1.2.2")
+#define APLAY_VERSION_WSTR STR16 ("1.2.3")
 
 namespace aplay {
 
@@ -212,6 +212,20 @@ public:
     {
         APlayProcessor* p = currentProcessor ();
         return p ? p->hostTimeline () : ap::PlugView::Backend::HostTimeline {};
+    }
+
+    /// 视野状态转发：视图每次打开都会来读一次（恢复上次看到的区间）。
+    void setViewState (double startSec, double spanSec) override
+    {
+        if (APlayProcessor* p = currentProcessor ()) p->setViewState (startSec, spanSec);
+    }
+    void getViewState (double& startSec, double& spanSec) const override
+    {
+        APlayProcessor* p = currentProcessor ();
+        if (p) { p->getViewState (startSec, spanSec); return; }
+        // 没有处理器 = 没有音频 → 「没设置过」，让视图走自己的默认视野。
+        startSec = 0.0;
+        spanSec = 0.0;
     }
 };
 
@@ -649,6 +663,12 @@ bool APlayProcessor::loadFile (const std::string& path)
 {
     ap::crashLog ("载入请求: %s", path.c_str ());
     m_filePath = path;
+
+    // 换了音频 = 换了一条时间轴：上一首的视野（放大了多少、看着哪一段）不能留着，
+    // 否则重开编辑器会把用户带到「新歌的某个奇怪的片段」。清零 = 「没设置过」，
+    // 视图会自行回落到新载入的默认视野（见各端 kDefaultViewSpanSec）。
+    setViewState (0.0, 0.0);
+
     loadCurrentFile ();
 
     if (m_loadedOk)
@@ -664,6 +684,7 @@ void APlayProcessor::unloadFile ()
     m_filePath.clear ();
     m_player.clearAudio ();   // 不能传空 AudioData 给 setAudio —— 会被校验拒掉
     m_loadedOk = false;
+    setViewState (0.0, 0.0);  // 没音频了，旧视野也不该留到下一首
 }
 
 bool APlayProcessor::hasAudio () const { return m_player.hasAudio (); }
@@ -764,6 +785,25 @@ ap::PlugView::Backend::HostTimeline APlayProcessor::hostTimeline () const
     t.playheadSec = t.playheadValid ? ph : 0.0;
     t.playing = m_hostPlaying.load (std::memory_order_relaxed);
     return t;
+}
+
+//---- 视野状态（关掉编辑器再打开要恢复，见 gui.h）------------------------------
+// 编辑器视图每次打开都是新建的（宿主关界面只销毁 PlugView），视野也就跟着没了。
+// 所以「看到哪儿 / 放大到多少」和 BPM 一样存在这里 —— 界面线程在构造视图时读回，
+// 在 20Hz 定时器里把变化写回。用一把独立的小锁：它与音频线程毫无交集，
+// 不会影响 render() 的 try_lock（对比铁律 12：持锁扫采样会让音频整块丢帧）。
+void APlayProcessor::setViewState (double startSec, double spanSec)
+{
+    std::lock_guard<std::mutex> lk (m_viewMutex);
+    m_viewStart = startSec;
+    m_viewSpan = spanSec;
+}
+
+void APlayProcessor::getViewState (double& startSec, double& spanSec) const
+{
+    std::lock_guard<std::mutex> lk (m_viewMutex);
+    startSec = m_viewStart;
+    spanSec = m_viewSpan;
 }
 
 void APlayProcessor::setOffsetSec (float sec) { m_player.setStartOffsetSec (sec); }
@@ -928,7 +968,7 @@ public:
         strncpy (ci.subCategories, "Instrument", Steinberg::PClassInfo2::kSubCategoriesSize - 1);
         // 厂商名：纯 ASCII。它是插件名上面那一级菜单的分组名，中文会乱码。
         strncpy (ci.vendor, "Dawei DrumScore", Steinberg::PClassInfo2::kVendorSize - 1);
-        strncpy (ci.version, "1.2.2", Steinberg::PClassInfo2::kVersionSize - 1);
+        strncpy (ci.version, "1.2.3", Steinberg::PClassInfo2::kVersionSize - 1);
         strncpy (ci.sdkVersion, kVstVersionString, Steinberg::PClassInfo2::kVersionSize - 1);
         registerClass (&ci, aplay::APlayProcessor::createInstance);
 

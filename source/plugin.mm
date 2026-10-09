@@ -569,7 +569,7 @@ public:
         strncpy8 (info->name, "大伟鼓谱MuseScore音频播放器", PClassInfo::kNameSize - 1);
         // classFlags / subCategories 保持 0（无特殊子分类）
         strncpy8 (info->vendor, m_factoryInfo.vendor, PClassInfo2::kVendorSize - 1);
-        strncpy8 (info->version, "1.2.2", PClassInfo2::kVersionSize - 1);
+        strncpy8 (info->version, "1.2.3", PClassInfo2::kVersionSize - 1);
         return kResultOk;
     }
 
