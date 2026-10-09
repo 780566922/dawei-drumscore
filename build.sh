@@ -143,8 +143,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key>                        <string>大伟鼓谱MuseScore音频播放器</string>
     <key>CFBundlePackageType</key>                 <string>BNDL</string>
     <key>CFBundleSignature</key>                   <string>????</string>
-    <key>CFBundleShortVersionString</key>          <string>1.1.0</string>
-    <key>CFBundleVersion</key>                     <string>1.1.0</string>
+    <key>CFBundleShortVersionString</key>          <string>1.2.0</string>
+    <key>CFBundleVersion</key>                     <string>1.2.0</string>
     <key>NSHumanReadableCopyright</key>            <string>Free for personal use</string>
 </dict>
 </plist>
