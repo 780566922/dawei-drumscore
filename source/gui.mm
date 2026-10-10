@@ -1,7 +1,7 @@
 //==============================================================================
 // gui.mm — 中文界面的 AppKit 实现
 //
-// 界面布局（默认 640 x 384，y 轴向下；宽度可被用户拖大，高度固定）：
+// 界面布局（默认 640 x 384，y 轴向下；宽度可变，高度固定）：
 //   ┌────────────────────────────────────────────┐
 //   │  大伟鼓谱 · MuseScore 音频播放器        [打开音频…] │
 //   │  ┌──────────────────────────────────────┐  │
@@ -16,7 +16,8 @@
 //   ├────────────────────────────────────────────┤
 //   │  ♪ B 站「大伟鼓谱」· 欢迎关注…（页脚署名）   │
 //   └────────────────────────────────────────────┘
-// 窗口拉宽后：波形区、分隔线、状态文字、页脚跟着变宽，右上角按钮与右侧读数贴右边界。
+// 面板变宽时（宿主要多宽就给多宽）：波形区、分隔线、状态文字、页脚跟着变宽，
+// 右上角按钮与右侧读数贴右边界。
 // 各控件靠 autoresizingMask 自动重排，没有「按尺寸重算坐标」的布局函数（见
 // GUIView initWithBackend: 里的三档规则）。
 //
@@ -91,14 +92,17 @@ static const double kDefaultViewSpanSec = 8.0;
 static const double kLockDropLogGapSec = 5.0;
 
 //---- 面板尺寸 ----------------------------------------------------------------
-// 宽度可以被用户拖大：宿主在 canResize() 返回 kResultTrue 时会把编辑器窗口做成
-// 可缩放，拖动过程中回调 checkSizeConstraint() 钳制、随后 onSize() 通知新尺寸。
+// ⚠️ 面板宽度【由宿主决定】：宿主拿 getSize() 去定窗口，而且定下之后可能再也改不了 ——
+//    MuseScore 4.x 把插件编辑器窗口的 min/max 设成同一个值（钉死），既不给缩放边框、
+//    也从不调用 canResize()。所以「用户拖窗口改大小」在本宿主上做不到，别再这么写文案。
+//    本端只管三件事：① 按规范回答 canResize()（别的宿主会照办）；② 布局自适应任何宽度；
+//    ③ checkSizeConstraint() 钳制宿主送来的尺寸。
 // 高度固定 384 —— 每一行的纵向位置、以及帮助覆盖层的「行数预算」都是按 384 排的，
 // 放开高度就得连带重算，收益（波形变高）远小于风险。
 static const CGFloat kPanelH    = 384.0;    ///< 固定高度
 static const CGFloat kPanelWDef = 640.0;    ///< 默认宽度
 // ⚠️ 最小宽度 = 默认宽度。第 4 行的快捷键提示实测需 345pt（起点 x=226），
-//    再窄就会被截断 —— 与其留着截断，不如不允许缩窄（本端只支持「拉宽」）。
+//    再窄就会被截断 —— 与其留着截断，不如不允许缩窄。
 static const CGFloat kPanelWMin = 640.0;
 static const CGFloat kPanelWMax = 1700.0;   ///< 与 Windows / Linux 同一上限
 
@@ -1232,7 +1236,6 @@ namespace ap { void openBrandHome (); }
         @"",
         @"#4  波形区其它操作：直接拖 = 平移视野；滚轮 / 双指左右滑 = 平移；",
         @"     ⌘/⌥+滚轮 或 双指捏合 = 缩放；双击 = 整首全览。",
-        @"     窗口边缘可以拖动 —— 拉宽它，波形区更大。",
         @"",
         @"#5  在乐谱里点任意小节，画面会跟着跳过去（扒谱很方便）。",
         @"     红线=音频播到哪，绿线=乐谱播到哪 —— 平时它俩就黏在一起；",
@@ -1242,7 +1245,7 @@ namespace ap { void openBrandHome (); }
         @"「大伟鼓谱」，到 B 站关注一下 —— 那就是最大的支持。",
     ];
 
-    // 21 行 × 16px，从 y=38 起 → 末行底 ≈ 371，留 13px 余量（面板高 384）。
+    // 20 行 × 16px，从 y=38 起 → 末行底 ≈ 355，留 29px 余量（面板高 384）。
     // ⚠️ 文案再加长就要同步这里，否则最后一行会被面板底边裁掉。
     CGFloat y = 38.0;
     const CGFloat lh = 16.0;
@@ -1314,13 +1317,13 @@ namespace ap { void openBrandHome (); }
         _st = new PanelState ();
         _st->backend = safeBackend (b);
 
-        // ---- 面板宽度可拖大：靠 autoresizingMask，不做手工重排 ----
+        // ---- 面板宽度可变：靠 autoresizingMask，不做手工重排 ----
         // 三档规则（⚠️ 只涉及横向，纵向全部固定，所以不用任何 Y 方向的 mask）：
         //   · 右边缘要对齐右边界  → NSViewMinXMargin（左边距吃掉宽度增量）
         //   · 横向要跟着变宽      → NSViewWidthSizable（左边距固定，宽度吃掉增量）
         //   · 其余（左对齐、定宽）→ 不设 mask。程序化创建的视图默认 mask = 0，
         //     本来就是「原地不动」，正好就是要的效果。
-        // 这样宿主把窗口拖宽时 AppKit 自己就排好了，不需要（也不该有）一个
+        // 这样宿主给出更宽的面板时 AppKit 自己就排好了，不需要（也不该有）一个
         // 按尺寸重算坐标的布局函数 —— 那种写法每加一个控件都要记得登记。
 
         // ---- 标题（窗口内标题保留中文：AppKit 自绘，编码完全可控）----
@@ -1330,7 +1333,7 @@ namespace ap { void openBrandHome (); }
 
         NSButton* open = [self button:@"打开音频…" action:@selector (openFile:)];
         open.frame = NSMakeRect (530, 5, 96, 24);
-        open.autoresizingMask = NSViewMinXMargin;   // 贴着右边界（拖宽时右移）
+        open.autoresizingMask = NSViewMinXMargin;   // 贴着右边界（面板变宽时右移）
 
         // 「帮助」：唤出使用指南覆盖层。
         // 有用户反馈「不知道怎么用」——说明书不能只躺在 README / 安装包里，
@@ -1344,7 +1347,7 @@ namespace ap { void openBrandHome (); }
         // ---- 波形 + 小节网格 ----
         _st->wave = [[WaveformView alloc] initWithBackend:safeBackend (b)];
         _st->wave.frame = NSMakeRect (14, 38, 612, 118);
-        _st->wave.autoresizingMask = NSViewWidthSizable;   // 窗口拉宽 → 波形区跟着变宽
+        _st->wave.autoresizingMask = NSViewWidthSizable;   // 面板变宽 → 波形区跟着变宽
         [_st->wave setPanel:(__bridge void*) self];
         [self addSubview:_st->wave];
         _st->wave.toolTip = @"滚轮左右平移 · ⌥滚轮缩放 · 双击全览 · "
@@ -2320,14 +2323,16 @@ tresult PLUGIN_API PlugView::onFocus (TBool /*state*/) { return kResultOk; }
 
 tresult PLUGIN_API PlugView::setFrame (IPlugFrame* frame)
 {
-    // 本端不需要主动请求宿主缩放（面板只支持拉宽，由用户拖窗口驱动），
-    // 但按规范把宿主回调存下来，方便将来需要时使用。
+    // 本端不主动请求宿主改尺寸（面板宽度由宿主决定），但按规范把宿主回调存下来 ——
+    // 将来若要支持「插件自己请求窗口变大」，调用的就是它。
     m_frame = frame;
     return kResultOk;
 }
 
-// 允许把编辑器窗口拉宽（旧版返回 kResultFalse = 固定尺寸，鼠标放到边缘没有反应）。
-// 宿主看到 kResultTrue 后会把窗口做成可缩放，拖动中回调 checkSizeConstraint。
+// 按 VST3 规范回答「本视图支持缩放」—— 别的宿主（Reaper / Cubase / Studio One …）
+// 会据此开放窗口缩放边框，那时 onSize() 与 autoresizingMask 就起作用了。
+// ⚠️ 但 MuseScore 4.x 完全忽略它：它把插件编辑器窗口的 min/max 设成同一个值（钉死），
+//    而且从不调用本函数 —— 所以别对外承诺「可以拖窗口边缘」。
 tresult PLUGIN_API PlugView::canResize () { return kResultTrue; }
 
 tresult PLUGIN_API PlugView::checkSizeConstraint (ViewRect* rect)

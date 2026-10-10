@@ -249,7 +249,7 @@ int main (int argc, char** argv)
 
     TestBackend backend;
     NSView* guiView = nil;
-    ap::PlugView* pvRef = nullptr;   // 供「窗口拉宽」用例复用（挂载用的那个视图）
+    ap::PlugView* pvRef = nullptr;   // 供「宿主改尺寸」用例复用（挂载用的那个视图）
 
     // ---- 1. 模拟宿主挂载编辑器视图（时序与 MuseScore 一致）----
     @autoreleasepool
@@ -282,10 +282,10 @@ int main (int argc, char** argv)
 
     int rc = 0;
 
-    // ---- ⭐ 窗口可拉宽：宿主拉宽后，波形区必须跟着变宽 ----
-    // 用户实测：「说明里写了可以拖动放大缩小，但鼠标放到窗口边缘没有反应」。
-    // 根因：canResize() 一直返回 kResultFalse（固定尺寸），宿主因此把编辑器窗口
-    // 做成不可缩放。这里按 VST3 规范的调用时序走一遍：
+    // ---- ⭐ 宿主改尺寸：面板变宽后，波形区必须跟着变宽 ----
+    // 背景：MuseScore 会把插件编辑器窗口钉死在我们 getSize() 报的尺寸上，用户拖不动
+    // （见经验总结第 13 章）。所以「面板会不会更宽」只取决于宿主 —— 而宿主一旦给出
+    // 新尺寸，就必须走这条调用链：
     //   checkSizeConstraint（钳制） → onSize（通知新尺寸） → 子视图按 mask 重排。
     // ⚠️ 顺带验证高度被压回 384 —— 本端只放开宽度，纵向位置与帮助层行数预算
     //    都是按 384 排的。
@@ -299,7 +299,7 @@ int main (int argc, char** argv)
         want.bottom = 500;   // 故意给一个 ≠384 的高度
         pvRef->checkSizeConstraint (&want);
 
-        std::printf ("  · 拉宽请求 900x500 → 钳制为 %dx%d\n",
+        std::printf ("  · 宿主给的 900x500 → 钳制为 %dx%d\n",
                      (int) want.getWidth (), (int) want.getHeight ());
         std::fflush (stdout);
 
@@ -318,25 +318,25 @@ int main (int argc, char** argv)
         if (std::fabs (waveW - 872.0) > 0.5)            ok = false;   // 900 - 左右各 14
         if (wave2 && std::fabs (NSMaxX (wave2.frame) - 886.0) > 0.5) ok = false;
 
-        // 帮助覆盖层必须铺满新宽度，否则拉宽后右侧会露出一条没被盖住的面板
+        // 帮助覆盖层必须铺满新宽度，否则面板变宽后右侧会露出一条没被盖住的面板
         bool overlayOk = false;
         for (NSView* sv in [guiView subviews])
             if ([NSStringFromClass ([sv class]) isEqualToString:@"HelpOverlayView"])
                 overlayOk = std::fabs (sv.frame.size.width - 900.0) < 0.5;
         if (!overlayOk)
         {
-            std::printf ("  · ✗ 帮助覆盖层没有跟着变宽（拉宽后右侧会漏出面板）\n");
+            std::printf ("  · ✗ 帮助覆盖层没有跟着变宽（面板变宽后右侧会漏出面板）\n");
             ok = false;
         }
 
         if (!ok)
         {
-            std::printf ("[复现] ✗ 拉宽后布局没有跟着变（波形区 / 覆盖层宽度不对）\n");
+            std::printf ("[复现] ✗ 面板变宽后布局没有跟着变（波形区 / 覆盖层宽度不对）\n");
             rc = 36;
         }
         else
         {
-            step ("窗口拉宽后波形区与帮助覆盖层同步变宽");
+            step ("宿主改尺寸后波形区与帮助覆盖层同步变宽");
         }
 
         // 复原成 640 宽：后面的用例都按这块坐标系算鼠标位置

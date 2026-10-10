@@ -182,7 +182,7 @@ private:
     void* m_view = nullptr;   // GUIView* （ObjC 类，用 void* 跨语言边界持有）
     // 宿主回调。Windows 版用得上：DPI 缩放系数在 attached 时才确定，若与
     // getSize 之前上报的尺寸不一致，要通过 resizeView 请宿主重新调整窗口。
-    // （Mac/Linux 版按规范原样存下来，但不主动请求缩放 —— 面板由用户拖窗口驱动。）
+    // （Mac/Linux 版按规范原样存下来，但不主动请求缩放 —— 面板尺寸由宿主决定。）
     IPlugFrame* m_frame = nullptr;
     uint32 m_refCount = 0;
 };

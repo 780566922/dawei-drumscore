@@ -486,9 +486,10 @@ int main (int argc, char** argv)
             check ("视图尺寸 = 640x384",
                    vr.right == 640 && vr.bottom == 384,
                    std::to_string (vr.right) + "x" + std::to_string (vr.bottom));
-            // 旧版这里是 kResultFalse（固定尺寸）—— 用户实测「鼠标放到窗口边缘没有反应」。
-            // 现在三端一致：kResultTrue，宿主据此把编辑器窗口做成可缩放。
-            check ("view->canResize 返回 true（窗口可拉宽）",
+            // 旧版这里是 kResultFalse（固定尺寸）。现在三端一致返回 kResultTrue，
+            // 表示「本视图支持缩放」。⚠️ 但这只锁「我们对规范的回答」，不锁「用户能不能
+            // 拖窗口」—— MuseScore 4.x 忽略它并把窗口 min/max 钉成同一个值（经验总结 13 章）。
+            check ("view->canResize 返回 true（按规范声明支持缩放）",
                    view->canResize () == kResultTrue);
 
             //---- 缩放钳制：宽度 640~1700，高度强制回 384（本端高度不可改）----

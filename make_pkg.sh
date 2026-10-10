@@ -16,7 +16,7 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE_NAME="大伟鼓谱MuseScore音频播放器.vst3"
 DISPLAY_NAME="大伟鼓谱 MuseScore 音频播放器"
-VERSION="1.2.5"
+VERSION="1.2.6"
 IDENT="com.dawei.drumscore"
 
 SRC_BUNDLE="$HERE/build/$BUNDLE_NAME"
