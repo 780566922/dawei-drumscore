@@ -486,8 +486,44 @@ int main (int argc, char** argv)
             check ("视图尺寸 = 640x384",
                    vr.right == 640 && vr.bottom == 384,
                    std::to_string (vr.right) + "x" + std::to_string (vr.bottom));
-            check ("view->canResize 返回 false（固定尺寸）",
-                   view->canResize () == kResultFalse);
+            // 旧版这里是 kResultFalse（固定尺寸）—— 用户实测「鼠标放到窗口边缘没有反应」。
+            // 现在三端一致：kResultTrue，宿主据此把编辑器窗口做成可缩放。
+            check ("view->canResize 返回 true（窗口可拉宽）",
+                   view->canResize () == kResultTrue);
+
+            //---- 缩放钳制：宽度 640~1700，高度强制回 384（本端高度不可改）----
+            {
+                ViewRect narrow {0, 0, 300, 200};
+                view->checkSizeConstraint (&narrow);
+                check ("checkSizeConstraint：过窄/过矮 → 640x384",
+                       narrow.getWidth () == 640 && narrow.getHeight () == 384,
+                       std::to_string (narrow.getWidth ()) + "x"
+                           + std::to_string (narrow.getHeight ()));
+
+                ViewRect wide {0, 0, 3000, 900};
+                view->checkSizeConstraint (&wide);
+                check ("checkSizeConstraint：超上限 → 1700x384（高度被压回）",
+                       wide.getWidth () == 1700 && wide.getHeight () == 384,
+                       std::to_string (wide.getWidth ()) + "x"
+                           + std::to_string (wide.getHeight ()));
+
+                ViewRect ok {0, 0, 900, 384};
+                view->checkSizeConstraint (&ok);
+                check ("checkSizeConstraint：范围内 → 宽度原样通过",
+                       ok.getWidth () == 900 && ok.getHeight () == 384,
+                       std::to_string (ok.getWidth ()) + "x" + std::to_string (ok.getHeight ()));
+
+                // ⚠️ 宿主给的矩形可能带非零原点（窗口装饰）。钳制必须按 width/height
+                //    算再写回 left/top 上，直接覆写 right/bottom 会把窗体怼偏。
+                ViewRect offset {20, 10, 920, 394};
+                view->checkSizeConstraint (&offset);
+                check ("checkSizeConstraint：带原点偏移时按宽高算，且原点不动",
+                       offset.getWidth () == 900 && offset.getHeight () == 384
+                           && offset.left == 20 && offset.top == 10,
+                       std::to_string (offset.left) + "," + std::to_string (offset.top) + " "
+                           + std::to_string (offset.getWidth ()) + "x"
+                           + std::to_string (offset.getHeight ()));
+            }
 
             // 界面必须真的拿到音频后端，否则窗口弹出来也是空壳：点了没反应。
             auto viewHasBackend = reinterpret_cast<int (*) (IPlugView*)> (

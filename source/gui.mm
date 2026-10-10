@@ -1,7 +1,7 @@
 //==============================================================================
 // gui.mm — 中文界面的 AppKit 实现
 //
-// 界面布局（640 x 384，y 轴向下）：
+// 界面布局（默认 640 x 384，y 轴向下；宽度可被用户拖大，高度固定）：
 //   ┌────────────────────────────────────────────┐
 //   │  大伟鼓谱 · MuseScore 音频播放器        [打开音频…] │
 //   │  ┌──────────────────────────────────────┐  │
@@ -16,6 +16,9 @@
 //   ├────────────────────────────────────────────┤
 //   │  ♪ B 站「大伟鼓谱」· 欢迎关注…（页脚署名）   │
 //   └────────────────────────────────────────────┘
+// 窗口拉宽后：波形区、分隔线、状态文字、页脚跟着变宽，右上角按钮与右侧读数贴右边界。
+// 各控件靠 autoresizingMask 自动重排，没有「按尺寸重算坐标」的布局函数（见
+// GUIView initWithBackend: 里的三档规则）。
 //
 // 波形区交互（对齐时最常用）：
 //   滚轮            左右平移
@@ -86,6 +89,18 @@ static const double kDefaultViewSpanSec = 8.0;
 // 「音频线程抢不到锁 → 整块丢音频 → 播放位置永久落后宿主」是完全隐形的故障。
 // 这里把它变成一条日志（同一故障 5 秒内只记一次，避免刷屏）。
 static const double kLockDropLogGapSec = 5.0;
+
+//---- 面板尺寸 ----------------------------------------------------------------
+// 宽度可以被用户拖大：宿主在 canResize() 返回 kResultTrue 时会把编辑器窗口做成
+// 可缩放，拖动过程中回调 checkSizeConstraint() 钳制、随后 onSize() 通知新尺寸。
+// 高度固定 384 —— 每一行的纵向位置、以及帮助覆盖层的「行数预算」都是按 384 排的，
+// 放开高度就得连带重算，收益（波形变高）远小于风险。
+static const CGFloat kPanelH    = 384.0;    ///< 固定高度
+static const CGFloat kPanelWDef = 640.0;    ///< 默认宽度
+// ⚠️ 最小宽度 = 默认宽度。第 4 行的快捷键提示实测需 345pt（起点 x=226），
+//    再窄就会被截断 —— 与其留着截断，不如不允许缩窄（本端只支持「拉宽」）。
+static const CGFloat kPanelWMin = 640.0;
+static const CGFloat kPanelWMax = 1700.0;   ///< 与 Windows / Linux 同一上限
 
 // ObjC++ 的 ivar 只能是指针/标量，C++ 容器要包在结构体里再放指针
 struct WaveState
@@ -1215,9 +1230,9 @@ namespace ap { void openBrandHome (); }
         @"     小节线拖到音乐的第一拍上（对准波形里的鼓点）。⇧ 拖 = 微调，",
         @"     调坏了点右边的「归零」。开头被跳过的那段画成灰色。",
         @"",
-        @"#4  波形区其它操作：直接拖 = 平移视野",
-        @"     滚轮 / 双指左右滑 = 平移；⌘/⌥+滚轮 或 双指捏合 = 缩放；",
-        @"     双击 = 整首全览。",
+        @"#4  波形区其它操作：直接拖 = 平移视野；滚轮 / 双指左右滑 = 平移；",
+        @"     ⌘/⌥+滚轮 或 双指捏合 = 缩放；双击 = 整首全览。",
+        @"     窗口边缘可以拖动 —— 拉宽它，波形区更大。",
         @"",
         @"#5  在乐谱里点任意小节，画面会跟着跳过去（扒谱很方便）。",
         @"     红线=音频播到哪，绿线=乐谱播到哪 —— 平时它俩就黏在一起；",
@@ -1294,10 +1309,19 @@ namespace ap { void openBrandHome (); }
 
 - (instancetype)initWithBackend:(ap::PlugView::Backend*)b
 {
-    if (self = [super initWithFrame:NSMakeRect (0, 0, 640, 384)])
+    if (self = [super initWithFrame:NSMakeRect (0, 0, kPanelWDef, kPanelH)])
     {
         _st = new PanelState ();
         _st->backend = safeBackend (b);
+
+        // ---- 面板宽度可拖大：靠 autoresizingMask，不做手工重排 ----
+        // 三档规则（⚠️ 只涉及横向，纵向全部固定，所以不用任何 Y 方向的 mask）：
+        //   · 右边缘要对齐右边界  → NSViewMinXMargin（左边距吃掉宽度增量）
+        //   · 横向要跟着变宽      → NSViewWidthSizable（左边距固定，宽度吃掉增量）
+        //   · 其余（左对齐、定宽）→ 不设 mask。程序化创建的视图默认 mask = 0，
+        //     本来就是「原地不动」，正好就是要的效果。
+        // 这样宿主把窗口拖宽时 AppKit 自己就排好了，不需要（也不该有）一个
+        // 按尺寸重算坐标的布局函数 —— 那种写法每加一个控件都要记得登记。
 
         // ---- 标题（窗口内标题保留中文：AppKit 自绘，编码完全可控）----
         NSTextField* title = [self label:@"大伟鼓谱 · MuseScore 音频播放器" size:14 align:NSTextAlignmentLeft];
@@ -1306,18 +1330,21 @@ namespace ap { void openBrandHome (); }
 
         NSButton* open = [self button:@"打开音频…" action:@selector (openFile:)];
         open.frame = NSMakeRect (530, 5, 96, 24);
+        open.autoresizingMask = NSViewMinXMargin;   // 贴着右边界（拖宽时右移）
 
         // 「帮助」：唤出使用指南覆盖层。
         // 有用户反馈「不知道怎么用」——说明书不能只躺在 README / 安装包里，
         // 得让它在这块面板上直接点得到，否则第一次打开的人只能靠猜。
         NSButton* help = [self button:@"？帮助" action:@selector (helpToggle:)];
         help.frame = NSMakeRect (452, 5, 72, 24);
+        help.autoresizingMask = NSViewMinXMargin;   // 同上：跟着「打开音频」一起贴右边
         help.font = [NSFont systemFontOfSize:11];
         help.toolTip = @"使用指南：怎么对齐、怎么播放、快捷键一览";
 
         // ---- 波形 + 小节网格 ----
         _st->wave = [[WaveformView alloc] initWithBackend:safeBackend (b)];
         _st->wave.frame = NSMakeRect (14, 38, 612, 118);
+        _st->wave.autoresizingMask = NSViewWidthSizable;   // 窗口拉宽 → 波形区跟着变宽
         [_st->wave setPanel:(__bridge void*) self];
         [self addSubview:_st->wave];
         _st->wave.toolTip = @"滚轮左右平移 · ⌥滚轮缩放 · 双击全览 · "
@@ -1386,6 +1413,7 @@ namespace ap { void openBrandHome (); }
         NSTextField* hintKeys = [self label:@"拖动=平移视图　⌘/⌥拖动=改偏移　滚轮=平移　⌘/⌥滚轮=缩放　双击=全览"
                                      size:10 align:NSTextAlignmentLeft];
         hintKeys.frame = NSMakeRect (226, 189, 394, 16);
+        hintKeys.autoresizingMask = NSViewWidthSizable;   // 起点固定，右端跟着窗口走
         [hintKeys setTextColor:[NSColor colorWithCalibratedWhite:0.55 alpha:1.0]];
 
         // ---- 速度（BPM）+ 拍号（N/M）----
@@ -1435,10 +1463,12 @@ namespace ap { void openBrandHome (); }
 
         _st->volLabel = [self label:@"100 %" size:12 align:NSTextAlignmentLeft];
         _st->volLabel.frame = NSMakeRect (520, 267, 100, 18);
+        _st->volLabel.autoresizingMask = NSViewMinXMargin;   // 音量读数贴着右边界
 
         // ---- 状态 ----
         _st->statusLabel = [self label:@"未载入音频" size:11 align:NSTextAlignmentLeft];
         _st->statusLabel.frame = NSMakeRect (14, 292, 612, 16);
+        _st->statusLabel.autoresizingMask = NSViewWidthSizable;   // 状态文字越长越放得下
 
         // ---- 播放状态指示灯（纯显示，不可点击）----
         // VST3 标准里插件无法反向控制宿主播放/暂停，点这个按钮也不会真正
@@ -1454,12 +1484,14 @@ namespace ap { void openBrandHome (); }
         NSTextField* hint = [self label:@"支持 MP3/WAV/M4A/AAC/FLAC/OGG" size:10
                                  align:NSTextAlignmentRight];
         hint.frame = NSMakeRect (430, 320, 196, 14);
+        hint.autoresizingMask = NSViewMinXMargin;   // 右对齐（文案本来就右对齐）
         [hint setTextColor:[NSColor colorWithCalibratedWhite:0.5 alpha:1.0]];
 
         // ---- 底部页脚：B 站署名 + 欢迎语（作者引流，可点击跳主页）----
         // 放在面板最底部而非顶栏：不挤占主操作区，且用户每次打开界面都会看到。
         NSBox* sep = [[NSBox alloc] initWithFrame:NSMakeRect (14, 352, 612, 1)];
         sep.boxType = NSBoxSeparator;
+        sep.autoresizingMask = NSViewWidthSizable;   // 分隔线横贯整个面板宽度
         [self addSubview:sep];
 
         // ⭐ 用 BrandLinkField（NSTextField 子类）而不是 label: —— 点一下会用系统
@@ -1467,6 +1499,7 @@ namespace ap { void openBrandHome (); }
         //    尺寸/颜色与原来的 label 完全一致，所以布局与验证器断言都不用改。
         BrandLinkField* footer =
             [[BrandLinkField alloc] initWithFrame:NSMakeRect (14, 360, 612, 16)];
+        footer.autoresizingMask = NSViewWidthSizable;   // 与上面的分隔线同宽
         footer.stringValue = @"♪  B 站「大伟鼓谱」· 欢迎关注，鼓谱 / 教学 / 伴奏持续更新";
         footer.font        = [NSFont systemFontOfSize:11];
         footer.alignment   = NSTextAlignmentCenter;
@@ -2213,7 +2246,7 @@ tresult PLUGIN_API PlugView::attached (void* parent, FIDString /*type*/)
 
     NSView* parentView = (__bridge NSView*) parent;
     ::GUIView* v = [[::GUIView alloc] initWithBackend:m_backend];
-    v.frame = NSMakeRect (0, 0, 640, 384);
+    v.frame = NSMakeRect (0, 0, kPanelWDef, kPanelH);
     [v setFrameOrigin:NSZeroPoint];
     [parentView addSubview:v];
     m_view = (__bridge void*) v;
@@ -2243,29 +2276,73 @@ tresult PLUGIN_API PlugView::onWheel (float) { return kResultOk; }
 tresult PLUGIN_API PlugView::onKeyDown (char16, int16, int16) { return kResultOk; }
 tresult PLUGIN_API PlugView::onKeyUp (char16, int16, int16) { return kResultOk; }
 
+// ⚠️ 视图已经建好时必须【如实汇报当前尺寸】—— 报默认值的话，用户刚拖好的宽度
+//    会被宿主的缩放框架弹回去（规范也要求这里返回「当前」而不是「期望」尺寸）。
 tresult PLUGIN_API PlugView::getSize (ViewRect* size)
 {
     if (!size) return kInvalidArgument;
     size->left = 0;
     size->top = 0;
-    size->right = 640;
-    size->bottom = 384;
+
+    if (m_view)
+    {
+        const NSSize s = ((__bridge ::GUIView*) m_view).frame.size;
+        size->right  = static_cast<int32> (s.width);
+        size->bottom = static_cast<int32> (s.height);
+    }
+    else
+    {
+        size->right  = static_cast<int32> (kPanelWDef);
+        size->bottom = static_cast<int32> (kPanelH);
+    }
     return kResultOk;
 }
 
-tresult PLUGIN_API PlugView::onSize (ViewRect* /*newSize*/) { return kResultOk; }
+// 宿主在缩放过程中回调：把矩形钳制到允许范围（宽度 640~1700，高度锁死 384）。
+// ⚠️ 高度必须【强制】回 384，而不是「不限制」—— 纵向位置和帮助层行数预算都是
+//    按 384 排的，放任高度变化会让下半部分控件与页脚错位。
+tresult PLUGIN_API PlugView::onSize (ViewRect* newSize)
+{
+    if (!m_view || !newSize)
+        return kResultOk;
+
+    const CGFloat w = newSize->right - newSize->left;
+    const CGFloat h = newSize->bottom - newSize->top;
+
+    ::GUIView* v = (__bridge ::GUIView*) m_view;
+    // 改 frame 会触发 AppKit 按各子视图的 autoresizingMask 重排（波形区随之变宽）
+    [v setFrameSize:NSMakeSize (w, h)];
+    [v setNeedsDisplay:YES];
+    return kResultOk;
+}
+
 tresult PLUGIN_API PlugView::onFocus (TBool /*state*/) { return kResultOk; }
 
-tresult PLUGIN_API PlugView::setFrame (IPlugFrame* /*frame*/) { return kResultOk; }
+tresult PLUGIN_API PlugView::setFrame (IPlugFrame* frame)
+{
+    // 本端不需要主动请求宿主缩放（面板只支持拉宽，由用户拖窗口驱动），
+    // 但按规范把宿主回调存下来，方便将来需要时使用。
+    m_frame = frame;
+    return kResultOk;
+}
 
-// 固定尺寸：用户拖动窗口会让布局错乱，所以直接拒绝
-tresult PLUGIN_API PlugView::canResize () { return kResultFalse; }
+// 允许把编辑器窗口拉宽（旧版返回 kResultFalse = 固定尺寸，鼠标放到边缘没有反应）。
+// 宿主看到 kResultTrue 后会把窗口做成可缩放，拖动中回调 checkSizeConstraint。
+tresult PLUGIN_API PlugView::canResize () { return kResultTrue; }
 
 tresult PLUGIN_API PlugView::checkSizeConstraint (ViewRect* rect)
 {
     if (!rect) return kInvalidArgument;
-    rect->right = 640;
-    rect->bottom = 384;
+
+    int32 w = rect->right - rect->left;
+    int32 h = rect->bottom - rect->top;
+
+    if (w < static_cast<int32> (kPanelWMin)) w = static_cast<int32> (kPanelWMin);
+    if (w > static_cast<int32> (kPanelWMax)) w = static_cast<int32> (kPanelWMax);
+    h = static_cast<int32> (kPanelH);   // 高度固定，不吃用户的纵向拖动
+
+    rect->right  = rect->left + w;
+    rect->bottom = rect->top  + h;
     return kResultOk;
 }
 

@@ -249,6 +249,7 @@ int main (int argc, char** argv)
 
     TestBackend backend;
     NSView* guiView = nil;
+    ap::PlugView* pvRef = nullptr;   // 供「窗口拉宽」用例复用（挂载用的那个视图）
 
     // ---- 1. 模拟宿主挂载编辑器视图（时序与 MuseScore 一致）----
     @autoreleasepool
@@ -261,6 +262,7 @@ int main (int argc, char** argv)
 
         auto* pv = new ap::PlugView (&backend, nullptr);
         pv->addRef ();
+        pvRef = pv;
         const Steinberg::tresult r =
             pv->attached ((__bridge void*) container, Steinberg::kPlatformTypeNSView);
         // 由宿主持有，本进程不释放插件视图对象
@@ -279,6 +281,70 @@ int main (int argc, char** argv)
     step ("autorelease 池已排空（模拟编辑器打开数秒后）");
 
     int rc = 0;
+
+    // ---- ⭐ 窗口可拉宽：宿主拉宽后，波形区必须跟着变宽 ----
+    // 用户实测：「说明里写了可以拖动放大缩小，但鼠标放到窗口边缘没有反应」。
+    // 根因：canResize() 一直返回 kResultFalse（固定尺寸），宿主因此把编辑器窗口
+    // 做成不可缩放。这里按 VST3 规范的调用时序走一遍：
+    //   checkSizeConstraint（钳制） → onSize（通知新尺寸） → 子视图按 mask 重排。
+    // ⚠️ 顺带验证高度被压回 384 —— 本端只放开宽度，纵向位置与帮助层行数预算
+    //    都是按 384 排的。
+    @autoreleasepool
+    {
+        NSView* waveBefore = findWaveView (guiView);
+        const CGFloat waveWBefore = waveBefore ? waveBefore.frame.size.width : 0.0;
+
+        Steinberg::ViewRect want {};
+        want.right  = 900;
+        want.bottom = 500;   // 故意给一个 ≠384 的高度
+        pvRef->checkSizeConstraint (&want);
+
+        std::printf ("  · 拉宽请求 900x500 → 钳制为 %dx%d\n",
+                     (int) want.getWidth (), (int) want.getHeight ());
+        std::fflush (stdout);
+
+        pvRef->onSize (&want);
+
+        const NSSize  panel  = guiView.frame.size;
+        NSView*       wave2  = findWaveView (guiView);
+        const CGFloat waveW  = wave2 ? wave2.frame.size.width : 0.0;
+
+        std::printf ("  · 面板 %.0fx%.0f，波形区宽 %.0f → %.0f\n",
+                     panel.width, panel.height, waveWBefore, waveW);
+        std::fflush (stdout);
+
+        bool ok = true;
+        if (panel.width != 900 || panel.height != 384)  ok = false;
+        if (std::fabs (waveW - 872.0) > 0.5)            ok = false;   // 900 - 左右各 14
+        if (wave2 && std::fabs (NSMaxX (wave2.frame) - 886.0) > 0.5) ok = false;
+
+        // 帮助覆盖层必须铺满新宽度，否则拉宽后右侧会露出一条没被盖住的面板
+        bool overlayOk = false;
+        for (NSView* sv in [guiView subviews])
+            if ([NSStringFromClass ([sv class]) isEqualToString:@"HelpOverlayView"])
+                overlayOk = std::fabs (sv.frame.size.width - 900.0) < 0.5;
+        if (!overlayOk)
+        {
+            std::printf ("  · ✗ 帮助覆盖层没有跟着变宽（拉宽后右侧会漏出面板）\n");
+            ok = false;
+        }
+
+        if (!ok)
+        {
+            std::printf ("[复现] ✗ 拉宽后布局没有跟着变（波形区 / 覆盖层宽度不对）\n");
+            rc = 36;
+        }
+        else
+        {
+            step ("窗口拉宽后波形区与帮助覆盖层同步变宽");
+        }
+
+        // 复原成 640 宽：后面的用例都按这块坐标系算鼠标位置
+        Steinberg::ViewRect back {};
+        back.right  = 640;
+        back.bottom = 384;
+        pvRef->onSize (&back);
+    }
 
     // ---- 子视图断言：音量滑块必须真的挂进视图层级 ----
     // 之前滑块既没 addSubview 也没 retain —— 结果是「界面上看不见」

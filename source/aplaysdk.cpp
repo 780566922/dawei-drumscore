@@ -28,7 +28,7 @@ using namespace Steinberg::Vst;
 static constexpr uint32 kAPlayDistributable = 1 << 0;
 
 // 插件版本字符串（FULL_VERSION_STR 是 CMake 生成的，这里手写）
-#define APLAY_VERSION_WSTR STR16 ("1.2.4")
+#define APLAY_VERSION_WSTR STR16 ("1.2.5")
 
 namespace aplay {
 
@@ -968,7 +968,7 @@ public:
         strncpy (ci.subCategories, "Instrument", Steinberg::PClassInfo2::kSubCategoriesSize - 1);
         // 厂商名：纯 ASCII。它是插件名上面那一级菜单的分组名，中文会乱码。
         strncpy (ci.vendor, "Dawei DrumScore", Steinberg::PClassInfo2::kVendorSize - 1);
-        strncpy (ci.version, "1.2.4", Steinberg::PClassInfo2::kVersionSize - 1);
+        strncpy (ci.version, "1.2.5", Steinberg::PClassInfo2::kVersionSize - 1);
         strncpy (ci.sdkVersion, kVstVersionString, Steinberg::PClassInfo2::kVersionSize - 1);
         registerClass (&ci, aplay::APlayProcessor::createInstance);
 
