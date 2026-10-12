@@ -28,7 +28,7 @@ using namespace Steinberg::Vst;
 static constexpr uint32 kAPlayDistributable = 1 << 0;
 
 // 插件版本字符串（FULL_VERSION_STR 是 CMake 生成的，这里手写）
-#define APLAY_VERSION_WSTR STR16 ("1.2.6")
+#define APLAY_VERSION_WSTR STR16 ("1.2.7")
 
 namespace aplay {
 
@@ -227,6 +227,26 @@ public:
         startSec = 0.0;
         spanSec = 0.0;
     }
+
+    //---- 拍号变化（按小节覆盖）----
+    // ⭐⚠️ 这三个【必须】转发。基类为了「空后端不必补空函数」给了默认实现，
+    //    所以漏转发是【静默】的：界面读到的永远是空表（拍号条画不出变化点），
+    //    写进去的值又直接落进基类的空函数里（用户改了拍号、网格纹丝不动）。
+    //    这个坑已经被 validate.cpp 的「拍号变化表」断言当场抓到过一次。
+    void getTimeSigChanges (std::vector<ap::TimeSigChange>& out) const override
+    {
+        APlayProcessor* p = currentProcessor ();
+        if (p) { p->getTimeSigChanges (out); return; }
+        out.clear ();
+    }
+    void setTimeSigChange (int bar, int beats, int denom) override
+    {
+        if (APlayProcessor* p = currentProcessor ()) p->setTimeSigChange (bar, beats, denom);
+    }
+    void clearTimeSigChange (int bar) override
+    {
+        if (APlayProcessor* p = currentProcessor ()) p->clearTimeSigChange (bar);
+    }
 };
 
 } // namespace
@@ -325,6 +345,13 @@ tresult PLUGIN_API APlayProcessor::setState (IBStream* state)
 {
     if (!state) return kResultOk;
 
+    // 状态是「整体替换」语义：先把拍号变化表清空。若存档里没有对应数据块
+    // （旧工程 / 从没设过变化），它就是空的，而不是留着上一份存档的残留。
+    {
+        std::lock_guard<std::mutex> lk (m_tsMutex);
+        m_tsChanges.clear ();
+    }
+
     for (int guard = 0; guard < 64; ++guard)
     {
         int32 id = 0;
@@ -384,6 +411,30 @@ tresult PLUGIN_API APlayProcessor::setState (IBStream* state)
                 if (state->read (&b, 1) == kResultOk) m_loop = b != 0;
                 break;
             }
+            case kIdTimeSigMap:
+            {
+                // int32 条数，随后每条 3 个 int32：(bar, beats, denom)
+                std::map<int, ap::TimeSigChange> incoming;
+                int32 cnt = 0;
+                if (state->read (&cnt, sizeof cnt) == kResultOk && cnt > 0 && cnt < 4096)
+                {
+                    for (int32 i = 0; i < cnt; ++i)
+                    {
+                        int32 b = 1, n = 4, d = 4;
+                        if (state->read (&b, sizeof b) != kResultOk) break;
+                        if (state->read (&n, sizeof n) != kResultOk) break;
+                        if (state->read (&d, sizeof d) != kResultOk) break;
+                        ap::TimeSigChange c;
+                        c.bar   = (b < 1) ? 1 : (b > 1000000 ? 1000000 : b);
+                        c.beats = ap::normalizeBeatsPerBar (n, 4);
+                        c.denom = ap::normalizeBeatDenom (d, 4);
+                        incoming[c.bar] = c;   // 同一小节重复出现时后者胜
+                    }
+                }
+                std::lock_guard<std::mutex> lk (m_tsMutex);
+                m_tsChanges.swap (incoming);
+                break;
+            }
             case kIdFilePath:
             {
                 if (size > 0 && size < 8192)
@@ -439,6 +490,23 @@ tresult PLUGIN_API APlayProcessor::getState (IBStream* state)
     writeChunk (kIdGridBeats, &beats, sizeof beats);
     int32 denom = m_gridBeatDenominator;
     writeChunk (kIdGridBeatDenominator, &denom, sizeof denom);
+
+    // 拍号变化表：int32 条数，随后每条 3 个 int32：(bar, beats, denom)。
+    // std::map 迭代天然按 bar 升序，写出来就是递增的。
+    {
+        std::lock_guard<std::mutex> lk (m_tsMutex);
+        std::vector<int32> buf;
+        buf.reserve (m_tsChanges.size () * 3 + 1);
+        buf.push_back (static_cast<int32> (m_tsChanges.size ()));
+        for (const auto& kv : m_tsChanges)
+        {
+            buf.push_back (static_cast<int32> (kv.second.bar));
+            buf.push_back (static_cast<int32> (kv.second.beats));
+            buf.push_back (static_cast<int32> (kv.second.denom));
+        }
+        writeChunk (kIdTimeSigMap, buf.data (),
+                    static_cast<int32> (buf.size () * sizeof (int32)));
+    }
 
     const int32 len = static_cast<int32> (m_filePath.size ());
     writeChunk (kIdFilePath, m_filePath.data (), len);
@@ -669,6 +737,9 @@ bool APlayProcessor::loadFile (const std::string& path)
     // 视图会自行回落到新载入的默认视野（见各端 kDefaultViewSpanSec）。
     setViewState (0.0, 0.0);
 
+    // 拍号变化表同理：它是「这首歌的谱面长什么样」，换歌必须重设。
+    clearTimeSigChanges ();
+
     loadCurrentFile ();
 
     if (m_loadedOk)
@@ -685,6 +756,7 @@ void APlayProcessor::unloadFile ()
     m_player.clearAudio ();   // 不能传空 AudioData 给 setAudio —— 会被校验拒掉
     m_loadedOk = false;
     setViewState (0.0, 0.0);  // 没音频了，旧视野也不该留到下一首
+    clearTimeSigChanges ();   // 同上：旧谱面的拍号变化不能带到下一首
 }
 
 bool APlayProcessor::hasAudio () const { return m_player.hasAudio (); }
@@ -766,6 +838,43 @@ void APlayProcessor::setGridBeatDenominator (int denom)
     m_gridBeatDenominator = (denom == 2 || denom == 4 || denom == 8 || denom == 16) ? denom : 4;
 }
 int APlayProcessor::gridBeatDenominator () const { return m_gridBeatDenominator; }
+
+//---- 拍号变化（按小节覆盖；见 gui.h 的 TimeSigChange）------------------------
+// 与 BPM / 拍号一样属于「用户操作产生、关掉界面后仍要有意义」的状态，所以存在
+// 处理器里、随乐谱一起保存（铁律 11）。读写都发生在非音频线程上（界面线程 +
+// 宿主的状态存取线程），用一把独立小锁 —— 音频线程从不读它，与 render() 的
+// try_lock 零交集（铁律 12）。
+void APlayProcessor::clearTimeSigChanges ()
+{
+    std::lock_guard<std::mutex> lk (m_tsMutex);
+    m_tsChanges.clear ();
+}
+
+void APlayProcessor::getTimeSigChanges (std::vector<ap::TimeSigChange>& out) const
+{
+    std::lock_guard<std::mutex> lk (m_tsMutex);
+    out.clear ();
+    out.reserve (m_tsChanges.size ());
+    // std::map 按 key 升序迭代 → 天然满足 buildBars 要求的「变化按小节升序」
+    for (const auto& kv : m_tsChanges) out.push_back (kv.second);
+}
+
+void APlayProcessor::setTimeSigChange (int bar, int beats, int denom)
+{
+    if (bar < 1) bar = 1;
+    ap::TimeSigChange c;
+    c.bar   = bar;
+    c.beats = ap::normalizeBeatsPerBar (beats, 4);
+    c.denom = ap::normalizeBeatDenom (denom, 4);
+    std::lock_guard<std::mutex> lk (m_tsMutex);
+    m_tsChanges[bar] = c;
+}
+
+void APlayProcessor::clearTimeSigChange (int bar)
+{
+    std::lock_guard<std::mutex> lk (m_tsMutex);
+    m_tsChanges.erase (bar);
+}
 
 ap::PlugView::Backend::HostTimeline APlayProcessor::hostTimeline () const
 {
@@ -968,7 +1077,7 @@ public:
         strncpy (ci.subCategories, "Instrument", Steinberg::PClassInfo2::kSubCategoriesSize - 1);
         // 厂商名：纯 ASCII。它是插件名上面那一级菜单的分组名，中文会乱码。
         strncpy (ci.vendor, "Dawei DrumScore", Steinberg::PClassInfo2::kVendorSize - 1);
-        strncpy (ci.version, "1.2.6", Steinberg::PClassInfo2::kVersionSize - 1);
+        strncpy (ci.version, "1.2.7", Steinberg::PClassInfo2::kVersionSize - 1);
         strncpy (ci.sdkVersion, kVstVersionString, Steinberg::PClassInfo2::kVersionSize - 1);
         registerClass (&ci, aplay::APlayProcessor::createInstance);
 

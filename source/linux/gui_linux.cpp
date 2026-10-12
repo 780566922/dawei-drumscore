@@ -6,6 +6,8 @@
 //   - 波形预览 + 可拖动播放头
 //   - 带符号起始偏移（在波形上按住 Ctrl / Alt 拖动）
 //   - 小节网格（BPM + 拍号）
+//   - 顶部拍号条：按小节标出「N/M」，点方块改该小节的拍号（谱子里有拍号变化时
+//     后面小节也能对上）
 //   - 音量、缩放、全览、回到播放头、使用指南
 //   - 拖入音频文件 / 点按钮选文件
 //
@@ -97,6 +99,13 @@ const RGB8 kCheckOn   = {  70, 130, 220 };
 const RGB8 kBiliPink  = { 214,  51, 108 };
 const RGB8 kWhite     = { 255, 255, 255 };
 
+// 拍号条 / 拍号弹层（见 kTsStripH 处说明）
+const RGB8 kTsStripBg  = {  22,  22,  26 };   ///< 拍号条底色（与波形区同为深色）
+const RGB8 kTsStripSep = {  61,  61,  68 };   ///< 条的下沿分隔线
+const RGB8 kTsBoxBg    = {  66,  70,  82 };   ///< 普通方块（未变拍号）
+const RGB8 kTsSel      = { 250, 173,  51 };   ///< 变化点方块 / 弹层选中项（橙）
+const RGB8 kTsRemove   = { 176,  74,  74 };   ///< 弹层「取消该小节的变化」
+
 //------------------------------------------------------------------------------
 // 控件矩形（与 Windows 版一一对应，便于对照维护）
 //
@@ -177,6 +186,44 @@ const TimeSig kTimeSigs[] = {
     { "6/8",  6, 8 }, { "7/8",  7, 8 }, { "9/8",  9, 8 }, { "12/8", 12, 8 },
 };
 const int kTimeSigCount = static_cast<int> (sizeof (kTimeSigs) / sizeof (kTimeSigs[0]));
+
+//---- 拍号条（波形区顶部那一条）----------------------------------------------
+// 谱子里出现拍号变化时（前 8 小节 4/4、之后转 3/4），网格必须【逐小节】按当时
+// 生效的拍号算各小节长度，否则变化点之后的小节线会全部错位。逐小节推进的算法
+// 在 gui.h 的 ap::buildBars()（三端共用同一份，见 MEMORY 铁律 9）。
+//
+// 顶部这一条就是用来「看 / 改每小节拍号」的：每个小节一个「N/M」方块，变化点
+// 用橙色高亮，点方块弹出设置面板。
+//
+// ⚠️ 条是从波形区【内部让出来的】：kWaveY 不动，波形内容从 kWaveY + kTsStripH 起
+//    画。动 kWaveY 会连带动整个布局、帮助覆盖层的行数预算与验证器。
+const int kTsStripH = 22;   ///< 拍号条高
+const int kTsBoxH   = 15;   ///< 方块高
+const int kTsBoxGap = 4;    ///< 相邻方块最小间隔（太挤就跳过不画）
+
+// 弹层候选（与 macOS / Windows 端一致）：分子取常用值，分母只留 2/4/8/16。
+const int kTsBeatChoices[]  = { 2, 3, 4, 5, 6, 7, 9, 12 };
+const int kTsDenomChoices[] = { 2, 4, 8, 16 };
+const int kTsBeatChoiceCount  = static_cast<int> (sizeof (kTsBeatChoices)  / sizeof (kTsBeatChoices[0]));
+const int kTsDenomChoiceCount = static_cast<int> (sizeof (kTsDenomChoices) / sizeof (kTsDenomChoices[0]));
+
+/// 拍号条上的一个方块（布局结果；绘制与点击命中共用同一份）
+struct TsStripBox
+{
+    Rect rc;
+    int  bar     = 1;
+    int  beats   = 4;
+    int  denom   = 4;
+    bool changed = false;   ///< 是不是拍号变化点
+};
+
+/// 弹层上的一个按钮
+struct TsPopupBtn
+{
+    Rect rc;
+    int  kind  = 0;   ///< 0 = 分子选项，1 = 分母选项，2 = 取消该小节的变化
+    int  value = 0;
+};
 
 //------------------------------------------------------------------------------
 std::string formatTime (double sec)
@@ -289,6 +336,8 @@ private:
     void drawControls (XftDraw* xd);
     void drawBrowser (XftDraw* xd);
     void drawHelp (XftDraw* xd);
+    /// 拍号设置弹层（画在所有内容之上）
+    void paintTimeSigPopup (XftDraw* xd);
 
     void fillRect (Drawable d, const Rect& r, unsigned long pixel);
     void frameRect (Drawable d, const Rect& r, unsigned long pixel);
@@ -332,6 +381,27 @@ private:
     void applyDefaultView ();
     /// 从后端回读拍号并选中对应项（见构造处的说明）
     void syncTimeSigFromBackend ();
+
+    //---- 拍号条 / 拍号变化 ---------------------------------------------
+    /// 逐小节推进生成视野内的小节表（算法调用 gui.h 的 ap::buildBars）
+    void rebuildBars (std::vector<ap::BarMark>& out) const;
+    /// 当前视野下拍号条的方块布局（绘制与点击命中共用这一份）
+    std::vector<TsStripBox> tsStripBoxes () const;
+    void drawTimeSigStrip (const std::vector<TsStripBox>& boxes);
+    /// 命中拍号条上的方块 → 返回其小节号
+    bool waveTimeSigBoxAt (int x, int y, int& bar) const;
+    /// 该小节【实际生效】的拍号（含前面小节的变化）+ 本小节是否有变化
+    void timeSigAtBar (int bar, int& beats, int& denom, bool& hasChange) const;
+    /// 不含本小节自身变化的「继承值」（用来判断用户选的其实就是继承值 → 等于取消）
+    void inheritedTimeSigAtBar (int bar, int& beats, int& denom) const;
+    void openTimeSigPopup (int bar);
+    void closeTimeSigPopup ();
+    void applyTimeSigChange (int bar, int beats, int denom);
+    void removeTimeSigChange (int bar);
+    void layoutTsPopup ();
+    /// 弹层可见时，点击先交给它；返回 true = 事件已被吃掉
+    bool onTimeSigPopupClick (int x, int y);
+
     void refreshCache ();
 
     //---- 拖放（XDND）---------------------------------------------------
@@ -401,6 +471,16 @@ private:
     bool m_showNumbers = true;
     int  m_timeSigIndex = 0;
 
+    //---- 拍号条 / 弹层 ----
+    int  m_tsBoxW = 0;              ///< 方块宽（create() 里按 "12/16" 实测，绘制与命中共用）
+    bool m_tsPopupVisible   = false;
+    int  m_tsPopupBar       = 1;
+    int  m_tsPopupBeats     = 4;
+    int  m_tsPopupDenom     = 4;
+    bool m_tsPopupHasChange = false;
+    std::vector<TsPopupBtn> m_tsPopupBtns;   ///< 绘制与命中测试共用同一份
+    Rect m_tsPopupBox = { 0, 0, 0, 0 };      ///< 弹层面板矩形
+
     /// 使用指南覆盖层是否可见。Linux 端整个界面都画在离屏 pixmap 上，
     /// 所以直接在最上层再画一遍就行，不需要 Windows 那种独立子窗口。
     bool m_helpVisible = false;
@@ -448,7 +528,9 @@ private:
         CBg, CWaveBg, CWaveLine, CBarLine, CBeatLine, CNumText,
         CScoreHead, CAudioHead, COffsetSh, CText, CTextDim,
         CBtnFace, CBtnEdge, CBtnDown, CBtnHot, CCheckOn,
-        CBiliPink, CWhite, CCount
+        CBiliPink, CWhite,
+        CTsStripBg, CTsStripSep, CTsBoxBg, CTsSel, CTsRemove,
+        CCount
     };
     unsigned long px (Col c) const { return m_px[static_cast<size_t> (c)]; }
     XftColor* xc (Col c) { return &m_xftCol[static_cast<size_t> (c)]; }
@@ -506,7 +588,8 @@ bool X11View::create (Window parent, int w, int h)
         &kBg, &kWaveBg, &kWaveLine, &kBarLine, &kBeatLine, &kNumText,
         &kScoreHead, &kAudioHead, &kOffsetSh, &kText, &kTextDim,
         &kBtnFace, &kBtnEdge, &kBtnDown, &kBtnHot, &kCheckOn,
-        &kBiliPink, &kWhite
+        &kBiliPink, &kWhite,
+        &kTsStripBg, &kTsStripSep, &kTsBoxBg, &kTsSel, &kTsRemove
     };
     const Colormap cmap = DefaultColormap (m_dpy, m_screen);
     // 注意：Xft 的这几个 API 要的是非 const Visual*，不能写成 const 引用
@@ -572,6 +655,17 @@ bool X11View::create (Window parent, int w, int h)
     }
     if (!m_fontBold)
         m_fontBold = m_font;
+
+    // 拍号方块宽：按实际字体实测最长的那种（"12/16"）。绘制与点击命中都用它 ——
+    // 两处各量一遍、或一处写死常数，迟早会对不上（点偏一点点就打不开面板）。
+    {
+        const char* probe = "12/16";
+        XGlyphInfo ext {};
+        ::XftTextExtentsUtf8 (m_dpy, m_fontSmall,
+                              reinterpret_cast<const FcChar8*> (probe),
+                              static_cast<int> (std::strlen (probe)), &ext);
+        m_tsBoxW = std::max (26, ext.xOff + 10);
+    }
 
     // 离屏缓冲
     m_pixmap = ::XCreatePixmap (m_dpy, m_win,
@@ -1093,6 +1187,11 @@ void X11View::paint ()
     if (m_helpVisible)
         drawHelp (m_xftDraw);
 
+    // 拍号设置弹层比指南更靠上（打开它时已把指南关掉，见 openTimeSigPopup；
+    // 顺序固定成「最后画 = 最上层」，不依赖任何 z 序 —— 铁律 15）。
+    if (m_tsPopupVisible)
+        paintTimeSigPopup (m_xftDraw);
+
     ::XCopyArea (m_dpy, m_pixmap, m_win, m_gc, 0, 0,
                  static_cast<unsigned> (m_w), static_cast<unsigned> (m_h), 0, 0);
     ::XFlush (m_dpy);
@@ -1101,15 +1200,22 @@ void X11View::paint ()
 //------------------------------------------------------------------------------
 void X11View::drawWaveArea (XftDraw* xd)
 {
-    const Rect wave { kWaveX, kWaveY, kWaveW, kWaveH };
-    fillRect (m_pixmap, wave, px (CWaveBg));
+    // 整块区域 = 顶部拍号条 + 下方波形区。拍号条是从区域【内部】让出来的：
+    // 区域矩形（含命中判定用的 kWaveY/kWaveH）不变，波形内容从 waveTop 起画。
+    const Rect full { kWaveX, kWaveY, kWaveW, kWaveH };
+    fillRect (m_pixmap, full, px (CWaveBg));
+
+    const int waveTop = kWaveY + kTsStripH;
+    const int waveBot = kWaveY + kWaveH;
+    const int waveH   = waveBot - waveTop;
 
     if (!m_backend)
         return;
 
     if (!m_backend->hasAudio ())
     {
-        drawTextCentered (xd, wave, "把音频文件拖到这里，或点右上角「打开音频」",
+        drawTextCentered (xd, Rect { kWaveX, waveTop, kWaveW, waveH },
+                          "把音频文件拖到这里，或点右上角「打开音频」",
                           xc (CTextDim), m_font);
         return;
     }
@@ -1121,14 +1227,14 @@ void X11View::drawWaveArea (XftDraw* xd)
     if (!peaks.empty ())
     {
         ::XSetForeground (m_dpy, m_gc, px (CWaveLine));
-        const int mid = kWaveY + kWaveH / 2;
+        const int mid = waveTop + waveH / 2;
         const int n = static_cast<int> (peaks.size ());
         for (int i = 0; i < n && i < kWaveW; ++i)
         {
             float p = peaks[static_cast<size_t> (i)];
             if (p < 0.0f) p = 0.0f;
             if (p > 1.0f) p = 1.0f;
-            const int half = static_cast<int> (p * (kWaveH / 2 - 2));
+            const int half = static_cast<int> (p * (waveH / 2 - 2));
             const int x = kWaveX + i;
             ::XDrawLine (m_dpy, m_pixmap, m_gc, x, mid - half, x, mid + half + 1);
         }
@@ -1137,61 +1243,75 @@ void X11View::drawWaveArea (XftDraw* xd)
     const float offset = m_backend->offsetSec ();
 
     // ---- 小节网格 ----
-    float bpm = m_backend->gridBPM ();
-    if (bpm <= 0.0f && m_tl.tempoValid) bpm = m_tl.bpm;
-    if (bpm <= 0.0f) bpm = 120.0f;
+    // ⚠️ 小节长度【逐小节算】：谱子里有拍号变化时，从变化点起每小节的长度就不一样
+    //    了（4/4 = 2 秒，转 3/4 之后 = 1.5 秒）。用全曲统一的 barSec 铺线，变化点
+    //    之后的小节线会全部错位。推进算法 = gui.h 的 ap::buildBars()，三端共用
+    //    同一份（别在这里另写一套 —— 铁律 9）。
+    std::vector<ap::BarMark> bars;
+    rebuildBars (bars);
 
-    int beats = m_backend->gridBeatsPerBar ();
-    int denom = m_backend->gridBeatDenominator ();
-    if (beats <= 0) beats = 4;
-    if (denom <= 0) denom = 4;
-
-    const double beatSec = (60.0 / bpm) * (4.0 / denom);
-    const double barSec  = beatSec * beats;
-
-    if (m_showGrid && beatSec > 1e-6)
+    if (m_showGrid && !bars.empty ())
     {
         ::XSetLineAttributes (m_dpy, m_gc, 1, LineSolid, CapButt, JoinMiter);
 
-        double s = offset;
-        if (s > m_viewStart)
-            s -= std::floor ((s - m_viewStart) / beatSec) * beatSec;
-        else
-            s += std::ceil ((m_viewStart - s) / beatSec) * beatSec;
+        const double pxPerSec = (m_viewSpan > 0.0)
+                                    ? static_cast<double> (kWaveW) / m_viewSpan : 0.0;
+        const double view1 = m_viewStart + m_viewSpan;
 
-        for (; s <= m_viewStart + m_viewSpan; s += beatSec)
+        for (const ap::BarMark& m : bars)
         {
-            if (s < m_viewStart)
+            // 拍线（虚线）：太密就不画，只留小节线，免得糊成一片
+            if (m.beatSec * pxPerSec >= 5.0)
+            {
+                for (int q = 1; q < m.beats; ++q)
+                {
+                    const double t = m.startSec + q * m.beatSec;
+                    if (t < m_viewStart || t > view1)
+                        continue;
+                    const int x = secToX (t);
+                    if (x < kWaveX || x > kWaveX + kWaveW)
+                        continue;
+                    ::XSetForeground (m_dpy, m_gc, px (CBeatLine));
+                    ::XDrawLine (m_dpy, m_pixmap, m_gc, x, waveTop, x, waveBot);
+                }
+            }
+
+            // 小节线（实线）
+            if (m.startSec < m_viewStart || m.startSec > view1)
                 continue;
-            const int x = secToX (s);
+            const int x = secToX (m.startSec);
             if (x < kWaveX || x > kWaveX + kWaveW)
                 continue;
-
-            const long long beatIndex =
-                static_cast<long long> (std::llround ((s - offset) / beatSec));
-            const bool isBar = (beatIndex % beats) == 0;
-
-            ::XSetForeground (m_dpy, m_gc, isBar ? px (CBarLine) : px (CBeatLine));
-            ::XDrawLine (m_dpy, m_pixmap, m_gc, x, kWaveY, x, kWaveY + kWaveH);
-        }
-
-        if (m_showNumbers && barSec > 1e-6)
-        {
-            long long barNo = static_cast<long long> (std::floor ((m_viewStart - offset) / barSec));
-            for (double b = offset + static_cast<double> (barNo) * barSec;
-                 b <= m_viewStart + m_viewSpan; b += barSec, ++barNo)
-            {
-                if (b < m_viewStart)
-                    continue;
-                const int x = secToX (b);
-                if (x < kWaveX - 20 || x > kWaveX + kWaveW)
-                    continue;
-                char buf[32];
-                std::snprintf (buf, sizeof buf, "%lld", barNo + 1);
-                drawText (xd, x + 2, kWaveY + 12, buf, xc (CNumText), m_fontSmall);
-            }
+            ::XSetForeground (m_dpy, m_gc, px (CBarLine));
+            ::XDrawLine (m_dpy, m_pixmap, m_gc, x, waveTop, x, waveBot);
         }
     }
+
+    // 小节号：独立开关，不依赖网格线。
+    // ⚠️ 小节宽度可变后「每隔 N 个标一个」的固定步长不再适用 —— 改成「与上一个
+    //    标注至少隔开 42px 才标」，宽窄自动适应。
+    if (m_showNumbers && !bars.empty ())
+    {
+        const double view1 = m_viewStart + m_viewSpan;
+        int lastLabelX = -1000000;
+        for (const ap::BarMark& m : bars)
+        {
+            if (m.startSec < m_viewStart || m.startSec > view1)
+                continue;
+            const int x = secToX (m.startSec);
+            if (x < kWaveX - 20 || x > kWaveX + kWaveW)
+                continue;
+            if (x - lastLabelX < 42)
+                continue;
+            lastLabelX = x;
+            char buf[32];
+            std::snprintf (buf, sizeof buf, "%d", m.bar);
+            drawText (xd, x + 2, waveTop + 12, buf, xc (CNumText), m_fontSmall);
+        }
+    }
+
+    // ---- 顶部拍号条 ----
+    drawTimeSigStrip (tsStripBoxes ());
 
     // ---- 谱面播放头（绿）----
     if (m_tl.playheadValid)
@@ -1201,7 +1321,7 @@ void X11View::drawWaveArea (XftDraw* xd)
         {
             ::XSetForeground (m_dpy, m_gc, px (CScoreHead));
             ::XSetLineAttributes (m_dpy, m_gc, 2, LineSolid, CapButt, JoinMiter);
-            ::XDrawLine (m_dpy, m_pixmap, m_gc, x, kWaveY, x, kWaveY + kWaveH);
+            ::XDrawLine (m_dpy, m_pixmap, m_gc, x, waveTop, x, waveBot);
             ::XSetLineAttributes (m_dpy, m_gc, 1, LineSolid, CapButt, JoinMiter);
         }
     }
@@ -1213,7 +1333,7 @@ void X11View::drawWaveArea (XftDraw* xd)
         {
             ::XSetForeground (m_dpy, m_gc, px (CAudioHead));
             ::XSetLineAttributes (m_dpy, m_gc, 2, LineSolid, CapButt, JoinMiter);
-            ::XDrawLine (m_dpy, m_pixmap, m_gc, x, kWaveY, x, kWaveY + kWaveH);
+            ::XDrawLine (m_dpy, m_pixmap, m_gc, x, waveTop, x, waveBot);
             ::XSetLineAttributes (m_dpy, m_gc, 1, LineSolid, CapButt, JoinMiter);
         }
     }
@@ -1225,7 +1345,7 @@ void X11View::drawWaveArea (XftDraw* xd)
         if (x > kWaveX)
         {
             const int right = std::min (x, kWaveX + kWaveW);
-            const Rect sh { kWaveX, kWaveY, right - kWaveX, kWaveH };
+            const Rect sh { kWaveX, waveTop, right - kWaveX, waveH };
             fillRect (m_pixmap, sh, px (COffsetSh));
         }
     }
@@ -1266,7 +1386,7 @@ void X11View::drawWaveArea (XftDraw* xd)
                 if (bx < kWaveX + 2)
                     bx = kWaveX + 2;
 
-                const Rect box { bx, kWaveY + 3, bw, bh };
+                const Rect box { bx, waveTop + 3, bw, bh };
                 fillRect (m_pixmap, box, px (CAudioHead));
                 drawText (xd, box.x + 5, box.y + 3 + m_fontSmall->ascent,
                           warn, xc (CWhite), m_fontSmall);
@@ -1391,6 +1511,7 @@ void X11View::drawHelp (XftDraw* xd)
         "#2  填速度：先填 BPM 和拍号（如 120、4/4）。",
         "     填好了网格小节线才对得上谱子的小节；",
         "     留空 = 自动，跟着乐谱走。",
+        "     谱子中途换拍号时，点波形顶部的拍号块改那一小节（选回原值即取消）。",
         "",
         "#3  对拍子：按住 Ctrl（或 Alt）在波形上左右拖网格，",
         "     把「1」那条小节线拖到音乐的第一拍上（对准波形里的",
@@ -1418,7 +1539,7 @@ void X11View::drawHelp (XftDraw* xd)
 
     fillRect (m_pixmap, Rect { 12, 26, m_w - 24, 1 }, px (CBtnEdge));
 
-    // 22 行 × 15px，从 y=32 起 → 末行文字顶 347、底 ≈362，仍在面板【最小】高 384 之内
+    // 23 行 × 15px，从 y=32 起 → 末行文字顶 362、底 ≈375，仍在面板【最小】高 384 之内
     //（面板可以拉更高，这里按最小高算才是紧的那一档）。
     // ⚠️ 文案再加长就要同步这里（或改小 lh），否则最后一行会被面板底边裁掉。
     const int lh = 15;
@@ -1444,6 +1565,357 @@ void X11View::toggleHelp ()
     m_helpVisible = !m_helpVisible;
     m_hotId = ID_NONE;      // 关掉悬停高亮，避免残留按钮的「热」态
     m_dirty = true;
+}
+
+//------------------------------------------------------------------------------
+// 拍号条 / 拍号变化
+//
+// 逐小节推进的算法在 gui.h 的 ap::buildBars()（三端共用同一份，铁律 9）；
+// 本文件只负责「取当前视野 → 摆方块 → 画 / 命中」。
+//------------------------------------------------------------------------------
+void X11View::rebuildBars (std::vector<ap::BarMark>& out) const
+{
+    out.clear ();
+    if (!m_backend || !(m_viewSpan > 0.0))
+        return;
+
+    float bpm = m_backend->gridBPM ();
+    if (bpm <= 0.0f && m_tl.tempoValid) bpm = m_tl.bpm;
+    if (bpm <= 0.0f) bpm = 120.0f;
+
+    std::vector<ap::TimeSigChange> changes;
+    m_backend->getTimeSigChanges (changes);
+
+    ap::buildBars (m_viewStart, m_viewStart + m_viewSpan,
+                   static_cast<double> (m_backend->offsetSec ()),
+                   60.0 / static_cast<double> (bpm),
+                   m_backend->gridBeatsPerBar (),
+                   m_backend->gridBeatDenominator (),
+                   changes, out);
+}
+
+// 拍号条上的方块布局。
+// ⭐ 绘制与点击命中【共用这一份】—— 两处各算一遍迟早写歪，表现是「点不准」，
+//    是最难查的那类 bug。
+// 方块太挤时跳过中间那些（只保证看得清），与另外两端同一规则。
+std::vector<TsStripBox> X11View::tsStripBoxes () const
+{
+    std::vector<TsStripBox> boxes;
+
+    std::vector<ap::BarMark> bars;
+    rebuildBars (bars);
+    if (bars.empty () || kWaveW <= 0)
+        return boxes;
+
+    const int boxTop   = kWaveY + 3;
+    const int w        = m_tsBoxW > 0 ? m_tsBoxW : 34;
+    const double view1 = m_viewStart + m_viewSpan;
+    int lastRight = -1000000;
+
+    for (const ap::BarMark& m : bars)
+    {
+        if (m.startSec < m_viewStart || m.startSec > view1)
+            continue;
+        const int x = secToX (m.startSec);
+
+        TsStripBox b;
+        b.rc      = Rect { x - w / 2, boxTop, w, kTsBoxH };
+        b.bar     = m.bar;
+        b.beats   = m.beats;
+        b.denom   = m.denom;
+        b.changed = m.changed;
+
+        if (b.rc.x < lastRight + kTsBoxGap)
+            continue;                       // 挤不下 → 跳过
+        if (b.rc.x > kWaveX + kWaveW)
+            break;
+        lastRight = b.rc.x + b.rc.w;
+        boxes.push_back (b);
+    }
+    return boxes;
+}
+
+void X11View::drawTimeSigStrip (const std::vector<TsStripBox>& boxes)
+{
+    // 条的底色 + 下沿分隔线（把「条」和「波形区」分开）
+    fillRect (m_pixmap, Rect { kWaveX, kWaveY, kWaveW, kTsStripH }, px (CTsStripBg));
+    fillRect (m_pixmap, Rect { kWaveX, kWaveY + kTsStripH - 1, kWaveW, 1 }, px (CTsStripSep));
+
+    for (const TsStripBox& b : boxes)
+    {
+        fillRect (m_pixmap, b.rc, b.changed ? px (CTsSel) : px (CTsBoxBg));
+        frameRect (m_pixmap, b.rc, b.changed ? px (CTsSel) : px (CTsStripSep));
+
+        char label[32];
+        std::snprintf (label, sizeof label, "%d/%d", b.beats, b.denom);
+        drawTextCentered (m_xftDraw, b.rc, label,
+                          b.changed ? xc (CText) : xc (CWhite), m_fontSmall);
+    }
+}
+
+bool X11View::waveTimeSigBoxAt (int x, int y, int& bar) const
+{
+    if (!m_backend || !m_backend->hasAudio ())
+        return false;
+    if (y >= kWaveY + kTsStripH)
+        return false;                       // 落在波形区，不是拍号条
+
+    const std::vector<TsStripBox> boxes = tsStripBoxes ();
+    for (const TsStripBox& b : boxes)
+    {
+        // 命中域外扩 3px：方块不高，手抖一两个像素也该点得中
+        const Rect hit { b.rc.x - 3, b.rc.y - 3, b.rc.w + 6, b.rc.h + 6 };
+        if (hit.hit (x, y))
+        {
+            bar = b.bar;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 该小节【实际生效】的拍号 = 「起小节 <= bar」的最后一条变化；没有就用全局默认。
+void X11View::timeSigAtBar (int bar, int& beats, int& denom, bool& hasChange) const
+{
+    int b = m_backend ? m_backend->gridBeatsPerBar () : 4;
+    int d = m_backend ? m_backend->gridBeatDenominator () : 4;
+    if (b < 1) b = 4;
+    if (d < 1) d = 4;
+    bool has = false;
+    std::vector<ap::TimeSigChange> changes;
+    if (m_backend)
+        m_backend->getTimeSigChanges (changes);
+    for (const ap::TimeSigChange& c : changes)
+    {
+        if (c.bar == bar) has = true;
+        if (c.bar <= bar) { b = c.beats; d = c.denom; }
+    }
+    beats = b;
+    denom = d;
+    hasChange = has;
+}
+
+// 不含本小节自身变化的「继承值」。用途：用户把某小节设成跟继承值一样时，
+// 等于「这一小节没有变化」→ 应当取消变化点，而不是留一个橙块却毫无几何作用。
+void X11View::inheritedTimeSigAtBar (int bar, int& beats, int& denom) const
+{
+    int b = m_backend ? m_backend->gridBeatsPerBar () : 4;
+    int d = m_backend ? m_backend->gridBeatDenominator () : 4;
+    if (b < 1) b = 4;
+    if (d < 1) d = 4;
+    std::vector<ap::TimeSigChange> changes;
+    if (m_backend)
+        m_backend->getTimeSigChanges (changes);
+    for (const ap::TimeSigChange& c : changes)
+        if (c.bar < bar) { b = c.beats; d = c.denom; }
+    beats = b;
+    denom = d;
+}
+
+void X11View::openTimeSigPopup (int bar)
+{
+    if (!m_backend || !m_backend->hasAudio ())
+        return;
+
+    int beats = 4, denom = 4;
+    bool has = false;
+    timeSigAtBar (bar, beats, denom, has);
+
+    m_helpVisible = false;      // 别和帮助层叠在一起
+    m_tsPopupVisible   = true;
+    m_tsPopupBar       = bar;
+    m_tsPopupBeats     = beats;
+    m_tsPopupDenom     = denom;
+    m_tsPopupHasChange = has;
+
+    m_hotId = ID_NONE;          // 别让底下的按钮留着「热」态
+    m_dirty = true;
+}
+
+void X11View::closeTimeSigPopup ()
+{
+    if (!m_tsPopupVisible)
+        return;
+    m_tsPopupVisible = false;
+    m_tsPopupBtns.clear ();
+    m_dirty = true;
+}
+
+void X11View::applyTimeSigChange (int bar, int beats, int denom)
+{
+    if (!m_backend)
+        return;
+
+    int inhB = 4, inhD = 4;
+    inheritedTimeSigAtBar (bar, inhB, inhD);
+
+    const bool same = (beats == inhB && denom == inhD);
+    if (same)
+        m_backend->clearTimeSigChange (bar);     // 选的就是继承值 → 等于取消
+    else
+        m_backend->setTimeSigChange (bar, beats, denom);
+
+    // 面板留在屏幕上，方便连着调分子 / 分母
+    m_tsPopupBeats     = beats;
+    m_tsPopupDenom     = denom;
+    m_tsPopupHasChange = !same;
+    m_dirty = true;
+}
+
+void X11View::removeTimeSigChange (int bar)
+{
+    if (!m_backend)
+        return;
+    m_backend->clearTimeSigChange (bar);
+
+    int b = 4, d = 4;
+    bool has = false;
+    timeSigAtBar (bar, b, d, has);
+    m_tsPopupBeats     = b;
+    m_tsPopupDenom     = d;
+    m_tsPopupHasChange = false;
+    m_dirty = true;
+}
+
+// 弹层按钮布局：绘制与命中测试共用同一份（同 tsStripBoxes 的理由）。
+// 面板很窄时按可用宽度收缩按钮 / 间距，保证弹层始终完整可见。
+void X11View::layoutTsPopup ()
+{
+    m_tsPopupBtns.clear ();
+
+    const int padX = 14, labelW = 34, headH = 30, rowH = 30, removeH = 22;
+    const int maxRowW = std::max (120, m_w - 8 - padX * 2 - labelW - 6);
+
+    int btnW = 34;
+    int gap  = 5;
+    int row1Need = kTsBeatChoiceCount * (btnW + gap) - gap;
+    if (row1Need > maxRowW)
+    {
+        gap = 3;
+        row1Need = kTsBeatChoiceCount * (btnW + gap) - gap;
+        if (row1Need > maxRowW)
+            btnW = std::max (16, (maxRowW - gap * (kTsBeatChoiceCount - 1)) / kTsBeatChoiceCount);
+    }
+    const int btnH = 22;
+
+    const int row1W = labelW + 6 + kTsBeatChoiceCount  * (btnW + gap) - gap;
+    const int row2W = labelW + 6 + kTsDenomChoiceCount * (btnW + gap) - gap;
+    const int boxW  = std::max (row1W, row2W) + padX * 2;
+    const int boxH  = headH + rowH * 2 + (m_tsPopupHasChange ? 26 : 0) + 14;
+
+    const int boxX = std::max (0, (m_w - boxW) / 2);
+    const int boxY = std::max (0, (m_h - boxH) / 2);
+    m_tsPopupBox = Rect { boxX, boxY, boxW, boxH };
+
+    const int startX = m_tsPopupBox.x + padX + labelW + 6;
+    int y = m_tsPopupBox.y + headH;
+    int x = startX;
+    for (int i = 0; i < kTsBeatChoiceCount; ++i)
+    {
+        TsPopupBtn b;
+        b.rc    = Rect { x, y, btnW, btnH };
+        b.kind  = 0;
+        b.value = kTsBeatChoices[i];
+        m_tsPopupBtns.push_back (b);
+        x += btnW + gap;
+    }
+    y += rowH;
+    x = startX;
+    for (int i = 0; i < kTsDenomChoiceCount; ++i)
+    {
+        TsPopupBtn b;
+        b.rc    = Rect { x, y, btnW, btnH };
+        b.kind  = 1;
+        b.value = kTsDenomChoices[i];
+        m_tsPopupBtns.push_back (b);
+        x += btnW + gap;
+    }
+    if (m_tsPopupHasChange)
+    {
+        y += rowH;
+        TsPopupBtn b;
+        b.rc    = Rect { m_tsPopupBox.x + padX, y, boxW - padX * 2, removeH };
+        b.kind  = 2;
+        b.value = 0;
+        m_tsPopupBtns.push_back (b);
+    }
+}
+
+void X11View::paintTimeSigPopup (XftDraw* xd)
+{
+    if (!m_backend || !m_backend->hasAudio ())
+        return;
+
+    layoutTsPopup ();
+
+    // 面板底 + 边框。
+    // ⚠️ X11 的 FillRect 没有 alpha 通道，铺不出 macOS / Windows 端那种半透明遮罩
+    //    （那要引 XRender 的 Picture）。这里改用不透明浅色面板：本层本来就是模态的
+    //    —— 弹层可见时任何点击都先交给它（见 onTimeSigPopupClick），不会误触底下控件。
+    fillRect (m_pixmap, m_tsPopupBox, px (CBtnFace));
+    frameRect (m_pixmap, m_tsPopupBox, px (CBtnEdge));
+
+    char title[64];
+    std::snprintf (title, sizeof title, "第 %d 小节  拍号", m_tsPopupBar);
+    drawText (xd, m_tsPopupBox.x + 14, m_tsPopupBox.y + 8 + m_font->ascent,
+              title, xc (CCheckOn), m_fontBold);
+
+    // 两排的行标签（与 layoutTsPopup 的 headH / rowH 对应）
+    drawText (xd, m_tsPopupBox.x + 14,
+              m_tsPopupBox.y + 30 + 4 + m_fontSmall->ascent,
+              "分子", xc (CTextDim), m_fontSmall);
+    drawText (xd, m_tsPopupBox.x + 14,
+              m_tsPopupBox.y + 60 + 4 + m_fontSmall->ascent,
+              "分母", xc (CTextDim), m_fontSmall);
+
+    for (const TsPopupBtn& b : m_tsPopupBtns)
+    {
+        const bool sel = (b.kind == 0 && b.value == m_tsPopupBeats)
+                      || (b.kind == 1 && b.value == m_tsPopupDenom);
+
+        unsigned long bg = px (CWhite);
+        XftColor*     fg = xc (CText);
+        if (b.kind == 2)      { bg = px (CTsRemove); fg = xc (CWhite); }
+        else if (sel)         { bg = px (CTsSel);    fg = xc (CText); }
+
+        fillRect (m_pixmap, b.rc, bg);
+        frameRect (m_pixmap, b.rc, b.kind == 2 ? px (CTsRemove) : px (CBtnEdge));
+
+        if (b.kind == 2)
+        {
+            drawTextCentered (xd, b.rc, "取消该小节的变化", fg, m_fontSmall);
+        }
+        else
+        {
+            char label[32];
+            std::snprintf (label, sizeof label, "%d", b.value);
+            drawTextCentered (xd, b.rc, label, fg, m_fontSmall);
+        }
+    }
+}
+
+// 弹层可见时，点击先交给它。返回 true = 事件已被吃掉（调用方直接 return）。
+bool X11View::onTimeSigPopupClick (int x, int y)
+{
+    if (!m_tsPopupVisible)
+        return false;
+
+    for (const TsPopupBtn& b : m_tsPopupBtns)
+    {
+        const Rect hit { b.rc.x - 2, b.rc.y - 2, b.rc.w + 4, b.rc.h + 4 };
+        if (!hit.hit (x, y))
+            continue;
+        if (b.kind == 0)
+            applyTimeSigChange (m_tsPopupBar, b.value, m_tsPopupDenom);
+        else if (b.kind == 1)
+            applyTimeSigChange (m_tsPopupBar, m_tsPopupBeats, b.value);
+        else
+            removeTimeSigChange (m_tsPopupBar);
+        return true;
+    }
+
+    closeTimeSigPopup ();       // 点面板外 = 关闭
+    return true;
 }
 
 //------------------------------------------------------------------------------
@@ -1500,6 +1972,11 @@ static void openBrandHome ()
 
 void X11View::onButtonPress (int x, int y, unsigned state)
 {
+    // 拍号设置弹层是模态的：它可见时任何点击都先交给它
+    //（点按钮 = 应用；点面板外 = 关闭）。不是弹层时它返回 false，落到下面。
+    if (onTimeSigPopupClick (x, y))
+        return;
+
     // 使用指南铺满整块面板，任何点击都只表示「知道了」。
     if (m_helpVisible)
     {
@@ -1523,6 +2000,19 @@ void X11View::onButtonPress (int x, int y, unsigned state)
     if (rBrand.hit (x, y))
     {
         openBrandHome ();
+        return;
+    }
+
+    // 顶部拍号条：点中方块 = 弹出该小节的拍号设置。
+    // ⚠️ 两种情况都要把点击「吃掉」：命中方块要开面板；没命中也不能掉进下面的
+    //    「平移」分支 —— 否则点一下条会把视野挪走，纯属意外。
+    if (m_backend && m_backend->hasAudio ()
+        && Rect { kWaveX, kWaveY, kWaveW, kTsStripH }.hit (x, y))
+    {
+        int bar = 0;
+        if (waveTimeSigBoxAt (x, y, bar))
+            openTimeSigPopup (bar);
+        m_dirty = true;
         return;
     }
 
@@ -1628,9 +2118,9 @@ void X11View::onMotion (int x, int y, unsigned state)
     }
 
     // hover 高亮
-    // 使用指南挡在上面时不做任何悬停高亮 —— 否则鼠标划过会看到底下的按钮
-    // 隔着说明文字亮起来，像是说明本身就是个按钮。
-    if (m_helpVisible)
+    // 使用指南 / 拍号弹层挡在上面时不做任何悬停高亮 —— 否则鼠标划过会看到底下的
+    // 按钮隔着说明文字亮起来，像是说明本身就是个按钮。
+    if (m_helpVisible || m_tsPopupVisible)
     {
         if (m_hotId != ID_NONE)
         {
@@ -1669,6 +2159,10 @@ void X11View::onScroll (int x, int y, int dir, unsigned state, bool horizontal)
     // 等用户点一下关掉指南，波形已经不在原来的位置了。
     // 关闭只认鼠标点击（见 onButtonPress）。
     if (m_helpVisible)
+        return;
+
+    // 拍号弹层同理：滚轮【只吞不关】—— 也不许漏到下面把波形视野滚走。
+    if (m_tsPopupVisible)
         return;
 
     if (m_browserOpen)
@@ -1898,7 +2392,7 @@ bool X11View::followPlayheadTo (double audioSec, bool allowJump)
 {
     if (!m_followScroll)
         return false;
-    if (m_dragging || m_helpVisible || m_browserOpen)
+    if (m_dragging || m_helpVisible || m_tsPopupVisible || m_browserOpen)
         return false;
     if (!(m_viewSpan > 0.0))
         return false;

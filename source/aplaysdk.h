@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -104,6 +105,11 @@ public:
     int gridBeatDenominator () const override;
     ap::PlugView::Backend::HostTimeline hostTimeline () const override;
 
+    // 拍号变化（按小节覆盖；见 gui.h 的 TimeSigChange）。
+    void getTimeSigChanges (std::vector<ap::TimeSigChange>& out) const override;
+    void setTimeSigChange (int bar, int beats, int denom) override;
+    void clearTimeSigChange (int bar) override;
+
     // 视野状态（见 gui.h 的说明）：编辑器视图每次打开都是新建的，所以
     // 「正看着哪一段 / 放大到多少」必须存在处理器里，重开界面才回得去。
     void setViewState (double startSec, double spanSec) override;
@@ -116,6 +122,7 @@ private:
     void loadCurrentFile ();
     void applyParams ();
     void captureHostTimeline (Steinberg::Vst::ProcessData& data);
+    void clearTimeSigChanges ();   ///< 换音频 / 卸载音频时清空拍号变化表
 
     // 宿主采样率：宿主可能在运行中重新配置（切音频设备），
     // 音频线程会读、宿主线程会写 —— 用原子量避免数据竞争。
@@ -137,6 +144,13 @@ private:
     float m_gridBPM = 0.0f;
     int   m_gridBeats = 4;
     int   m_gridBeatDenominator = 4;   ///< 拍号分母 M（2/4/8/16）
+
+    //---- 拍号变化表（按小节覆盖；见 gui.h 的 TimeSigChange）----
+    // 另一把独立小锁：它只被界面线程与宿主的状态存取线程（setState/getState）
+    // 读写，音频线程从不碰 —— 与 render() 的 try_lock 零交集（铁律 12）。
+    // 用 std::map 而非 vector：按小节查/改/删是主操作，且天然按 bar 升序。
+    mutable std::mutex m_tsMutex;
+    std::map<int, ap::TimeSigChange> m_tsChanges;
 
     //---- 视野状态（关掉编辑器再打开要恢复，见 gui.h）----
     // 单独一把小锁：它只被界面线程读写，与音频线程毫无交集 ——
@@ -175,6 +189,7 @@ private:
         kIdGridBPM = 4,
         kIdGridBeats = 5,
         kIdGridBeatDenominator = 6,
+        kIdTimeSigMap = 7,
         kIdFilePath = 100
     };
 };

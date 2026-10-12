@@ -72,6 +72,12 @@ const int kPanelHMax = 1200;
 const int kWaveW  = 320;      ///< 波形区最小宽（面板缩到下限时用它兜底）
 const int kWaveH  = 118;      ///< 波形区最小高
 
+// 拍号条：波形区【顶部】划出的一条窄带，按小节画「N/M」方块，点方块弹拍号设置。
+// 条高从波形区内部让出（波形区窗口 frame 不变，免得连带动布局与验证器）。
+const int kTsStripH = 22;     ///< 拍号条高（设计像素）
+const int kTsBoxH   = 15;     ///< 方块高（设计像素）
+const int kTsBoxGap = 4;      ///< 相邻方块最小间隔（太挤就跳过不画）
+
 // 分家检测阈值（秒）：正常播放时「音频实际位置」与「谱面位置 + 偏移」只差一个
 // 音频缓冲的量级（几十毫秒）。超过这个值就认为跟随出了问题，波形区右上角会亮
 // 出红色错位徽标，提示用户点「回到播放头」一键修复。
@@ -144,6 +150,18 @@ const TimeSig kTimeSigs[] = {
     { L"6/8",  6, 8 }, { L"7/8",  7, 8 }, { L"9/8",  9, 8 }, { L"12/8", 12, 8 },
 };
 const int kTimeSigCount = static_cast<int> (sizeof (kTimeSigs) / sizeof (kTimeSigs[0]));
+
+// 拍号设置弹层里的按钮：kind 0 = 分子选项，1 = 分母选项，2 = 取消该小节的变化
+struct TsPopupBtn { RECT rc; int kind; int value; };
+
+// 拍号条上的方块（波形区坐标）
+struct TsStripBox { RECT rc; int bar = 1; int beats = 4; int denom = 4; bool changed = false; };
+
+// 候选拍号（与 macOS 端逐值一致）：分子取常用值，分母只留 2/4/8/16
+const int kTsBeatChoices[]  = { 2, 3, 4, 5, 6, 7, 9, 12 };
+const int kTsDenomChoices[] = { 2, 4, 8, 16 };
+const int kTsBeatChoiceCount  = static_cast<int> (sizeof (kTsBeatChoices)  / sizeof (kTsBeatChoices[0]));
+const int kTsDenomChoiceCount = static_cast<int> (sizeof (kTsDenomChoices) / sizeof (kTsDenomChoices[0]));
 
 //------------------------------------------------------------------------------
 std::wstring utf8ToWide (const std::string& s)
@@ -315,6 +333,32 @@ public:
     /// 关闭使用指南（主窗口被点到时回调）。
     void hideHelp ();
     bool helpVisible () const { return m_helpVisible; }
+
+    // ---- 拍号设置弹层（点波形顶部拍号条上的方块后弹出）----
+    /// 弹出第 bar 小节的拍号设置面板。
+    void openTimeSigPopup (int bar);
+    /// 关闭拍号设置面板并恢复控件显示。
+    void closeTimeSigPopup ();
+    /// 把「第 bar 小节起换成 beats/denom」写进后端（等于继承值时自动改为取消变化）。
+    void applyTimeSigChange (int bar, int beats, int denom);
+    /// 取消第 bar 小节处的拍号变化。
+    void removeTimeSigChange (int bar);
+    /// 弹层是否可见。
+    bool tsPopupVisible () const { return m_tsPopupVisible; }
+    /// 自绘弹层（由【主窗口】的 WM_PAINT 调用；dc 原点 = 主窗口客户区左上角）。
+    void paintTimeSigPopup (HDC dc);
+    /// 弹层上的鼠标按下 → 返回 true 表示已处理（含「点在面板外 = 关闭」）。
+    bool onTimeSigPopupClick (int x, int y);
+    /// 弹层里各按钮的矩形（绘制与命中测试共用同一份）。
+    void layoutTsPopup ();
+    /// 波形区坐标 (x,y) 是否落在拍号条某个方块上；命中则回填小节号。
+    bool waveTimeSigBoxAt (int x, int y, int& bar) const;
+    /// 生成当前视野的小节表（拍号变化逐小节推进；算法三端共用于 gui.h）。
+    void rebuildBars (std::vector<ap::BarMark>& out) const;
+    /// 当前视野下拍号条的方块布局（绘制与点击命中共用同一份）。
+    std::vector<TsStripBox> tsStripBoxes () const;
+    /// 画拍号条（画在波形区的离屏 DC 上，dc 原点 = 波形区左上角）。
+    void drawTimeSigStrip (HDC dc, const std::vector<TsStripBox>& boxes);
     void onMouseDown (int x, int y, int mods);
     void onMouseMove (int x, int y, int mods);
     void onMouseUp ();
@@ -388,6 +432,17 @@ private:
     //    「？帮助」看起来像没反应。改成「隐藏所有控件 + 父窗口整块自绘」后，
     //    层级问题从根上不存在（Linux 端一直是这么做的）。
     bool m_helpVisible = false;
+
+    // ---- 拍号设置弹层 ----
+    // ⚠️ 与使用指南同样的理由：不做独立子窗口，而是「隐藏所有控件 + 主窗口整块自绘」
+    //    —— 宿主里的 z 序不可依赖（铁律 15），层级不参与就不会错。
+    bool m_tsPopupVisible   = false;
+    int  m_tsPopupBar       = 1;
+    int  m_tsPopupBeats     = 4;
+    int  m_tsPopupDenom     = 4;
+    bool m_tsPopupHasChange = false;
+    std::vector<TsPopupBtn> m_tsPopupBtns;   ///< 按钮矩形（绘制与命中测试共用同一份）
+    RECT m_tsPopupBox = { 0, 0, 0, 0 };      ///< 弹层面板矩形
     HWND m_openBtn = nullptr, m_zoomOut = nullptr, m_zoomIn = nullptr, m_zoomFit = nullptr;
     HWND m_backBtn = nullptr, m_helpBtn = nullptr, m_gridCheck = nullptr, m_numCheck = nullptr;
     HWND m_bpmEdit = nullptr, m_bpmUp = nullptr, m_bpmDown = nullptr;
@@ -397,6 +452,7 @@ private:
     HWND m_statusLamp = nullptr, m_brand = nullptr, m_fmtLabel = nullptr;
 
     HFONT m_font = nullptr, m_fontSmall = nullptr, m_fontBold = nullptr;
+    int   m_tsBoxW = 0;   ///< 拍号条方块宽（按 "12/16" 实测；createFonts 里算）
     HBRUSH m_bgBrush = nullptr;
 
     PlugView* m_owner = nullptr;      ///< 宿主侧回调（DPI 变化时请求改窗口尺寸）
@@ -541,6 +597,21 @@ void WinView::createFonts ()
     if (!m_font)      m_font = reinterpret_cast<HFONT> (::GetStockObject (DEFAULT_GUI_FONT));
     if (!m_fontSmall) m_fontSmall = m_font;
     if (!m_fontBold)  m_fontBold = m_font;
+
+    // 拍号条方块的宽度：按最宽的拍号文字（"12/16"）【实测】量出来。
+    // 绘制与点击命中必须用同一个宽度，写死一个数字迟早会对不上（字体/DPI 都会变）。
+    m_tsBoxW = 0;
+    if (HDC dc = ::CreateCompatibleDC (nullptr))
+    {
+        HGDIOBJ old = ::SelectObject (dc, m_fontSmall);
+        SIZE sz = {};
+        if (::GetTextExtentPoint32W (dc, L"12/16", 5, &sz))
+            m_tsBoxW = std::max (px (26), static_cast<int> (sz.cx) + px (10));
+        ::SelectObject (dc, old);
+        ::DeleteDC (dc);
+    }
+    if (m_tsBoxW <= 0)
+        m_tsBoxW = px (34);
 }
 
 void WinView::deleteFonts ()
@@ -938,6 +1009,9 @@ void WinView::paint (HDC target, const RECT& rc)
     // 波形/网格/播放头会整块错位裁切。
     const int W = m_waveW;
     const int H = m_waveH;
+    // 波形绘制区的上边界：其上是拍号条（见 kTsStripH 的说明）。
+    // 视图/窗口尺寸都没变，只是把顶部一小条分给了拍号条 —— 所以布局与验证器不用动。
+    const int waveTop = px (kTsStripH);
 
     const int sx = std::max (0, static_cast<int> (rc.left));
     const int sy = std::max (0, static_cast<int> (rc.top));
@@ -980,7 +1054,7 @@ void WinView::paint (HDC target, const RECT& rc)
         ::SetBkMode (dc, TRANSPARENT);
         ::SetTextColor (dc, RGB (150, 150, 160));
         ::SelectObject (dc, m_font);
-        RECT tr = { 0, 0, W, H };
+        RECT tr = { 0, waveTop, W, H };
         ::DrawTextW (dc, L"把音频文件拖到这里", -1, &tr,
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
@@ -993,14 +1067,14 @@ void WinView::paint (HDC target, const RECT& rc)
         {
             HPEN wavePen = ::CreatePen (PS_SOLID, std::max (1, px (1)), RGB (90, 190, 255));
             HPEN oldPen = reinterpret_cast<HPEN> (::SelectObject (dc, wavePen));
-            const int mid = H / 2;
+            const int mid = waveTop + (H - waveTop) / 2;
             const int n = static_cast<int> (peaks.size ());
             for (int i = 0; i < n && i < W; ++i)
             {
                 float p = peaks[static_cast<size_t> (i)];
                 if (p < 0.0f) p = 0.0f;
                 if (p > 1.0f) p = 1.0f;
-                const int half = static_cast<int> (p * (H / 2 - px (2)));
+                const int half = static_cast<int> (p * ((H - waveTop) / 2 - px (2)));
                 ::MoveToEx (dc, i, mid - half, nullptr);
                 ::LineTo (dc, i, mid + half + 1);
             }
@@ -1011,20 +1085,16 @@ void WinView::paint (HDC target, const RECT& rc)
         const float offset = m_backend->offsetSec ();
 
         // ---- 小节网格 ----
-        float bpm = m_backend->gridBPM ();
+        // ⚠️ 小节长度【逐小节算】：谱子里有拍号变化时，从变化点起每小节的长度就
+        //    不一样了（4/4 = 2 秒、转 3/4 之后 = 1.5 秒）。用全曲统一的 barSec 铺线，
+        //    变化点之后的小节线会全部错位。推进算法 = gui.h 的 ap::buildBars()，
+        //    三端共用同一份（别在这里另写一套）。
         const PlugView::Backend::HostTimeline tl0 = m_backend->hostTimeline ();
-        if (bpm <= 0.0f && tl0.tempoValid) bpm = tl0.bpm;
-        if (bpm <= 0.0f) bpm = 120.0f;
 
-        int beats = m_backend->gridBeatsPerBar ();
-        int denom = m_backend->gridBeatDenominator ();
-        if (beats <= 0) beats = 4;
-        if (denom <= 0) denom = 4;
+        std::vector<ap::BarMark> bars;
+        rebuildBars (bars);
 
-        const double beatSec = (60.0 / bpm) * (4.0 / denom);
-        const double barSec = beatSec * beats;
-
-        if (m_showGrid && beatSec > 1e-6)
+        if (m_showGrid && !bars.empty ())
         {
             // ⚠️ PS_DOT / PS_DASH 只支持宽度 1（几何画笔限制），所以拍线不跟着放大，
             // 小节线是实线、可以放大。这样高 DPI 下小节线更醒目，层次反而更清楚。
@@ -1033,53 +1103,71 @@ void WinView::paint (HDC target, const RECT& rc)
             HPEN prevPen = reinterpret_cast<HPEN> (::SelectObject (dc, barPen));
             ::SetBkMode (dc, TRANSPARENT);
 
-            // 从视野内第一条拍线开始
-            double s = offset;
-            if (s > m_viewStart)
-                s -= std::floor ((s - m_viewStart) / beatSec) * beatSec;
-            else
-                s += std::ceil ((m_viewStart - s) / beatSec) * beatSec;
+            const double view1 = m_viewStart + m_viewSpan;
 
-            for (; s <= m_viewStart + m_viewSpan; s += beatSec)
+            for (const ap::BarMark& m : bars)
             {
-                if (s < m_viewStart)
+                // 拍线（虚线）：太密就不画，只留小节线，免得糊成一片
+                if (m.beatSec * static_cast<double> (W) / m_viewSpan >= px (5))
+                {
+                    ::SelectObject (dc, beatPen);
+                    for (int q = 1; q < m.beats; ++q)
+                    {
+                        const double t = m.startSec + q * m.beatSec;
+                        if (t < m_viewStart || t > view1)
+                            continue;
+                        const int x = secToX (t);
+                        if (x < 0 || x > W)
+                            continue;
+                        ::MoveToEx (dc, x, waveTop, nullptr);
+                        ::LineTo (dc, x, H);
+                    }
+                }
+
+                // 小节线（实线）
+                if (m.startSec < m_viewStart || m.startSec > view1)
                     continue;
-                const int x = secToX (s);
+                const int x = secToX (m.startSec);
                 if (x < 0 || x > W)
                     continue;
-
-                const long long beatIndex =
-                    static_cast<long long> (std::llround ((s - offset) / beatSec));
-                const bool isBar = (beatIndex % beats) == 0;
-
-                ::SelectObject (dc, isBar ? barPen : beatPen);
-                ::MoveToEx (dc, x, 0, nullptr);
+                ::SelectObject (dc, barPen);
+                ::MoveToEx (dc, x, waveTop, nullptr);
                 ::LineTo (dc, x, H);
-            }
-
-            if (m_showNumbers && barSec > 1e-6)
-            {
-                ::SelectObject (dc, m_fontSmall);
-                ::SetTextColor (dc, RGB (255, 210, 130));
-                long long barNo = static_cast<long long> (std::floor ((m_viewStart - offset) / barSec));
-                for (double b = offset + static_cast<double> (barNo) * barSec;
-                     b <= m_viewStart + m_viewSpan; b += barSec, ++barNo)
-                {
-                    if (b < m_viewStart)
-                        continue;
-                    const int x = secToX (b);
-                    if (x < -px (20) || x > W)
-                        continue;
-                    wchar_t buf[32];
-                    std::swprintf (buf, 32, L"%lld", barNo + 1);
-                    ::TextOutW (dc, x + px (2), px (2), buf, static_cast<int> (std::wcslen (buf)));
-                }
             }
 
             ::SelectObject (dc, prevPen);
             ::DeleteObject (barPen);
             ::DeleteObject (beatPen);
         }
+
+        // 小节号：独立开关，不依赖网格线。
+        // ⚠️ 小节宽度可变后「固定步长」不再适用 —— 改成「与上一个标注至少隔开
+        //    42 设计像素才标」，宽窄自动适应。
+        if (m_showNumbers && !bars.empty ())
+        {
+            ::SelectObject (dc, m_fontSmall);
+            ::SetTextColor (dc, RGB (255, 210, 130));
+            const double view1 = m_viewStart + m_viewSpan;
+            int lastLabelX = -1000000;
+            for (const ap::BarMark& m : bars)
+            {
+                if (m.startSec < m_viewStart || m.startSec > view1)
+                    continue;
+                const int x = secToX (m.startSec);
+                if (x < -px (20) || x > W)
+                    continue;
+                if (x - lastLabelX < px (42))
+                    continue;
+                lastLabelX = x;
+                wchar_t buf[32];
+                std::swprintf (buf, 32, L"%d", m.bar);
+                ::TextOutW (dc, x + px (2), waveTop + px (2), buf,
+                            static_cast<int> (std::wcslen (buf)));
+            }
+        }
+
+        // ---- 顶部拍号条 ----
+        drawTimeSigStrip (dc, tsStripBoxes ());
 
         // ---- 谱面播放头（绿色）----
         if (tl0.playheadValid)
@@ -1089,7 +1177,7 @@ void WinView::paint (HDC target, const RECT& rc)
             {
                 HPEN p = ::CreatePen (PS_SOLID, std::max (1, px (2)), RGB (80, 220, 120));
                 HPEN op = reinterpret_cast<HPEN> (::SelectObject (dc, p));
-                ::MoveToEx (dc, x, 0, nullptr);
+                ::MoveToEx (dc, x, waveTop, nullptr);
                 ::LineTo (dc, x, H);
                 ::SelectObject (dc, op);
                 ::DeleteObject (p);
@@ -1103,7 +1191,7 @@ void WinView::paint (HDC target, const RECT& rc)
             {
                 HPEN p = ::CreatePen (PS_SOLID, std::max (1, px (2)), RGB (255, 90, 90));
                 HPEN op = reinterpret_cast<HPEN> (::SelectObject (dc, p));
-                ::MoveToEx (dc, x, 0, nullptr);
+                ::MoveToEx (dc, x, waveTop, nullptr);
                 ::LineTo (dc, x, H);
                 ::SelectObject (dc, op);
                 ::DeleteObject (p);
@@ -1116,7 +1204,7 @@ void WinView::paint (HDC target, const RECT& rc)
             const int x = secToX (offset);
             if (x > 0)
             {
-                RECT shade = { 0, 0, x < W ? x : W, H };
+                RECT shade = { 0, waveTop, x < W ? x : W, H };
                 HBRUSH ob = ::CreateSolidBrush (RGB (70, 40, 20));
                 ::FillRect (dc, &shade, ob);
                 ::DeleteObject (ob);
@@ -1155,8 +1243,8 @@ void WinView::paint (HDC target, const RECT& rc)
                     ::GetTextExtentPoint32W (dc, warn,
                                              static_cast<int> (std::wcslen (warn)), &sz);
 
-                    RECT box = { W - sz.cx - px (16), px (4),
-                                 W - px (4), px (4) + sz.cy + px (6) };
+                    RECT box = { W - sz.cx - px (16), waveTop + px (4),
+                                 W - px (4), waveTop + px (4) + sz.cy + px (6) };
                     if (box.left < 0) box.left = 0;
                     HBRUSH bw = ::CreateSolidBrush (RGB (208, 64, 50));
                     ::FillRect (dc, &box, bw);
@@ -1258,6 +1346,7 @@ void WinView::paintHelp (HDC dc)
         L"#2  填速度：先填 BPM 和拍号（如 120、4/4）。",
         L"     填好了网格小节线才对得上谱子的小节；",
         L"     留空 = 自动，跟着乐谱走。",
+        L"     谱子中途换拍号时，点波形顶部的拍号块改那一小节（选回原值即取消）。",
         L"",
         L"#3  对拍子：按住 Ctrl（或 Alt）在波形上左右拖网格，",
         L"     把「1」那条小节线拖到音乐的第一拍上（对准波形里的",
@@ -1299,7 +1388,7 @@ void WinView::paintHelp (HDC dc)
     ::FillRect (dc, &sep, sp);
     ::DeleteObject (sp);
 
-    // 22 行 × 15px，从 y=34 起 → 末行文字顶 349、底 ≈361，仍在面板高 384 之内。
+    // 23 行 × 15px，从 y=34 起 → 末行文字顶 364、底 ≈377，仍在面板高 384 之内。
     // ⚠️ 文案再加长就要同步这里（或改小 lh），否则最后一行会被面板底边裁掉。
     const int lh = px (15);
     int y = px (34);
@@ -1317,6 +1406,372 @@ void WinView::paintHelp (HDC dc)
         }
         y += lh;
     }
+}
+
+//------------------------------------------------------------------------------
+// 拍号条 与 拍号设置弹层
+//
+// 拍号条：波形区顶部一条窄带，每个小节一个「N/M」方块，拍号变化点用橙色高亮。
+// 点方块 → 弹出该小节的拍号设置。
+//
+// ⚠️ 弹层与使用指南同一套做法（隐藏所有控件 + 主窗口整块自绘），理由见 setHelp：
+//    宿主里的 z 序不可依赖（铁律 15），让层级干脆不参与就不会错。
+//------------------------------------------------------------------------------
+void WinView::rebuildBars (std::vector<ap::BarMark>& out) const
+{
+    out.clear ();
+    if (!m_backend || !(m_viewSpan > 0.0))
+        return;
+
+    const PlugView::Backend::HostTimeline tl = m_backend->hostTimeline ();
+    float bpm = m_backend->gridBPM ();
+    if (bpm <= 0.0f && tl.tempoValid) bpm = tl.bpm;
+    if (bpm <= 0.0f) bpm = 120.0f;
+
+    std::vector<ap::TimeSigChange> changes;
+    m_backend->getTimeSigChanges (changes);
+
+    // 逐小节推进（拍号变化处每小节长度不同）—— 算法在 gui.h，三端共用同一份
+    ap::buildBars (m_viewStart, m_viewStart + m_viewSpan,
+                   static_cast<double> (m_backend->offsetSec ()),
+                   60.0 / static_cast<double> (bpm),
+                   m_backend->gridBeatsPerBar (),
+                   m_backend->gridBeatDenominator (),
+                   changes, out);
+}
+
+std::vector<TsStripBox> WinView::tsStripBoxes () const
+{
+    std::vector<TsStripBox> boxes;
+
+    std::vector<ap::BarMark> bars;
+    rebuildBars (bars);
+    if (bars.empty ())
+        return boxes;
+
+    const int boxTop   = px (3);
+    const int boxBot   = boxTop + px (kTsBoxH);
+    const int w        = m_tsBoxW > 0 ? m_tsBoxW : px (34);
+    const double view1 = m_viewStart + m_viewSpan;
+    int lastRight = -1000000;
+
+    for (const ap::BarMark& m : bars)
+    {
+        if (m.startSec < m_viewStart || m.startSec > view1)
+            continue;
+        const int x = secToX (m.startSec);
+
+        TsStripBox b;
+        b.rc      = { x - w / 2, boxTop, x + w / 2, boxBot };
+        b.bar     = m.bar;
+        b.beats   = m.beats;
+        b.denom   = m.denom;
+        b.changed = m.changed;
+
+        if (b.rc.left < lastRight + px (kTsBoxGap))
+            continue;                       // 挤不下 → 跳过（与 mac 端同一规则）
+        if (b.rc.left > m_waveW)
+            break;
+        lastRight = b.rc.right;
+        boxes.push_back (b);
+    }
+    return boxes;
+}
+
+void WinView::drawTimeSigStrip (HDC dc, const std::vector<TsStripBox>& boxes)
+{
+    const int stripH = px (kTsStripH);
+
+    RECT band = { 0, 0, m_waveW, stripH };
+    HBRUSH bg = ::CreateSolidBrush (RGB (22, 22, 22));
+    ::FillRect (dc, &band, bg);
+    ::DeleteObject (bg);
+
+    RECT sep = { 0, stripH - std::max (1, px (1)), m_waveW, stripH };
+    HBRUSH sp = ::CreateSolidBrush (RGB (61, 61, 61));
+    ::FillRect (dc, &sep, sp);
+    ::DeleteObject (sp);
+
+    ::SetBkMode (dc, TRANSPARENT);
+    ::SelectObject (dc, m_fontSmall);
+
+    for (const TsStripBox& b : boxes)
+    {
+        HBRUSH br = ::CreateSolidBrush (b.changed ? RGB (250, 173, 51) : RGB (77, 77, 77));
+        ::FillRect (dc, &b.rc, br);
+        ::DeleteObject (br);
+
+        ::SetTextColor (dc, b.changed ? RGB (26, 26, 26) : RGB (230, 230, 230));
+        wchar_t label[32];
+        std::swprintf (label, 32, L"%d/%d", b.beats, b.denom);
+        RECT tr = b.rc;
+        ::DrawTextW (dc, label, -1, &tr,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+}
+
+bool WinView::waveTimeSigBoxAt (int x, int y, int& bar) const
+{
+    if (!m_backend || !m_backend->hasAudio ())
+        return false;
+    if (y >= px (kTsStripH))
+        return false;                       // 落在波形区，不是拍号条
+
+    const std::vector<TsStripBox> boxes = tsStripBoxes ();
+    for (const TsStripBox& b : boxes)
+    {
+        RECT hit = b.rc;
+        ::InflateRect (&hit, px (3), px (3));
+        if (x >= hit.left && x < hit.right && y >= hit.top && y < hit.bottom)
+        {
+            bar = b.bar;
+            return true;
+        }
+    }
+    return false;
+}
+
+//---- 弹层 ----------------------------------------------------------------
+void WinView::openTimeSigPopup (int bar)
+{
+    if (!m_backend || !m_backend->hasAudio ())
+        return;
+
+    // 该小节【实际生效】的拍号 = 「起小节 <= bar」的最后一条变化；没有就用全局默认
+    int  beats = m_backend->gridBeatsPerBar ();
+    int  denom = m_backend->gridBeatDenominator ();
+    if (beats < 1) beats = 4;
+    if (denom < 1) denom = 4;
+    bool has = false;
+    std::vector<ap::TimeSigChange> changes;
+    m_backend->getTimeSigChanges (changes);
+    for (const ap::TimeSigChange& c : changes)
+    {
+        if (c.bar == bar) has = true;
+        if (c.bar <= bar) { beats = c.beats; denom = c.denom; }
+    }
+
+    setHelp (false);                        // 别和指南叠在一起
+    m_tsPopupVisible   = true;
+    m_tsPopupBar       = bar;
+    m_tsPopupBeats     = beats;
+    m_tsPopupDenom     = denom;
+    m_tsPopupHasChange = has;
+
+    showControls (false);                   // 层级不参与：藏掉所有控件，由主窗口整块自绘
+    ::SetFocus (m_hwnd);
+    ::InvalidateRect (m_hwnd, nullptr, TRUE);
+}
+
+void WinView::closeTimeSigPopup ()
+{
+    if (!m_tsPopupVisible)
+        return;
+    m_tsPopupVisible = false;
+    m_tsPopupBtns.clear ();
+    showControls (true);
+    if (m_wave)
+        ::InvalidateRect (m_wave, nullptr, TRUE);   // 恢复波形区（含拍号条）
+    ::InvalidateRect (m_hwnd, nullptr, TRUE);
+}
+
+void WinView::applyTimeSigChange (int bar, int beats, int denom)
+{
+    if (!m_backend)
+        return;
+
+    // 「设成跟继承值一样」= 这一小节其实没有变化 → 直接取消变化点，
+    // 免得留下一个橙色方块却毫无几何作用。
+    int inhB = m_backend->gridBeatsPerBar ();
+    int inhD = m_backend->gridBeatDenominator ();
+    if (inhB < 1) inhB = 4;
+    if (inhD < 1) inhD = 4;
+    std::vector<ap::TimeSigChange> changes;
+    m_backend->getTimeSigChanges (changes);
+    for (const ap::TimeSigChange& c : changes)
+        if (c.bar < bar) { inhB = c.beats; inhD = c.denom; }
+
+    const bool same = (beats == inhB && denom == inhD);
+    if (same)
+        m_backend->clearTimeSigChange (bar);
+    else
+        m_backend->setTimeSigChange (bar, beats, denom);
+
+    m_tsPopupBeats     = beats;
+    m_tsPopupDenom     = denom;
+    m_tsPopupHasChange = !same;
+
+    if (m_wave)
+        ::InvalidateRect (m_wave, nullptr, FALSE);
+    ::InvalidateRect (m_hwnd, nullptr, TRUE);
+}
+
+void WinView::removeTimeSigChange (int bar)
+{
+    if (!m_backend)
+        return;
+    m_backend->clearTimeSigChange (bar);
+
+    int beats = m_backend->gridBeatsPerBar ();
+    int denom = m_backend->gridBeatDenominator ();
+    if (beats < 1) beats = 4;
+    if (denom < 1) denom = 4;
+    std::vector<ap::TimeSigChange> changes;
+    m_backend->getTimeSigChanges (changes);
+    for (const ap::TimeSigChange& c : changes)
+        if (c.bar <= bar) { beats = c.beats; denom = c.denom; }
+
+    m_tsPopupBeats     = beats;
+    m_tsPopupDenom     = denom;
+    m_tsPopupHasChange = false;
+
+    if (m_wave)
+        ::InvalidateRect (m_wave, nullptr, FALSE);
+    ::InvalidateRect (m_hwnd, nullptr, TRUE);
+}
+
+void WinView::layoutTsPopup ()
+{
+    m_tsPopupBtns.clear ();
+
+    RECT client = {};
+    ::GetClientRect (m_hwnd, &client);
+
+    const int padX = px (14), btnW = px (34), btnH = px (22), gap = px (5);
+    const int labelW = px (34), headH = px (30), rowH = px (30), removeH = px (22);
+
+    const int row1W = labelW + px (6) + kTsBeatChoiceCount  * (btnW + gap) - gap;
+    const int row2W = labelW + px (6) + kTsDenomChoiceCount * (btnW + gap) - gap;
+    const int boxW  = std::max (row1W, row2W) + padX * 2;
+    const int boxH  = headH + rowH * 2 + (m_tsPopupHasChange ? px (26) : 0) + px (14);
+
+    const int boxX = std::max (0, (client.right - boxW) / 2);
+    const int boxY = std::max (0, (client.bottom - boxH) / 2);
+    m_tsPopupBox = { boxX, boxY, boxX + boxW, boxY + boxH };
+
+    const int startX = m_tsPopupBox.left + padX + labelW + px (6);
+    int y = m_tsPopupBox.top + headH;
+    int x = startX;
+    for (int i = 0; i < kTsBeatChoiceCount; ++i)
+    {
+        TsPopupBtn b {};
+        b.rc    = { x, y, x + btnW, y + btnH };
+        b.kind  = 0;
+        b.value = kTsBeatChoices[i];
+        m_tsPopupBtns.push_back (b);
+        x += btnW + gap;
+    }
+    y += rowH;
+    x = startX;
+    for (int i = 0; i < kTsDenomChoiceCount; ++i)
+    {
+        TsPopupBtn b {};
+        b.rc    = { x, y, x + btnW, y + btnH };
+        b.kind  = 1;
+        b.value = kTsDenomChoices[i];
+        m_tsPopupBtns.push_back (b);
+        x += btnW + gap;
+    }
+    if (m_tsPopupHasChange)
+    {
+        y += rowH;
+        TsPopupBtn b {};
+        b.rc    = { m_tsPopupBox.left + padX, y, m_tsPopupBox.right - padX, y + removeH };
+        b.kind  = 2;
+        b.value = 0;
+        m_tsPopupBtns.push_back (b);
+    }
+}
+
+void WinView::paintTimeSigPopup (HDC dc)
+{
+    RECT client = {};
+    ::GetClientRect (m_hwnd, &client);
+    layoutTsPopup ();
+
+    // ⚠️ GDI 的 FillRect 没有 alpha 通道。要半透明遮罩就得引 msimg32/AlphaBlend，
+    //    本端没有实机验证条件（CI 只编不跑），不值得为一个纯观感引入新依赖 ——
+    //    改用不透明底色：这一层本来就是模态的，控件已被 showControls(false) 藏起来。
+    HBRUSH backdrop = ::CreateSolidBrush (RGB (44, 46, 52));
+    ::FillRect (dc, &client, backdrop);
+    ::DeleteObject (backdrop);
+
+    HBRUSH boxBg = ::CreateSolidBrush (RGB (41, 41, 44));
+    ::FillRect (dc, &m_tsPopupBox, boxBg);
+    ::DeleteObject (boxBg);
+    HBRUSH border = ::CreateSolidBrush (RGB (132, 132, 140));
+    ::FrameRect (dc, &m_tsPopupBox, border);
+    ::DeleteObject (border);
+
+    ::SetBkMode (dc, TRANSPARENT);
+
+    ::SelectObject (dc, m_font);
+    ::SetTextColor (dc, RGB (250, 184, 77));
+    wchar_t title[64];
+    std::swprintf (title, 64, L"第 %d 小节  拍号", m_tsPopupBar);
+    ::TextOutW (dc, m_tsPopupBox.left + px (14), m_tsPopupBox.top + px (8), title,
+                static_cast<int> (std::wcslen (title)));
+
+    ::SelectObject (dc, m_fontSmall);
+    ::SetTextColor (dc, RGB (158, 158, 158));
+    ::TextOutW (dc, m_tsPopupBox.left + px (14), m_tsPopupBox.top + px (34), L"分子", 2);
+    ::TextOutW (dc, m_tsPopupBox.left + px (14), m_tsPopupBox.top + px (64), L"分母", 2);
+
+    for (const TsPopupBtn& b : m_tsPopupBtns)
+    {
+        const bool sel = (b.kind == 0 && b.value == m_tsPopupBeats)
+                      || (b.kind == 1 && b.value == m_tsPopupDenom);
+        COLORREF fill, text;
+        if (b.kind == 2)      { fill = RGB (107, 51, 51); text = RGB (235, 235, 235); }
+        else if (sel)         { fill = RGB (250, 173, 51); text = RGB (26, 26, 26); }
+        else                  { fill = RGB (82, 82, 82);   text = RGB (235, 235, 235); }
+
+        HBRUSH br = ::CreateSolidBrush (fill);
+        ::FillRect (dc, &b.rc, br);
+        ::DeleteObject (br);
+
+        ::SelectObject (dc, m_fontSmall);
+        ::SetTextColor (dc, text);
+        RECT tr = b.rc;
+        if (b.kind == 2)
+        {
+            ::DrawTextW (dc, L"取消该小节的变化", -1, &tr,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        else
+        {
+            wchar_t label[32];
+            std::swprintf (label, 32, L"%d", b.value);
+            ::DrawTextW (dc, label, -1, &tr,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
+}
+
+bool WinView::onTimeSigPopupClick (int x, int y)
+{
+    if (!m_tsPopupVisible)
+        return false;
+
+    layoutTsPopup ();
+    for (const TsPopupBtn& b : m_tsPopupBtns)
+    {
+        RECT hit = b.rc;
+        ::InflateRect (&hit, px (2), px (2));
+        if (x < hit.left || x >= hit.right || y < hit.top || y >= hit.bottom)
+            continue;
+
+        if (b.kind == 0)
+            applyTimeSigChange (m_tsPopupBar, b.value, m_tsPopupDenom);
+        else if (b.kind == 1)
+            applyTimeSigChange (m_tsPopupBar, m_tsPopupBeats, b.value);
+        else
+            removeTimeSigChange (m_tsPopupBar);
+        return true;
+    }
+
+    closeTimeSigPopup ();       // 点面板外 = 关闭
+    return true;
 }
 
 //------------------------------------------------------------------------------
@@ -1421,9 +1876,19 @@ bool WinView::waveHitTest (int screenX, int screenY) const
 
 void WinView::onMouseDown (int x, int y, int mods)
 {
-    (void) y;
     if (!m_backend || !m_backend->hasAudio ())
         return;
+
+    // 顶部拍号条：点中方块 → 弹出该小节的拍号设置。
+    // ⚠️ 命中与没命中都要把这次点击吃掉 —— 否则会掉进下面的拖动分支，
+    //    点一下拍号条就把视野挪走了（用户会以为是 bug）。
+    if (y < px (kTsStripH))
+    {
+        int bar = 0;
+        if (waveTimeSigBoxAt (x, y, bar))
+            openTimeSigPopup (bar);
+        return;
+    }
 
     // ⭐ 让波形区拿到键盘焦点：滚轮消息是发给焦点窗口的，不点一下它，
     //    滚轮只会落到「上一次点过的控件」上（比如 BPM 输入框）。
@@ -2139,7 +2604,9 @@ LRESULT CALLBACK mainProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     WinView* v = viewOf (hwnd);
     // 使用指南可见时，这一层由主窗口整块自绘（见 setHelp），
     // 所有控件都已经被隐藏，所以下面这些判断不会有「盖住控件」的副作用。
-    const bool help = (v && v->helpVisible ());
+    const bool help  = (v && v->helpVisible ());
+    // 拍号设置弹层同理：控件已被藏起来，主窗口整块自绘（理由同 setHelp）。
+    const bool popup = (v && v->tsPopupVisible ());
 
     switch (msg)
     {
@@ -2162,6 +2629,15 @@ LRESULT CALLBACK mainProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         case WM_PAINT:
+            if (popup)
+            {
+                PAINTSTRUCT ps;
+                HDC dc = ::BeginPaint (hwnd, &ps);
+                v->paintTimeSigPopup (dc);
+                ::EndPaint (hwnd, &ps);
+                // ⚠️ 不能落到 DefWindowProc：它会用类的背景刷把弹层擦掉。
+                return 0;
+            }
             if (help)
             {
                 PAINTSTRUCT ps;
@@ -2173,12 +2649,19 @@ LRESULT CALLBACK mainProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;              // 平时走默认流程（用 COLOR_BTNFACE 擦背景）
         case WM_ERASEBKGND:
-            if (help)
-                return 1;       // 背景由 paintHelp 整块填，顺便免掉闪烁
+            if (help || popup)
+                return 1;       // 背景由 paintHelp / paintTimeSigPopup 整块填，顺便免掉闪烁
             break;
         case WM_LBUTTONDOWN:
         case WM_RBUTTONDOWN:
         case WM_MBUTTONDOWN:
+            // 拍号设置弹层：只有左键点按钮/面板外才有意义，右键与中键一律吞掉。
+            if (popup)
+            {
+                if (msg == WM_LBUTTONDOWN)
+                    v->onTimeSigPopupClick (GET_X_LPARAM (lp), GET_Y_LPARAM (lp));
+                return 0;
+            }
             // 指南铺满整块面板、没有任何可交互元素，点任意处都只该是「知道了」。
             if (help)
             {
@@ -2198,7 +2681,10 @@ LRESULT CALLBACK mainProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // ⚠️ 指南可见时滚轮【只吞掉、不关闭】：指南是固定的一屏文字，但用户
             //    习惯性会往下滚一滚看看还有没有，一滚就关 = 用户报的「刚进去就没了」。
             //    关闭只认鼠标按下（见下面 WM_LBUTTONDOWN 那组）。
-            if (help)
+            // ⚠️ 指南 / 拍号弹层可见时滚轮【只吞掉、不关闭】：它们是固定的一屏内容，
+            //    但用户习惯性会往下滚一滚看看还有没有，一滚就关 = 用户报的「刚进去就没了」。
+            //    关闭只认鼠标按下（见上面 WM_LBUTTONDOWN 那组）。
+            if (help || popup)
                 return 0;
             if (v)
             {

@@ -19,6 +19,7 @@
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/gui/iplugview.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -48,6 +49,118 @@ using Steinberg::IPlugView;
 //    改地址就改这一行。
 //------------------------------------------------------------------------------
 inline constexpr const char* kBrandHomeUrl = "https://space.bilibili.com/65320474";
+
+//------------------------------------------------------------------------------
+// 拍号变化（按小节覆盖）与共用的小节推进算法
+//
+// 背景：谱子里出现拍号变化时（前 8 小节 4/4、之后转 3/4），均匀网格从变化点起
+// 就再也对不上谱子的小节 —— 后面所有小节线都会错位。所以网格必须「逐小节推进」：
+// 每个小节用【当时生效】的拍号算自己的长度，而不是全曲一个长度。
+//
+// ⭐ 这套推进算法三端共用（只此一份）。以前「同一语义在三端各写一遍」已经栽过
+//    一次（Win/Linux 漏加起始偏移，见 MEMORY 铁律 9），这次干脆不给自己机会。
+//------------------------------------------------------------------------------
+struct TimeSigChange
+{
+    int bar   = 1;   ///< 从第几小节（显示小节号，1 起）开始生效
+    int beats = 4;   ///< 分子 N（每小节几拍）
+    int denom = 4;   ///< 分母 M（以几分音符为一拍；2/4/8/16）
+};
+
+/// 一个小节的网格几何（时间轴与音频同一坐标系：第 1 小节起点 = 起始偏移）
+struct BarMark
+{
+    int    bar      = 1;      ///< 显示小节号（1 起；时间轴最前面可能是 0 或负数）
+    double startSec = 0.0;    ///< 小节起点（秒）
+    double beatSec  = 0.5;    ///< 该小节每拍时长 = quarterSec × (4/denom)
+    int    beats    = 4;
+    int    denom    = 4;
+    bool   changed  = false;  ///< 该小节是不是拍号变化点
+};
+
+/// 拍号分母只允许这几个值；其余一律回落到 fallback。
+inline int normalizeBeatDenom (int denom, int fallback)
+{
+    return (denom == 2 || denom == 4 || denom == 8 || denom == 16) ? denom : fallback;
+}
+
+/// 拍号分子合法区间（与后端 setGridBeatsPerBar 的钳制范围一致）。
+inline int normalizeBeatsPerBar (int beats, int fallback)
+{
+    return (beats >= 1 && beats <= 32) ? beats : fallback;
+}
+
+// 逐小节推进，生成覆盖 [minSec, maxSec] 的小节表（按 startSec 升序）。
+//   · 第 1 小节起点 = offsetSec，之后每小节按【当时生效】的拍号各自累加；
+//   · changes 必须按 bar 升序（后端返回时已保证）；
+//   · 第 1 小节之前（小节号 <= 0）一律用默认拍号 —— 变化只可能从第 1 小节起。
+// quarterSec = 一个四分音符的时长 = 60 / BPM。
+inline void buildBars (double minSec, double maxSec, double offsetSec, double quarterSec,
+                       int defBeats, int defDenom,
+                       const std::vector<TimeSigChange>& changes,
+                       std::vector<BarMark>& out)
+{
+    out.clear ();
+    if (!(quarterSec > 0.0) || !(maxSec > minSec)) return;
+
+    defBeats = normalizeBeatsPerBar (defBeats, 4);
+    defDenom = normalizeBeatDenom (defDenom, 4);
+
+    const double defBeatSec = quarterSec * (4.0 / static_cast<double> (defDenom));
+    // 上限只是防御性的（视野已被钳制，正常远达不到）
+    const int kGuard = 100000;
+
+    // ---- 第 1 小节起，逐小节向后推进 ----
+    int    curBeats = defBeats;
+    int    curDenom = defDenom;
+    std::size_t ci  = 0;
+    double t        = offsetSec;
+    for (int n = 1; t <= maxSec && n <= kGuard; ++n)
+    {
+        bool changed = false;
+        // 把所有「起小节 <= 当前小节」的变化都吃掉（ci 只前进，n 单调递增）
+        while (ci < changes.size () && changes[ci].bar <= n)
+        {
+            curBeats = normalizeBeatsPerBar (changes[ci].beats, defBeats);
+            curDenom = normalizeBeatDenom (changes[ci].denom, defDenom);
+            if (changes[ci].bar == n) changed = true;
+            ++ci;
+        }
+        if (t >= minSec)
+        {
+            BarMark m;
+            m.bar      = n;
+            m.startSec = t;
+            m.beats    = curBeats;
+            m.denom    = curDenom;
+            m.beatSec  = quarterSec * (4.0 / static_cast<double> (curDenom));
+            m.changed  = changed;
+            out.push_back (m);
+        }
+        // ⚠️ 即便本小节不在视野内也必须继续累加 —— 否则后面小节的起点全错
+        t += quarterSec * (4.0 / static_cast<double> (curDenom)) * curBeats;
+    }
+
+    // ---- 第 1 小节之前：默认拍号向前铺（小节号 0, -1, -2 …）----
+    t = offsetSec;
+    for (int k = 0; k >= -kGuard; --k)
+    {
+        t -= defBeatSec * defBeats;
+        if (t < minSec) break;
+        BarMark m;
+        m.bar      = k;
+        m.startSec = t;
+        m.beats    = defBeats;
+        m.denom    = defDenom;
+        m.beatSec  = defBeatSec;
+        m.changed  = false;
+        out.push_back (m);
+    }
+
+    std::sort (out.begin (), out.end (),
+               [] (const BarMark& a, const BarMark& b) { return a.startSec < b.startSec; });
+}
+
 
 // 注意：不要显式再继承 Steinberg::FUnknown —— IPlugView 已经继承它，
 // 重复继承会触发 MSVC C4584（base-class already a base-class）。
@@ -127,6 +240,24 @@ public:
         // 新载入的默认视野（见各端 kDefaultViewSpanSec）。
         virtual void setViewState (double startSec, double spanSec) = 0;
         virtual void getViewState (double& startSec, double& spanSec) const = 0;
+
+        //---- 拍号变化（按小节覆盖；见上面的 TimeSigChange）------------------------
+        // 和 BPM / 拍号一样属于「用户操作产生、关掉界面后仍要有意义」的状态，
+        // 所以存在后端里、随乐谱一起保存（铁律 11）。
+        //
+        // 三个方法都给默认实现（= 「没有任何变化」）：这样各端的空后端不必为
+        // 用不到的能力补三行空函数，只有真正的后端才覆盖它们。
+        virtual void getTimeSigChanges (std::vector<TimeSigChange>& out) const
+        {
+            out.clear ();
+        }
+        /// 设置「从第 bar 小节起换拍号」。bar < 1 视为第 1 小节。
+        virtual void setTimeSigChange (int bar, int beats, int denom)
+        {
+            (void) bar; (void) beats; (void) denom;
+        }
+        /// 取消第 bar 小节处的拍号变化（该小节改回沿用最近一次的拍号）。
+        virtual void clearTimeSigChange (int bar) { (void) bar; }
 
         //---- 实时健康探针（可选实现，默认 0）------------------------------------
         // 「音频线程因抢不到播放器的锁而整块丢弃音频」的累计次数。

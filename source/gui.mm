@@ -106,6 +106,13 @@ static const CGFloat kPanelWDef = 640.0;    ///< 默认宽度
 static const CGFloat kPanelWMin = 640.0;
 static const CGFloat kPanelWMax = 1700.0;   ///< 与 Windows / Linux 同一上限
 
+// 拍号条：波形视图【顶部】划出的一条窄带，按小节画「N/M」方块，点击方块
+// 弹出拍号设置面板。条高从波形视图内部让出（视图 frame 不变）——
+// 面板高度固定 384、每一行的纵向位置都是按它排的，动 frame 会连带动布局与验证器。
+static const CGFloat kTsStripH = 22.0;      ///< 拍号条高度（pt）
+static const CGFloat kTsBoxH   = 15.0;      ///< 方块高度（pt）
+static const CGFloat kTsBoxGap = 4.0;       ///< 相邻方块最小间隔（太挤就跳过不画）
+
 // ObjC++ 的 ivar 只能是指针/标量，C++ 容器要包在结构体里再放指针
 struct WaveState
 {
@@ -158,10 +165,13 @@ struct WaveState
 
 @class WaveformView;
 @class HelpOverlayView;   // 定义在文件后半段（用覆盖层做使用指南，见 HelpOverlayView）
+@class TimeSigPopupView;  // 定义在文件后半段（拍号设置覆盖层）
 
 // 波形视图 → 面板的回调（面板是父视图，生命期必比子视图长）
 @protocol WavePanel <NSObject>
 - (void)offsetChangedExternally:(double)sec;
+/// 用户点了拍号条上第 bar 小节的方块 → 面板弹出该小节的拍号设置面板
+- (void)openTimeSigPopupForBar:(int)bar;
 @end
 
 // 同理：GUIView 的状态也打包
@@ -182,6 +192,7 @@ struct PanelState
     NSButton* numCheck = nil;
     NSButton* playBtn = nil;
     HelpOverlayView* helpOverlay = nil;   ///< 覆盖整块面板的使用指南（默认隐藏）
+    TimeSigPopupView* tsPopup    = nil;   ///< 拍号设置覆盖层（默认隐藏）
     NSTimer* timer = nil;
     bool timelineLogged = false;     ///< 宿主时间轴信息只记一次日志
     bool beatsUserSet = false;       ///< 用户手动改过拍号后就不再自动跟随乐谱
@@ -215,6 +226,7 @@ struct PanelState
 struct GridInfo
 {
     double beatSec  = 0.5;
+    double quarter  = 0.5;    ///< 一个四分音符的时长 = 60/bpm（拍号变化时要按小节重算）
     int    beats    = 4;      ///< 拍号分子 N（每小节拍数）
     int    denom    = 4;      ///< 拍号分母 M（2/4/8/16）
     double bpm      = 120.0;
@@ -256,7 +268,79 @@ static GridInfo gridInfoFor (ap::PlugView::Backend* b)
     // 时长 = (60/bpm) × (4/M)。例如 12/8 拍号下，每拍（八分音符）时长是
     // 四分音符的一半。
     g.beatSec = (60.0 / g.bpm) * (4.0 / static_cast<double> (g.denom));
+    g.quarter = 60.0 / g.bpm;
     return g;
+}
+
+//------------------------------------------------------------------------------
+// 取视野覆盖到的小节表（拍号条与网格线都用它）。
+//
+// 逐小节推进的算法本身在 gui.h 的 ap::buildBars() —— 三端共用同一份，
+// 免得「同一语义各写一遍」写歪（铁律 9）。
+//------------------------------------------------------------------------------
+static void visibleBarsFor (ap::PlugView::Backend* b, double viewStart, double viewLen,
+                            std::vector<ap::BarMark>& out)
+{
+    out.clear ();
+    if (!b || !(viewLen > 0.0)) return;
+    const GridInfo g = gridInfoFor (b);
+    std::vector<ap::TimeSigChange> changes;
+    b->getTimeSigChanges (changes);
+    ap::buildBars (viewStart, viewStart + viewLen, (double) b->offsetSec (), g.quarter,
+                   g.beats, g.denom, changes, out);
+}
+
+//------------------------------------------------------------------------------
+// 拍号条上方块的布局。
+//
+// ⭐ 画与命中测试【共用这一份】—— 两处各算一遍迟早会写歪（点击位置与画出来的
+//    方块对不上，是最难查的那类 bug）。
+//
+// 方块太挤时会跳过中间那些（只保证看得清）。这与参考工具的做法一致：视野很宽时
+// 每个小节都画只会糊成一片。
+//------------------------------------------------------------------------------
+struct TsBox
+{
+    NSRect  rect  = NSZeroRect;
+    int     bar   = 1;
+    int     beats = 4;
+    int     denom = 4;
+    bool    changed = false;
+};
+
+static void layoutTsBoxes (const std::vector<ap::BarMark>& bars, NSRect full,
+                           double v0, double v1, std::vector<TsBox>& out)
+{
+    out.clear ();
+    if (bars.empty () || !(v1 > v0) || NSWidth (full) <= 0.0) return;
+
+    const double  pxPerSec = (double) NSWidth (full) / (v1 - v0);
+    const CGFloat boxY     = NSMinY (full) + 3.0;
+
+    NSDictionary* attrs = @{ NSFontAttributeName : [NSFont systemFontOfSize:9] };
+    CGFloat lastRight = -1.0e9;
+
+    for (const ap::BarMark& m : bars)
+    {
+        if (m.startSec < v0 || m.startSec > v1) continue;
+        const CGFloat x = NSMinX (full) + (CGFloat) ((m.startSec - v0) * pxPerSec);
+
+        NSString* label = [NSString stringWithFormat:@"%d/%d", m.beats, m.denom];
+        const CGFloat tw = [label sizeWithAttributes:attrs].width;
+        const CGFloat w  = std::max<CGFloat> (26.0, tw + 10.0);
+
+        TsBox b;
+        b.rect    = NSMakeRect (x - w / 2.0, boxY, w, kTsBoxH);
+        b.bar     = m.bar;
+        b.beats   = m.beats;
+        b.denom   = m.denom;
+        b.changed = m.changed;
+
+        if (b.rect.origin.x < lastRight + kTsBoxGap) continue;   // 挤不下 → 跳过
+        if (b.rect.origin.x > NSMaxX (full)) break;
+        lastRight = NSMaxX (b.rect);
+        out.push_back (b);
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -330,6 +414,9 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
 - (void)refreshPeaks;
 - (void)samplePeaksIfNeeded;   ///< 仅取样不重绘（drawRect 内部用，避免重绘循环）
 - (void)invalidatePeaks;
+- (void)drawTimeSigStripIn:(NSRect)full bars:(std::vector<ap::BarMark>&)bars
+                     view0:(double)v0 view1:(double)v1;
+- (std::vector<TsBox>)timeSigBoxes;   ///< 当前视野下拍号条的方块布局（点击命中与断言用）
 - (void)fitAll;
 - (void)zoomBy:(double)factor aroundX:(CGFloat)x;
 - (void)zoomToSpan:(double)spanSec fromStart:(double)startSec;
@@ -627,9 +714,121 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     _st->peaksDirty = true;
 }
 
+//------------------------------------------------------------------------------
+// 拍号条：布局与绘制
+//
+// 条在波形视图顶部，每个小节一个「N/M」方块；拍号变化点用橙色高亮。
+// 点击方块 → 面板弹出该小节的拍号设置（见 TimeSigPopupView）。
+//------------------------------------------------------------------------------
+- (std::vector<TsBox>)timeSigBoxes
+{
+    std::vector<TsBox> boxes;
+    const NSRect full = [self bounds];
+    const double dur = _st->backend->durationSec ();
+    const double vl  = (_st->viewLen > 0.0) ? _st->viewLen : dur;
+    if (!(vl > 0.0)) return boxes;
+    std::vector<ap::BarMark> bars;
+    visibleBarsFor (_st->backend, _st->viewStart, vl, bars);
+    layoutTsBoxes (bars, full, _st->viewStart, _st->viewStart + vl, boxes);
+    return boxes;
+}
+
+//------------------------------------------------------------------------------
+// 只读自测访问器：给 gui_repro（离屏复现程序）用。
+//
+// 拍号条的几何是「绘制与点击命中共用同一份」，所以复现程序只要问这几个值就能算出
+// 该点哪里 —— 不用在测试里再抄一遍布局常数（抄一遍早晚跟实现漂移）。
+//------------------------------------------------------------------------------
+- (int)timeSigBoxCount
+{
+    return (int) [self timeSigBoxes].size ();
+}
+
+- (int)timeSigBoxBarAtIndex:(int)i
+{
+    std::vector<TsBox> b = [self timeSigBoxes];
+    return (i >= 0 && i < (int) b.size ()) ? b[static_cast<size_t> (i)].bar : -1;
+}
+
+- (int)timeSigBoxBeatsAtIndex:(int)i
+{
+    std::vector<TsBox> b = [self timeSigBoxes];
+    return (i >= 0 && i < (int) b.size ()) ? b[static_cast<size_t> (i)].beats : -1;
+}
+
+- (int)timeSigBoxDenomAtIndex:(int)i
+{
+    std::vector<TsBox> b = [self timeSigBoxes];
+    return (i >= 0 && i < (int) b.size ()) ? b[static_cast<size_t> (i)].denom : -1;
+}
+
+- (BOOL)timeSigBoxChangedAtIndex:(int)i
+{
+    std::vector<TsBox> b = [self timeSigBoxes];
+    return (i >= 0 && i < (int) b.size ()) && b[static_cast<size_t> (i)].changed;
+}
+
+- (CGFloat)timeSigBoxMidXAtIndex:(int)i
+{
+    std::vector<TsBox> b = [self timeSigBoxes];
+    if (i < 0 || i >= (int) b.size ()) return -1.0;
+    return NSMidX (b[static_cast<size_t> (i)].rect);
+}
+
+- (void)drawTimeSigStripIn:(NSRect)full bars:(std::vector<ap::BarMark>&)bars
+                     view0:(double)v0 view1:(double)v1
+{
+    // 条的底色 + 下沿分隔线（把「条」和「波形区」分开）
+    [[NSColor colorWithCalibratedWhite:0.085 alpha:1.0] setFill];
+    NSRectFill (NSMakeRect (NSMinX (full), NSMinY (full), NSWidth (full), kTsStripH));
+    [[NSColor colorWithCalibratedWhite:0.24 alpha:1.0] setFill];
+    NSRectFill (NSMakeRect (NSMinX (full), NSMinY (full) + kTsStripH - 1.0, NSWidth (full), 1.0));
+
+    std::vector<TsBox> boxes;
+    layoutTsBoxes (bars, full, v0, v1, boxes);
+
+    NSDictionary* light = @{ NSFontAttributeName : [NSFont systemFontOfSize:9],
+                             NSForegroundColorAttributeName :
+                                 [NSColor colorWithCalibratedWhite:0.90 alpha:1.0] };
+    NSDictionary* dark  = @{ NSFontAttributeName : [NSFont systemFontOfSize:9],
+                             NSForegroundColorAttributeName :
+                                 [NSColor colorWithCalibratedWhite:0.10 alpha:1.0] };
+
+    for (const TsBox& b : boxes)
+    {
+        if (b.changed)
+        {
+            [[NSColor colorWithCalibratedRed:0.98 green:0.68 blue:0.20 alpha:1.0] setFill];
+            [[NSColor colorWithCalibratedRed:1.00 green:0.86 blue:0.48 alpha:1.0] setStroke];
+        }
+        else
+        {
+            [[NSColor colorWithCalibratedWhite:0.30 alpha:1.0] setFill];
+            [[NSColor colorWithCalibratedWhite:0.44 alpha:1.0] setStroke];
+        }
+        NSBezierPath* p = [NSBezierPath bezierPathWithRoundedRect:b.rect xRadius:3.0 yRadius:3.0];
+        [p fill];
+        [p setLineWidth:1.0];
+        [p stroke];
+
+        NSString*     label = [NSString stringWithFormat:@"%d/%d", b.beats, b.denom];
+        NSDictionary* a     = b.changed ? dark : light;
+        NSSize        ts    = [label sizeWithAttributes:a];
+        [label drawAtPoint:NSMakePoint (NSMidX (b.rect) - ts.width / 2.0,
+                                        NSMidY (b.rect) - ts.height / 2.0)
+            withAttributes:a];
+    }
+}
+
 - (void)drawRect:(NSRect)dirty
 {
-    const NSRect r = [self bounds];
+    // 整块视图 = 顶部拍号条 + 下方波形区。拍号条是从视图内部【让出来】的，
+    // 视图自身的 frame 不动 —— 面板高度固定 384、每一行的纵向位置都按它排，
+    // 动 frame 会连带动布局、帮助覆盖层行数预算与验证器。
+    const NSRect rFull = [self bounds];
+    const NSRect r = NSMakeRect (NSMinX (rFull), NSMinY (rFull) + kTsStripH,
+                                 NSWidth (rFull),
+                                 std::max<CGFloat> (0.0, NSHeight (rFull) - kTsStripH));
     NSColor* bg    = [NSColor colorWithCalibratedWhite:0.16 alpha:1.0];
     NSColor* wave  = [NSColor colorWithCalibratedRed:0.30 green:0.72 blue:0.98 alpha:1.0];
     NSColor* head  = [NSColor colorWithCalibratedRed:1.0 green:0.35 blue:0.30 alpha:1.0];
@@ -641,7 +840,7 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     NSColor* txt   = [NSColor colorWithCalibratedWhite:0.65 alpha:1.0];
 
     [bg setFill];
-    NSRectFill (r);
+    NSRectFill (rFull);   // 背景铺满整块视图（含拍号条），免得条下露出面板底色
 
     if (!_st->backend->hasAudio ())
     {
@@ -719,82 +918,74 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     // ---- 小节网格 ----
     // 网格线（拍线/小节线）和小节号是两个独立开关：showGrid 控制线，showNumbers
     // 控制数字。两者任意一个开启就要做网格计算，但绘制各自受自己的开关约束。
-    const GridInfo g = gridInfoFor (_st->backend);
-    if ((_st->showGrid || _st->showNumbers) && g.bpm > 1.0 && g.beats >= 1 && (double) W > 0.0)
+    //
+    // ⚠️ 小节长度【逐小节算】：谱子里有拍号变化时，从变化点起每小节的长度就
+    //    不一样了（4/4 是 2 秒，转 3/4 之后是 1.5 秒）。拿一个全曲统一的 barSec
+    //    去铺线，变化点之后的小节线会全部错位。推进算法见 gui.h 的 ap::buildBars()。
+    std::vector<ap::BarMark> bars;
+    visibleBarsFor (_st->backend, v0, vl, bars);
+
+    // 视野里小节太多就不画（几万条线没意义还卡）
+    const bool gridDrawable = (bars.size () < 4096) && ((double) W > 0.0);
+
+    if (gridDrawable && _st->showGrid)
     {
-        const double beatSec = g.beatSec;
-        const double barSec  = beatSec * g.beats;
-        const CGFloat barPx  = (CGFloat) (barSec * pxPerSec);
-        const CGFloat beatPx = (CGFloat) (beatSec * pxPerSec);
-
-        const double firstK = std::floor ((v0 - off) / barSec) - 1.0;
-        const double lastK  = std::ceil  ((v1 - off) / barSec) + 1.0;
-        const double count  = lastK - firstK;
-
-        // 视野里小节太多时不画（否则几万条线没意义还卡）
-        if (count > 0.0 && count < 4096.0 && barPx >= 2.0)
+        // 拍线（虚线）
+        [beatC setStroke];
+        NSBezierPath* bp = [NSBezierPath bezierPath];
+        bp.lineWidth = 1.0;
+        const CGFloat dash[2] = { 3.0, 3.0 };
+        [bp setLineDash:dash count:2 phase:0.0];
+        for (const ap::BarMark& m : bars)
         {
-            // 标签步长：让相邻标签至少隔开 42px
-            int labelStep = 1;
-            while (barPx * labelStep < 42.0 && labelStep < 4096) labelStep *= 2;
-
-            if (_st->showGrid)
+            if (m.beatSec * pxPerSec < 5.0) continue;   // 拍线太密 → 只留小节线，免得糊成一片
+            for (int q = 1; q < m.beats; ++q)
             {
-                // 拍线（虚线）
-                if (beatPx >= 5.0)
-                {
-                    [beatC setStroke];
-                    NSBezierPath* bp = [NSBezierPath bezierPath];
-                    bp.lineWidth = 1.0;
-                    const CGFloat dash[2] = { 3.0, 3.0 };
-                    [bp setLineDash:dash count:2 phase:0.0];
-                    for (double k = firstK; k <= lastK; k += 1.0)
-                    {
-                        for (int q = 1; q < g.beats; ++q)
-                        {
-                            const double t = off + (k * g.beats + q) * beatSec;
-                            if (t < v0 || t > v1) continue;
-                            const CGFloat x = X (t);
-                            [bp moveToPoint:NSMakePoint (x, NSMinY (r) + 11)];
-                            [bp lineToPoint:NSMakePoint (x, NSMaxY (r))];
-                        }
-                    }
-                    [bp stroke];
-                }
-
-                // 小节线（实线）
-                [barC setStroke];
-                NSBezierPath* barP = [NSBezierPath bezierPath];
-                barP.lineWidth = 1.0;
-                for (double k = firstK; k <= lastK; k += 1.0)
-                {
-                    const double t = off + k * barSec;
-                    if (t < v0 || t > v1) continue;
-                    const CGFloat x = X (t);
-                    [barP moveToPoint:NSMakePoint (x, NSMinY (r) + 11)];
-                    [barP lineToPoint:NSMakePoint (x, NSMaxY (r))];
-                }
-                [barP stroke];
-            }
-
-            // 小节号：独立开关，不依赖 showGrid
-            if (_st->showNumbers)
-            {
-                std::size_t labelIdx = (std::size_t) std::max (0.0, firstK - std::fmod (firstK, (double) labelStep));
-                NSDictionary* attrs = @{ NSFontAttributeName : [NSFont systemFontOfSize:9],
-                                         NSForegroundColorAttributeName : numC };
-                for (double k = labelIdx; k <= lastK; k += (double) labelStep)
-                {
-                    const double t = off + k * barSec;
-                    if (t < v0 || t > v1) continue;
-                    const CGFloat x = X (t);
-                    if (x < NSMinX (r) - 2 || x > NSMaxX (r) - 8) continue;
-                    NSString* s = [NSString stringWithFormat:@"%d", (int) k + 1];
-                    [s drawAtPoint:NSMakePoint (x + 2, NSMinY (r) + 1) withAttributes:attrs];
-                }
+                const double t = m.startSec + q * m.beatSec;
+                if (t < v0 || t > v1) continue;
+                const CGFloat x = X (t);
+                [bp moveToPoint:NSMakePoint (x, NSMinY (r) + 11)];
+                [bp lineToPoint:NSMakePoint (x, NSMaxY (r))];
             }
         }
+        [bp stroke];
+
+        // 小节线（实线）
+        [barC setStroke];
+        NSBezierPath* barP = [NSBezierPath bezierPath];
+        barP.lineWidth = 1.0;
+        for (const ap::BarMark& m : bars)
+        {
+            if (m.startSec < v0 || m.startSec > v1) continue;
+            const CGFloat x = X (m.startSec);
+            [barP moveToPoint:NSMakePoint (x, NSMinY (r) + 11)];
+            [barP lineToPoint:NSMakePoint (x, NSMaxY (r))];
+        }
+        [barP stroke];
     }
+
+    // 小节号：独立开关，不依赖 showGrid。
+    // ⚠️ 小节宽度可变后，「每隔 N 个标一个」的固定步长不再适用 —— 改成
+    //    「与上一个标注至少隔开 42px 才标」，宽窄自动适应。
+    if (gridDrawable && _st->showNumbers)
+    {
+        NSDictionary* attrs = @{ NSFontAttributeName : [NSFont systemFontOfSize:9],
+                                 NSForegroundColorAttributeName : numC };
+        CGFloat lastLabelX = -1.0e9;
+        for (const ap::BarMark& m : bars)
+        {
+            if (m.startSec < v0 || m.startSec > v1) continue;
+            const CGFloat x = X (m.startSec);
+            if (x < NSMinX (r) - 2 || x > NSMaxX (r) - 8) continue;
+            if (x - lastLabelX < 42.0) continue;
+            lastLabelX = x;
+            NSString* s = [NSString stringWithFormat:@"%d", m.bar];
+            [s drawAtPoint:NSMakePoint (x + 2, NSMinY (r) + 1) withAttributes:attrs];
+        }
+    }
+
+    // ---- 顶部拍号条 ----
+    [self drawTimeSigStripIn:rFull bars:bars view0:v0 view1:v1];
 
     // ---- 谱面播放头（宿主给位置时才有）----
     // 绿线 = 谱面当前播到的位置（投影到音频时间轴，含偏移），
@@ -908,6 +1099,24 @@ static ap::PlugView::Backend* safeBackend (ap::PlugView::Backend* b)
     [[self window] makeFirstResponder:self];   // 确保后续 magnify/滚动事件能到达本视图
     const NSPoint p = [self localPoint:e];
     const NSEventModifierFlags m = [self mods:e];
+
+    // 顶部拍号条：点中某个方块 = 弹出该小节的拍号设置。
+    // 这两种情况都要把点击「吃掉」：命中方块要开面板；没命中也不能掉进下面的
+    // 「平移」分支 —— 否则点一下条会把视野挪走，纯属意外。
+    if (p.y < NSMinY ([self bounds]) + kTsStripH)
+    {
+        std::vector<TsBox> boxes = [self timeSigBoxes];
+        for (const TsBox& b : boxes)
+        {
+            if (NSPointInRect (p, NSInsetRect (b.rect, -3.0, -3.0)))
+            {
+                if (_st->panel)
+                    [(__bridge id<WavePanel>) _st->panel openTimeSigPopupForBar:b.bar];
+                return;
+            }
+        }
+        return;
+    }
 
     if (e.clickCount >= 2)        // 双击 = 回到全览
     {
@@ -1229,6 +1438,7 @@ namespace ap { void openBrandHome (); }
         @"",
         @"#2  填速度：先填 BPM 和拍号（如 120、4/4），网格小节线才会",
         @"     跟谱子的小节对上。留空 = 自动：跟着乐谱走，乐谱没给就 120。",
+        @"     谱子中途换拍号时，点波形顶部的拍号块改那一小节（选回原值即取消）。",
         @"",
         @"#3  对拍子：按住 ⌘（或 ⌥）在波形上左右拖网格，把「1」那条",
         @"     小节线拖到音乐的第一拍上（对准波形里的鼓点）。⇧ 拖 = 微调，",
@@ -1245,7 +1455,7 @@ namespace ap { void openBrandHome (); }
         @"「大伟鼓谱」，到 B 站关注一下 —— 那就是最大的支持。",
     ];
 
-    // 20 行 × 16px，从 y=38 起 → 末行底 ≈ 355，留 29px 余量（面板高 384）。
+    // 21 行 × 16px，从 y=38 起 → 末行底 ≈ 371，留 13px 余量（面板高 384）。
     // ⚠️ 文案再加长就要同步这里，否则最后一行会被面板底边裁掉。
     CGFloat y = 38.0;
     const CGFloat lh = 16.0;
@@ -1266,9 +1476,252 @@ namespace ap { void openBrandHome (); }
 @end
 
 //------------------------------------------------------------------------------
+// 拍号设置覆盖层（点了拍号条上的方块之后弹出）
+//
+// 铺满整块面板的半透明遮罩 + 居中一块小面板：「分子」「分母」两排按钮，
+// 外加「取消该小节的变化」。点面板外任意处关闭。
+//
+// 为什么做成覆盖层而不是两个常驻下拉：面板只有 640x384，常驻两个下拉要再从
+// 波形区里挖地方；而「点方块 → 就地改这一小节」也比「先在别处选中再改」直观。
+// 挂载方式照搬使用指南覆盖层（作为父视图【最后一个】子视图 + 显示时显式提到
+// 最前），不依赖「z 序 = 创建顺序」在宿主里的表现（铁律 15）。
+//------------------------------------------------------------------------------
+struct TsBtn
+{
+    NSRect rect  = NSZeroRect;
+    int    kind  = 0;   ///< 0 = 分子选项，1 = 分母选项，2 = 取消该小节的变化
+    int    value = 0;   ///< 分子 / 分母的取值
+};
+
+struct TsPopupState
+{
+    int    bar       = 1;
+    int    beats     = 4;
+    int    denom     = 4;
+    bool   hasChange = false;
+    NSRect box       = NSZeroRect;
+    std::vector<TsBtn> btns;
+};
+
+// 供面板（GUIView）实现的回调
+@protocol TimeSigPopupDelegate <NSObject>
+- (void)timeSigPopupApplyBar:(int)bar beats:(int)beats denom:(int)denom;
+- (void)timeSigPopupRemoveBar:(int)bar;
+- (void)timeSigPopupClosed;
+@end
+
+// 候选拍号（与参考工具一致）：分子取常用值，分母只留 2/4/8/16。
+static const int kTsBeatChoices[]  = { 2, 3, 4, 5, 6, 7, 9, 12 };
+static const int kTsDenomChoices[] = { 2, 4, 8, 16 };
+
+static const CGFloat kTsPopupHeadH = 30.0;   ///< 标题行高
+static const CGFloat kTsPopupRowH  = 30.0;   ///< 每排按钮占的行高
+
+@interface TimeSigPopupView : NSView
+{
+    TsPopupState* _ps;
+    __weak id<TimeSigPopupDelegate> _delegate;
+}
+- (instancetype)initWithDelegate:(id<TimeSigPopupDelegate>)d;
+- (void)showForBar:(int)bar beats:(int)beats denom:(int)denom hasChange:(BOOL)hasChange;
+@end
+
+@implementation TimeSigPopupView
+
+- (BOOL)isOpaque { return NO; }        // 半透明遮罩，别谎报不透明
+- (BOOL)isFlipped { return YES; }       // 与父视图一致：y 轴向下
+
+- (instancetype)initWithDelegate:(id<TimeSigPopupDelegate>)d
+{
+    if (self = [super initWithFrame:NSZeroRect])
+    {
+        _ps = new TsPopupState ();
+        _delegate = d;
+        self.hidden = YES;
+    }
+    return self;
+}
+
+- (void)dealloc
+{
+    delete _ps;   // ARC 不管 C++ 成员
+}
+
+// 按钮布局：绘制与命中测试共用同一份，避免两处各算一遍写歪
+- (void)layoutButtons
+{
+    _ps->btns.clear ();
+
+    const CGFloat padX = 14.0, btnW = 34.0, btnH = 22.0, gap = 5.0, labelW = 34.0;
+    const int nBeat  = (int) (sizeof (kTsBeatChoices)  / sizeof (kTsBeatChoices[0]));
+    const int nDenom = (int) (sizeof (kTsDenomChoices) / sizeof (kTsDenomChoices[0]));
+
+    const CGFloat row1W = labelW + 6.0 + nBeat  * (btnW + gap) - gap;
+    const CGFloat row2W = labelW + 6.0 + nDenom * (btnW + gap) - gap;
+    const CGFloat boxW  = std::max (row1W, row2W) + padX * 2.0;
+    const CGFloat boxH  = kTsPopupHeadH + kTsPopupRowH * 2.0
+                        + (_ps->hasChange ? 26.0 : 0.0) + 14.0;
+
+    const NSRect r = [self bounds];
+    _ps->box = NSMakeRect (NSMidX (r) - boxW / 2.0, NSMidY (r) - boxH / 2.0, boxW, boxH);
+
+    const CGFloat startX = _ps->box.origin.x + padX + labelW + 6.0;
+    CGFloat y = _ps->box.origin.y + kTsPopupHeadH;
+    CGFloat x = startX;
+    for (int i = 0; i < nBeat; ++i)
+    {
+        TsBtn b; b.rect = NSMakeRect (x, y, btnW, btnH); b.kind = 0; b.value = kTsBeatChoices[i];
+        _ps->btns.push_back (b);
+        x += btnW + gap;
+    }
+    y += kTsPopupRowH;
+    x = startX;
+    for (int i = 0; i < nDenom; ++i)
+    {
+        TsBtn b; b.rect = NSMakeRect (x, y, btnW, btnH); b.kind = 1; b.value = kTsDenomChoices[i];
+        _ps->btns.push_back (b);
+        x += btnW + gap;
+    }
+    if (_ps->hasChange)
+    {
+        y += kTsPopupRowH;
+        TsBtn b;
+        b.rect  = NSMakeRect (_ps->box.origin.x + padX, y, boxW - padX * 2.0, 22.0);
+        b.kind  = 2;
+        b.value = 0;
+        _ps->btns.push_back (b);
+    }
+}
+
+- (void)showForBar:(int)bar beats:(int)beats denom:(int)denom hasChange:(BOOL)hasChange
+{
+    _ps->bar       = bar;
+    _ps->beats     = beats;
+    _ps->denom     = denom;
+    _ps->hasChange = hasChange;
+    [self layoutButtons];
+    self.hidden = NO;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)mouseDown:(NSEvent*)e
+{
+    const NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    for (const TsBtn& b : _ps->btns)
+    {
+        if (!NSPointInRect (p, NSInsetRect (b.rect, -2.0, -2.0))) continue;
+        if (b.kind == 0)
+            [_delegate timeSigPopupApplyBar:_ps->bar beats:b.value denom:_ps->denom];
+        else if (b.kind == 1)
+            [_delegate timeSigPopupApplyBar:_ps->bar beats:_ps->beats denom:b.value];
+        else
+            [_delegate timeSigPopupRemoveBar:_ps->bar];
+        return;
+    }
+    self.hidden = YES;                 // 点面板外 = 关闭
+    [_delegate timeSigPopupClosed];
+}
+
+- (void)rightMouseDown:(NSEvent*)e
+{
+    (void) e;
+    self.hidden = YES;
+    [_delegate timeSigPopupClosed];
+}
+
+// 滚轮【只吞不关】：用户习惯滚一滚看还有没有，别一滚就关掉。
+// 不实现这条消息时事件会沿 responder chain 上抛，顺带把下面的波形视野滚走。
+- (void)scrollWheel:(NSEvent*)e { (void) e; }
+
+// 自测访问器：某个候选按钮的中心点（弹层视图坐标 = 面板坐标）。见 WaveformView
+// 那几个访问器的说明 —— 复现程序靠它算出「该点哪里」，不抄布局常数。
+- (NSPoint)tsButtonMidPointForKind:(int)kind value:(int)value
+{
+    for (const TsBtn& b : _ps->btns)
+        if (b.kind == kind && b.value == value)
+            return NSMakePoint (NSMidX (b.rect), NSMidY (b.rect));
+    return NSMakePoint (-1.0, -1.0);
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+    (void) dirty;
+    const NSRect r = [self bounds];
+
+    [[NSColor colorWithCalibratedWhite:0.0 alpha:0.55] setFill];
+    NSRectFill (r);
+
+    [[NSColor colorWithCalibratedWhite:0.16 alpha:1.0] setFill];
+    [[NSColor colorWithCalibratedWhite:0.42 alpha:1.0] setStroke];
+    NSBezierPath* boxPath = [NSBezierPath bezierPathWithRoundedRect:_ps->box xRadius:6.0 yRadius:6.0];
+    [boxPath fill];
+    [boxPath setLineWidth:1.0];
+    [boxPath stroke];
+
+    NSDictionary* titleAttrs = @{ NSFontAttributeName : [NSFont boldSystemFontOfSize:12],
+                                  NSForegroundColorAttributeName :
+                                      [NSColor colorWithCalibratedRed:0.98 green:0.72 blue:0.30 alpha:1.0] };
+    NSString* title = [NSString stringWithFormat:@"第 %d 小节  拍号", _ps->bar];
+    [title drawAtPoint:NSMakePoint (_ps->box.origin.x + 14.0, _ps->box.origin.y + 9.0)
+        withAttributes:titleAttrs];
+
+    NSDictionary* labelAttrs = @{ NSFontAttributeName : [NSFont systemFontOfSize:11],
+                                  NSForegroundColorAttributeName :
+                                      [NSColor colorWithCalibratedWhite:0.62 alpha:1.0] };
+    NSDictionary* btnAttrs   = @{ NSFontAttributeName : [NSFont systemFontOfSize:11],
+                                  NSForegroundColorAttributeName :
+                                      [NSColor colorWithCalibratedWhite:0.92 alpha:1.0] };
+    NSDictionary* selAttrs   = @{ NSFontAttributeName : [NSFont systemFontOfSize:11],
+                                  NSForegroundColorAttributeName :
+                                      [NSColor colorWithCalibratedWhite:0.10 alpha:1.0] };
+
+    // 两排的行标签
+    const CGFloat labelX = _ps->box.origin.x + 14.0;
+    [@"分子" drawAtPoint:NSMakePoint (labelX, _ps->box.origin.y + kTsPopupHeadH + 4.0)
+          withAttributes:labelAttrs];
+    [@"分母" drawAtPoint:NSMakePoint (labelX, _ps->box.origin.y + kTsPopupHeadH + kTsPopupRowH + 4.0)
+          withAttributes:labelAttrs];
+
+    for (const TsBtn& b : _ps->btns)
+    {
+        const BOOL selected = (b.kind == 0 && b.value == _ps->beats)
+                           || (b.kind == 1 && b.value == _ps->denom);
+        if (b.kind == 2)
+        {
+            [[NSColor colorWithCalibratedRed:0.42 green:0.20 blue:0.20 alpha:1.0] setFill];
+            [[NSColor colorWithCalibratedRed:0.62 green:0.30 blue:0.30 alpha:1.0] setStroke];
+        }
+        else if (selected)
+        {
+            [[NSColor colorWithCalibratedRed:0.98 green:0.68 blue:0.20 alpha:1.0] setFill];
+            [[NSColor colorWithCalibratedRed:1.00 green:0.86 blue:0.48 alpha:1.0] setStroke];
+        }
+        else
+        {
+            [[NSColor colorWithCalibratedWhite:0.32 alpha:1.0] setFill];
+            [[NSColor colorWithCalibratedWhite:0.46 alpha:1.0] setStroke];
+        }
+        NSBezierPath* p = [NSBezierPath bezierPathWithRoundedRect:b.rect xRadius:3.0 yRadius:3.0];
+        [p fill];
+        [p setLineWidth:1.0];
+        [p stroke];
+
+        NSString*     t = (b.kind == 2) ? @"取消该小节的变化"
+                                        : [NSString stringWithFormat:@"%d", b.value];
+        NSDictionary* a = (b.kind == 2) ? btnAttrs : (selected ? selAttrs : btnAttrs);
+        NSSize        sz = [t sizeWithAttributes:a];
+        [t drawAtPoint:NSMakePoint (NSMidX (b.rect) - sz.width / 2.0,
+                                    NSMidY (b.rect) - sz.height / 2.0)
+            withAttributes:a];
+    }
+}
+
+@end
+
+//------------------------------------------------------------------------------
 // 主面板
 //------------------------------------------------------------------------------
-@interface GUIView : NSView <NSTextFieldDelegate>
+@interface GUIView : NSView <NSTextFieldDelegate, TimeSigPopupDelegate>
 {
     PanelState* _st;
 }
@@ -1298,6 +1751,10 @@ namespace ap { void openBrandHome (); }
 - (void)helpToggle:(id)s;
 - (void)openFile:(id)s;
 - (void)loadPath:(NSString*)path;
+- (void)openTimeSigPopupForBar:(int)bar;          ///< 拍号条上的方块被点了
+- (void)timeSigAtBar:(int)bar beats:(int*)pb denom:(int*)pd hasChange:(BOOL*)ph;  ///< 该小节实际生效的拍号
+- (void)inheritedTimeSigAtBar:(int)bar beats:(int*)pb denom:(int*)pd;  ///< 不含本小节自身变化时的继承值
+- (void)refreshTimeSigUI;                         ///< 拍号变化后重绘波形区（拍号条 + 网格线）
 - (BOOL)hasAudioURL:(id<NSDraggingInfo>)sender;
 @end
 
@@ -1351,7 +1808,8 @@ namespace ap { void openBrandHome (); }
         [_st->wave setPanel:(__bridge void*) self];
         [self addSubview:_st->wave];
         _st->wave.toolTip = @"滚轮左右平移 · ⌥滚轮缩放 · 双击全览 · "
-                            @"按住拖动=平移视图 · ⌥拖动或⌘拖动=改起始偏移（配合 ⇧ 微调）";
+                            @"按住拖动=平移视图 · ⌥拖动或⌘拖动=改起始偏移（配合 ⇧ 微调）· "
+                            @"点顶部拍号块=改该小节的拍号";
 
         // ---- 时间 + 缩放 + 显示开关 ----
         _st->timeLabel = [self label:@"0:00 / 0:00" size:11 align:NSTextAlignmentLeft];
@@ -1524,6 +1982,12 @@ namespace ap { void openBrandHome (); }
         _st->helpOverlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         _st->helpOverlay.hidden = YES;
         [self addSubview:_st->helpOverlay];
+
+        // ---- 拍号设置覆盖层（加在帮助层之后 → 叠在它上面）----
+        _st->tsPopup = [[TimeSigPopupView alloc] initWithDelegate:self];
+        _st->tsPopup.frame = self.bounds;
+        _st->tsPopup.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [self addSubview:_st->tsPopup];
 
         // ---- 从后端回读已有设置（⭐ 关掉编辑器再打开时保持用户填的值）----
         [self syncControlsFromBackend];
@@ -1703,6 +2167,98 @@ namespace ap { void openBrandHome (); }
             [NSString stringWithFormat:@"偏移 %+.2f 秒", sec];
         [_st->statusLabel setTextColor:[NSColor colorWithCalibratedWhite:0.6 alpha:1.0]];
     }
+}
+
+//---- 拍号变化（波形区拍号条 → 弹出设置）---------------------------------------
+// 该小节【实际生效】的拍号 = 「起小节 <= bar」的最后一条变化；没有变化就用全局默认拍号。
+- (void)timeSigAtBar:(int)bar beats:(int*)pb denom:(int*)pd hasChange:(BOOL*)ph
+{
+    int b = _st->backend->gridBeatsPerBar ();
+    int d = _st->backend->gridBeatDenominator ();
+    if (b < 1) b = 4;
+    if (d < 1) d = 4;
+    bool has = false;
+    std::vector<ap::TimeSigChange> changes;
+    _st->backend->getTimeSigChanges (changes);
+    for (const ap::TimeSigChange& c : changes)
+    {
+        if (c.bar == bar) has = true;
+        if (c.bar <= bar) { b = c.beats; d = c.denom; }
+    }
+    if (pb) *pb = b;
+    if (pd) *pd = d;
+    if (ph) *ph = has;
+}
+
+// 不含本小节自身变化的「继承值」。用途：用户把某小节设成跟继承值一样时，
+// 等于「这一小节没有变化」→ 应当把变化点取消，而不是留一个毫无几何作用的橙块。
+- (void)inheritedTimeSigAtBar:(int)bar beats:(int*)pb denom:(int*)pd
+{
+    int b = _st->backend->gridBeatsPerBar ();
+    int d = _st->backend->gridBeatDenominator ();
+    if (b < 1) b = 4;
+    if (d < 1) d = 4;
+    std::vector<ap::TimeSigChange> changes;
+    _st->backend->getTimeSigChanges (changes);
+    for (const ap::TimeSigChange& c : changes)
+        if (c.bar < bar) { b = c.beats; d = c.denom; }
+    if (pb) *pb = b;
+    if (pd) *pd = d;
+}
+
+- (void)refreshTimeSigUI
+{
+    // 拍号条与网格线都在波形视图里，重绘它即可
+    [_st->wave setNeedsDisplay:YES];
+}
+
+// 自测访问器：拍号设置弹层是否可见（gui_repro 用）
+- (BOOL)tsPopupVisible
+{
+    return _st->tsPopup && !_st->tsPopup.hidden;
+}
+
+- (void)openTimeSigPopupForBar:(int)bar
+{
+    if (!_st->backend->hasAudio ()) return;
+
+    int   beats = 4, denom = 4;
+    BOOL  has   = NO;
+    [self timeSigAtBar:bar beats:&beats denom:&denom hasChange:&has];
+
+    _st->helpOverlay.hidden = YES;   // 别和帮助层叠在一起
+    [_st->tsPopup showForBar:bar beats:beats denom:denom hasChange:has];
+    [self addSubview:_st->tsPopup positioned:NSWindowAbove relativeTo:nil];
+}
+
+- (void)timeSigPopupApplyBar:(int)bar beats:(int)beats denom:(int)denom
+{
+    int inhB = 4, inhD = 4;
+    [self inheritedTimeSigAtBar:bar beats:&inhB denom:&inhD];
+
+    const BOOL same = (beats == inhB && denom == inhD);
+    if (same)
+        _st->backend->clearTimeSigChange (bar);          // 选的就是继承值 → 等于取消
+    else
+        _st->backend->setTimeSigChange (bar, beats, denom);
+
+    // 面板留在屏幕上，方便连着调分子 / 分母
+    [_st->tsPopup showForBar:bar beats:beats denom:denom hasChange:!same];
+    [self refreshTimeSigUI];
+}
+
+- (void)timeSigPopupRemoveBar:(int)bar
+{
+    _st->backend->clearTimeSigChange (bar);
+    int b = 4, d = 4;
+    [self timeSigAtBar:bar beats:&b denom:&d hasChange:NULL];
+    [_st->tsPopup showForBar:bar beats:b denom:d hasChange:NO];
+    [self refreshTimeSigUI];
+}
+
+- (void)timeSigPopupClosed
+{
+    // 关闭本身不需要做什么：变化一按下按钮就已经写进后端并重绘了
 }
 
 //---- 网格参数 --------------------------------------------------------------
@@ -2361,4 +2917,94 @@ extern "C" int aplayViewHasBackend (Steinberg::IPlugView* v)
 {
     auto* pv = dynamic_cast<ap::PlugView*> (v);
     return (pv && pv->backendForTest () != nullptr) ? 1 : 0;
+}
+
+//------------------------------------------------------------------------------
+// 拍号变化表（后端状态）探针 —— 同上，给纯 C++ 的验证器用。
+//
+// 为什么要这一段：拍号变化表是「用户操作产生、关掉界面后仍要有意义」的状态，
+// 存在处理器里。它的语义有四个容易写歪的点，全是纯逻辑、不需要界面就能测：
+//   ① 初值必须是空的；② 同一个小节再设一次是【覆盖】不是追加；
+//   ③ 非法分子 / 分母必须回落默认；④ 取消要能精确摘掉那一条。
+// 返回 1 = 全部符合预期；负数 = 第几条不符（便于定位）。
+//------------------------------------------------------------------------------
+extern "C" int aplayTimeSigMapProbe (Steinberg::IPlugView* v)
+{
+    auto* pv = dynamic_cast<ap::PlugView*> (v);
+    ap::PlugView::Backend* b = pv ? pv->backendForTest () : nullptr;
+    if (!b) return 0;
+
+    std::vector<ap::TimeSigChange> out;
+    b->getTimeSigChanges (out);
+    if (!out.empty ()) return -1;
+
+    b->setTimeSigChange (3, 3, 4);
+    b->setTimeSigChange (6, 6, 8);
+    b->getTimeSigChanges (out);
+    if (out.size () != 2) return -2;
+    if (out[0].bar != 3 || out[0].beats != 3 || out[0].denom != 4) return -3;
+    if (out[1].bar != 6 || out[1].beats != 6 || out[1].denom != 8) return -4;
+
+    // ② 同一个小节再设一次 = 覆盖，不是追加
+    b->setTimeSigChange (3, 5, 4);
+    b->getTimeSigChanges (out);
+    if (out.size () != 2) return -5;
+    if (out[0].bar != 3 || out[0].beats != 5 || out[0].denom != 4) return -6;
+
+    // ③ 非法值回落默认（分子 0 / 分母 7 都非法 → 4/4）
+    b->setTimeSigChange (9, 0, 7);
+    b->getTimeSigChanges (out);
+    if (out.size () != 3) return -7;
+    if (out[2].bar != 9 || out[2].beats != 4 || out[2].denom != 4) return -8;
+
+    // bar < 1 一律归到第 1 小节
+    b->setTimeSigChange (0, 3, 4);
+    b->getTimeSigChanges (out);
+    if (out.size () != 4) return -9;
+    if (out[0].bar != 1 || out[0].beats != 3) return -10;
+
+    // ④ 取消要精确：摘掉 1 / 3 / 9，剩下的只有 6；取消不存在的 key 也不能出问题
+    b->clearTimeSigChange (1);
+    b->clearTimeSigChange (3);
+    b->clearTimeSigChange (9);
+    b->clearTimeSigChange (77);
+    b->getTimeSigChanges (out);
+    if (out.size () != 1) return -11;
+    if (out[0].bar != 6) return -12;
+
+    b->clearTimeSigChange (6);
+    b->getTimeSigChanges (out);
+    if (!out.empty ()) return -13;
+
+    return 1;
+}
+
+/// 给后端设一条拍号变化（验证器测「随状态保存 / 恢复」用）
+extern "C" void aplayTimeSigSet (Steinberg::IPlugView* v, int bar, int beats, int denom)
+{
+    auto* pv = dynamic_cast<ap::PlugView*> (v);
+    ap::PlugView::Backend* b = pv ? pv->backendForTest () : nullptr;
+    if (b) b->setTimeSigChange (bar, beats, denom);
+}
+
+/// 回填当前拍号变化表（buf = 长度 cap 的三元组数组 [bar,beats,denom,...]），
+/// 返回条数。buf 为空时只报条数。
+extern "C" int aplayTimeSigDump (Steinberg::IPlugView* v, int* buf, int cap)
+{
+    auto* pv = dynamic_cast<ap::PlugView*> (v);
+    ap::PlugView::Backend* b = pv ? pv->backendForTest () : nullptr;
+    if (!b) return -1;
+
+    std::vector<ap::TimeSigChange> out;
+    b->getTimeSigChanges (out);
+    const int n = static_cast<int> (out.size ());
+    if (!buf) return n;
+    for (int i = 0; i < n && i < cap; ++i)
+    {
+        const ap::TimeSigChange& c = out[static_cast<size_t> (i)];
+        buf[i * 3 + 0] = c.bar;
+        buf[i * 3 + 1] = c.beats;
+        buf[i * 3 + 2] = c.denom;
+    }
+    return n;
 }

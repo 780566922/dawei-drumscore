@@ -143,8 +143,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key>                        <string>大伟鼓谱MuseScore音频播放器</string>
     <key>CFBundlePackageType</key>                 <string>BNDL</string>
     <key>CFBundleSignature</key>                   <string>????</string>
-    <key>CFBundleShortVersionString</key>          <string>1.2.6</string>
-    <key>CFBundleVersion</key>                     <string>1.2.6</string>
+    <key>CFBundleShortVersionString</key>          <string>1.2.7</string>
+    <key>CFBundleVersion</key>                     <string>1.2.7</string>
     <key>NSHumanReadableCopyright</key>            <string>Free for personal use</string>
 </dict>
 </plist>
@@ -215,8 +215,9 @@ build_test () {
 }
 
 echo "==> 编译验证器"
+# -I"$SRC"：验证器要直接引 gui.h 测「三端共用的小节推进算法」（ap::buildBars）。
 build_test "$OUT/validate" -std=c++17 -O1 -arch arm64 "$HERE/validate.cpp" \
-           -I"$SDK" $SDK_OBJS_ARM64 $FRAMEWORKS
+           -I"$SDK" -I"$SRC" $SDK_OBJS_ARM64 $FRAMEWORKS
 build_test "$OUT/e2e_test" -std=c++17 -O1 -arch arm64 "$HERE/e2e_test.cpp" \
            -I"$SDK" $SDK_OBJS_ARM64 $FRAMEWORKS
 build_test "$OUT/factory_lifecycle_test" -std=c++17 -O1 -arch arm64 \

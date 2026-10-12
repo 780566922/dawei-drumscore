@@ -16,6 +16,10 @@
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/gui/iplugview.h"
 
+// 三端共用的小节推进算法（ap::buildBars）就在这个头里。验证器只用到它的纯函数，
+// 不碰任何平台 GUI —— 这样「同一份算法」是被【真的那一份】测到的，不是副本。
+#include "gui.h"
+
 #include <dlfcn.h>
 
 #include <cmath>
@@ -143,6 +147,119 @@ int main (int argc, char** argv)
 
     std::printf ("\n===== 大伟鼓谱MuseScore音频播放器 验证 =====\n");
     std::printf ("加载: %s\n", bundlePath);
+
+    //---- 0. 共用的小节推进算法 ----
+    // ap::buildBars()（见 gui.h）是三端网格线与拍号条共用的同一份代码。谱子里一旦
+    // 有拍号变化（前 8 小节 4/4、之后转 3/4），每小节长度就不同了 —— 用「全曲统一
+    // barSec」铺线，变化点之后的小节线会全部错位。这里把它的语义逐条钉死：
+    // 起点 = 起始偏移、逐小节按【当时生效】的拍号累加、变化点标记、向前延伸、
+    // 视野外的小节也必须继续累加、非法值回落。
+    std::printf ("\n[0] 共用算法：逐小节推进（ap::buildBars）\n");
+    {
+        using ap::TimeSigChange;
+        std::vector<ap::BarMark> bars;
+        const double kEps = 1e-9;
+
+        // ① 无变化：4/4 @120BPM（四分音符 0.5 秒）→ 每拍 0.5 秒、每小节 2 秒
+        ap::buildBars (0.0, 8.0, 2.0, 0.5, 4, 4, {}, bars);
+        {
+            bool ok = (bars.size () == 5);
+            for (size_t i = 0; ok && i < bars.size (); ++i)
+                ok = (bars[i].bar == static_cast<int> (i))
+                  && std::fabs (bars[i].startSec - 2.0 * static_cast<double> (i)) < kEps
+                  && !bars[i].changed;
+            check ("buildBars：起点 = 起始偏移；逐小节累加；第 1 小节之前向前铺（0 号小节）",
+                   ok, "n=" + std::to_string (bars.size ()));
+        }
+
+        // ② 第 3 小节转 3/4：前两小节 2 秒，之后每小节 1.5 秒
+        {
+            std::vector<TimeSigChange> ch = { { 3, 3, 4 } };
+            ap::buildBars (0.0, 10.0, 2.0, 0.5, 4, 4, ch, bars);
+            const ap::BarMark* b3 = nullptr;
+            const ap::BarMark* b4 = nullptr;
+            for (const ap::BarMark& m : bars)
+            {
+                if (m.bar == 3) b3 = &m;
+                if (m.bar == 4) b4 = &m;
+            }
+            check ("buildBars：变化点之后每小节长度跟着变（3/4 → 1.5 秒）",
+                   b3 && b4
+                       && std::fabs (b3->startSec - 6.0) < kEps
+                       && std::fabs (b4->startSec - 7.5) < kEps
+                       && b3->beats == 3 && b3->denom == 4
+                       && std::fabs (b3->beatSec - 0.5) < kEps);
+            check ("buildBars：只有变化点那一小节标记 changed",
+                   b3 && b3->changed && b4 && !b4->changed);
+        }
+
+        // ③ 第 2 小节转 6/8：每拍（八分音符）= 0.5 × 4/8 = 0.25 秒，每小节 6 拍 = 1.5 秒
+        {
+            std::vector<TimeSigChange> ch = { { 2, 6, 8 } };
+            ap::buildBars (0.0, 8.0, 2.0, 0.5, 4, 4, ch, bars);
+            bool ok = false;
+            for (const ap::BarMark& m : bars)
+                if (m.bar == 2)
+                    ok = (m.beats == 6 && m.denom == 8)
+                      && std::fabs (m.beatSec - 0.25) < kEps
+                      && std::fabs (m.startSec - 4.0) < kEps;
+            bool ok3 = false;
+            for (const ap::BarMark& m : bars)
+                if (m.bar == 3)
+                    ok3 = std::fabs (m.startSec - 5.5) < kEps;   // 4.0 + 6 × 0.25
+            check ("buildBars：6/8 的拍长 = 四分音符 × 4/8（0.25 秒）", ok);
+            check ("buildBars：6/8 小节长度 1.5 秒（下一小节起点 5.5）", ok3);
+        }
+
+        // ④ 多段串联：4/4 → 3/4（第 3 小节）→ 5/4（第 6 小节）
+        {
+            std::vector<TimeSigChange> ch = { { 3, 3, 4 }, { 6, 5, 4 } };
+            ap::buildBars (0.0, 14.0, 2.0, 0.5, 4, 4, ch, bars);
+            const double expect[7] = { 2.0, 4.0, 6.0, 7.5, 9.0, 10.5, 13.0 };
+            const int    beats[7]  = { 4, 4, 3, 3, 3, 5, 5 };
+            bool ok = true;
+            for (int i = 0; i < 7 && ok; ++i)
+            {
+                const ap::BarMark* m = nullptr;
+                for (const ap::BarMark& x : bars)
+                    if (x.bar == i + 1) m = &x;
+                ok = m && std::fabs (m->startSec - expect[i]) < kEps && m->beats == beats[i];
+            }
+            check ("buildBars：多段变化串联（起点与拍号逐小节都对）", ok);
+        }
+
+        // ⑤ 视野里只看得到后面的小节时，前面【看不见的小节也必须继续累加】
+        //    （否则第 6 小节的起点会算成「偏移 + 5 × 2 秒」而不是真实值）
+        {
+            std::vector<TimeSigChange> ch = { { 3, 3, 4 } };
+            ap::buildBars (10.0, 11.5, 2.0, 0.5, 4, 4, ch, bars);
+            check ("buildBars：视野外的小节继续累加（第 6 小节起点 = 10.5，而非 12.0）",
+                   bars.size () == 1 && bars[0].bar == 6
+                       && std::fabs (bars[0].startSec - 10.5) < kEps
+                       && bars[0].beats == 3,
+                   "n=" + std::to_string (bars.size ()));
+        }
+
+        // ⑥ 非法值回落默认（分子 0 / 分母 7），但变化点本身仍然成立
+        {
+            std::vector<TimeSigChange> ch = { { 3, 0, 7 } };
+            ap::buildBars (0.0, 8.0, 0.0, 0.5, 4, 4, ch, bars);
+            bool ok = false;
+            for (const ap::BarMark& m : bars)
+                if (m.bar == 3)
+                    ok = (m.beats == 4 && m.denom == 4) && m.changed;
+            check ("buildBars：非法拍号回落 4/4（变化点仍成立）", ok);
+        }
+
+        // ⑦ 退化输入一律安全（空结果，不是崩）
+        {
+            ap::buildBars (0.0, 8.0, 0.0, 0.0, 4, 4, {}, bars);
+            const bool empty1 = bars.empty ();
+            ap::buildBars (8.0, 8.0, 0.0, 0.5, 4, 4, {}, bars);
+            check ("buildBars：退化输入（四分音符时长 0 / 空区间）→ 空结果且不崩",
+                   empty1 && bars.empty ());
+        }
+    }
 
     //---- 1. dlopen ----
     std::printf ("\n[1] 动态库加载\n");
@@ -534,6 +651,51 @@ int main (int argc, char** argv)
                        viewHasBackend (view) == 1);
             else
                 std::printf ("  [INFO] 未找到 aplayViewHasBackend 符号，跳过该检查\\n");
+
+            //---- 拍号变化表：内存语义 + 随乐谱保存 / 恢复 ----
+            // 它和 BPM 一样属于「用户操作产生、关掉界面后仍要有意义」的状态，存在
+            // 处理器里、随乐谱一起存取（铁律 11）。所以两件事都要测：
+            //   ① 内存语义（写入 / 同小节覆盖 / 非法回落 / 精确取消）；
+            //   ② 它真的进了 getState / setState，且恢复是【整体替换】。
+            {
+                auto tsProbe = reinterpret_cast<int (*) (IPlugView*)> (
+                    dlsym (lib, "aplayTimeSigMapProbe"));
+                auto tsSet = reinterpret_cast<void (*) (IPlugView*, int, int, int)> (
+                    dlsym (lib, "aplayTimeSigSet"));
+                auto tsDump = reinterpret_cast<int (*) (IPlugView*, int*, int)> (
+                    dlsym (lib, "aplayTimeSigDump"));
+
+                if (tsProbe && tsSet && tsDump)
+                {
+                    const int pr = tsProbe (view);
+                    check ("拍号变化表：写入 / 同小节覆盖 / 非法回落 / 精确取消",
+                           pr == 1, "probe=" + std::to_string (pr));
+
+                    // 存两条 → 保存；再把表改脏（覆盖一条 + 新增一条）→ 恢复
+                    tsSet (view, 2, 7, 8);
+                    tsSet (view, 5, 3, 4);
+                    MemStream ts1;
+                    check ("拍号变化表：getState 成功", comp->getState (&ts1) == kResultOk);
+
+                    tsSet (view, 2, 2, 2);
+                    tsSet (view, 9, 9, 9);
+                    MemStream ts2;
+                    ts2.buf = ts1.buf;
+                    check ("拍号变化表：setState 成功", comp->setState (&ts2) == kResultOk);
+
+                    int tri[12] = {0};
+                    const int n = tsDump (view, tri, 4);
+                    check ("拍号变化表：随乐谱保存 / 恢复（整体替换，改脏的那两条被冲掉）",
+                           n == 2
+                               && tri[0] == 2 && tri[1] == 7 && tri[2] == 8
+                               && tri[3] == 5 && tri[4] == 3 && tri[5] == 4,
+                           "n=" + std::to_string (n));
+                }
+                else
+                {
+                    std::printf ("  [INFO] 未找到拍号变化表探针符号，跳过该检查\n");
+                }
+            }
 
             view->release ();
         }

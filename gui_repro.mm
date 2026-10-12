@@ -25,6 +25,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <string>
 
 //------------------------------------------------------------------------------
@@ -140,6 +141,25 @@ public:
     double viewStartSaved = 0.0;   ///< 后端里存的视野（测试直接读，便于打印诊断）
     double viewSpanSaved  = 0.0;
 
+    // 拍号变化表：真实后端按小节存在处理器里，这里同样按小节存，
+    // 否则「点方块 → 弹层 → 应用」这条链在复现程序里永远是空表，测不出东西。
+    void getTimeSigChanges (std::vector<ap::TimeSigChange>& out) const override
+    {
+        out.clear ();
+        for (const auto& kv : m_tsChanges) out.push_back (kv.second);
+    }
+    void setTimeSigChange (int bar, int beats, int denom) override
+    {
+        if (bar < 1) bar = 1;
+        ap::TimeSigChange c;
+        c.bar   = bar;
+        c.beats = ap::normalizeBeatsPerBar (beats, 4);
+        c.denom = ap::normalizeBeatDenom (denom, 4);
+        m_tsChanges[bar] = c;
+    }
+    void clearTimeSigChange (int bar) override { m_tsChanges.erase (bar); }
+    std::map<int, ap::TimeSigChange> m_tsChanges;
+
 private:
     mutable ap::Player m_player;
     std::string m_path;
@@ -183,6 +203,17 @@ private:
 // 只读自测访问器（实现在 gui.mm 的 GUIView 里）
 - (double)bpmFieldValue;
 - (NSString*)beatsSelection;
+// 拍号条（实现在 gui.mm 的 WaveformView 里）：块数与每块的小节号 / 拍号 / 中心 x。
+// ⭐ 几何一律从实现里问出来，测试不抄布局常数。
+- (int)timeSigBoxCount;
+- (int)timeSigBoxBarAtIndex:(int)i;
+- (int)timeSigBoxBeatsAtIndex:(int)i;
+- (int)timeSigBoxDenomAtIndex:(int)i;
+- (BOOL)timeSigBoxChangedAtIndex:(int)i;
+- (CGFloat)timeSigBoxMidXAtIndex:(int)i;
+// 拍号弹层（实现在 gui.mm 的 TimeSigPopupView / GUIView 里）
+- (NSPoint)tsButtonMidPointForKind:(int)kind value:(int)value;
+- (BOOL)tsPopupVisible;
 @end
 
 //------------------------------------------------------------------------------
@@ -195,6 +226,19 @@ static NSView* findWaveView (NSView* v)
         if ([NSStringFromClass ([s class]) isEqualToString:@"WaveformView"])
             return s;
         NSView* r = findWaveView (s);
+        if (r) return r;
+    }
+    return nil;
+}
+
+/// 按类名递归找子树里的视图（拍号弹层 = "TimeSigPopupView"）
+static NSView* findViewByClass (NSView* v, NSString* cls)
+{
+    for (NSView* s in [v subviews])
+    {
+        if ([NSStringFromClass ([s class]) isEqualToString:cls])
+            return s;
+        NSView* r = findViewByClass (s, cls);
         if (r) return r;
     }
     return nil;
@@ -1028,6 +1072,227 @@ int main (int argc, char** argv)
                 }
                 backend.fakePlaying = true;         // 复原，别影响后面的用例
             }
+        }
+
+        // ---- 拍号条：谱子里有拍号变化时，网格按【逐小节】的拍号推进 ----
+        // 用户需求原话：「扒谱时遇到拍号变化，后续小节也能正常标记在音频上」。
+        // 关键断言不是「有条」，而是【变化点之后每小节长度真的变了】—— 若退回
+        // 「全曲统一 barSec」，第 3 小节转 3/4 之后所有小节线都会错位。
+        //
+        // 断言用「方块间距之比」，与像素尺度无关：
+        //   第 2→3 小节相隔 2.0 秒（4/4），第 3→4 小节相隔 1.5 秒（3/4）→ 比值 0.75。
+        @autoreleasepool
+        {
+            SEL selCount  = NSSelectorFromString (@"timeSigBoxCount");
+            SEL selBarAt  = NSSelectorFromString (@"timeSigBoxBarAtIndex:");
+            SEL selBeats  = NSSelectorFromString (@"timeSigBoxBeatsAtIndex:");
+            SEL selDenom  = NSSelectorFromString (@"timeSigBoxDenomAtIndex:");
+            SEL selChgd   = NSSelectorFromString (@"timeSigBoxChangedAtIndex:");
+            SEL selMidX   = NSSelectorFromString (@"timeSigBoxMidXAtIndex:");
+            SEL selVisible = NSSelectorFromString (@"tsPopupVisible");
+            SEL selBtnPt  = NSSelectorFromString (@"tsButtonMidPointForKind:value:");
+            SEL selZoomTo = NSSelectorFromString (@"zoomToSpan:fromStart:");
+            SEL selFit2   = NSSelectorFromString (@"fitAll");
+
+            backend.fakeTimeline = false;      // 网格跟手填的参数走，别被假宿主覆盖
+            backend.setGridBPM (0.0f);         // 自动 → 默认 120
+            backend.setGridBeatsPerBar (4);
+            backend.setGridBeatDenominator (4);
+            backend.setOffsetSec (0.0f);
+            backend.m_tsChanges.clear ();
+
+            // 固定视野：0 秒起、8 秒长。4/4 @120BPM 每小节 2 秒 → 第 1..4 小节 + 第 5 小节起点都在画面里
+            ((void (*) (id, SEL, double, double)) objc_msgSend) (wave, selZoomTo, 8.0, 0.0);
+
+            const int nBase = (int) ((int (*) (id, SEL)) objc_msgSend) (wave, selCount);
+            std::printf ("  · 无变化时拍号条方块数 = %d（8 秒视野 / 每小节 2 秒）\n", nBase);
+            if (nBase < 3)
+            {
+                std::printf ("[复现] ✗ 拍号条没有按小节摆出方块\n");
+                rc = 37;
+            }
+            else
+            {
+                step ("拍号条按小节摆出方块（无变化）");
+            }
+
+            backend.setTimeSigChange (3, 3, 4);    // 第 3 小节起转 3/4
+
+            auto midXOfBar = [&] (int bar) -> CGFloat
+            {
+                const int n = (int) ((int (*) (id, SEL)) objc_msgSend) (wave, selCount);
+                for (int i = 0; i < n; ++i)
+                {
+                    const int b = (int) ((int (*) (id, SEL, int)) objc_msgSend) (wave, selBarAt, i);
+                    if (b == bar)
+                        return ((CGFloat (*) (id, SEL, int)) objc_msgSend) (wave, selMidX, i);
+                }
+                return -1.0;
+            };
+
+            const CGFloat x2 = midXOfBar (2);
+            const CGFloat x3 = midXOfBar (3);
+            const CGFloat x4 = midXOfBar (4);
+            std::printf ("  · 方块中心 x：第 2 小节 %.1f，第 3 小节 %.1f，第 4 小节 %.1f\n",
+                         (double) x2, (double) x3, (double) x4);
+
+            // 第 3 小节那块应当是 3/4 且带「变化点」标记；第 4 小节沿用 3/4 但不是变化点
+            {
+                const int n = (int) ((int (*) (id, SEL)) objc_msgSend) (wave, selCount);
+                bool ok3 = false, ok4 = false, okFlag = false;
+                for (int i = 0; i < n; ++i)
+                {
+                    const int b     = (int) ((int (*) (id, SEL, int)) objc_msgSend) (wave, selBarAt, i);
+                    const int be    = (int) ((int (*) (id, SEL, int)) objc_msgSend) (wave, selBeats, i);
+                    const int de    = (int) ((int (*) (id, SEL, int)) objc_msgSend) (wave, selDenom, i);
+                    const BOOL ch   = (BOOL) ((BOOL (*) (id, SEL, int)) objc_msgSend) (wave, selChgd, i);
+                    if (b == 3) { ok3 = (be == 3 && de == 4); okFlag = ch; }
+                    if (b == 4) { ok4 = (be == 3 && de == 4); }
+                }
+                if (!ok3 || !okFlag)
+                {
+                    std::printf ("[复现] ✗ 第 3 小节的方块没有标成 3/4 变化点\n");
+                    rc = 38;
+                }
+                else if (!ok4)
+                {
+                    std::printf ("[复现] ✗ 变化点之后的小节没有沿用 3/4\n");
+                    rc = 38;
+                }
+                else
+                {
+                    step ("变化点方块 = 3/4 且被标出；后面小节沿用 3/4");
+                }
+            }
+
+            if (x2 > 0 && x3 > 0 && x4 > 0)
+            {
+                const double d23 = (double) (x3 - x2);   // 2.0 秒
+                const double d34 = (double) (x4 - x3);   // 1.5 秒
+                const double ratio = d23 > 0.0 ? d34 / d23 : 0.0;
+                std::printf ("  · 间距之比 第3→4 / 第2→3 = %.3f（期望 0.750；"
+                             "若退化成统一小节长会是 1.000）\n", ratio);
+                if (std::fabs (ratio - 0.75) > 0.08)
+                {
+                    std::printf ("[复现] ✗ 拍号变化点之后的小节长度没有跟着变"
+                                 "（网格从变化点起会全部错位）\n");
+                    rc = 39;
+                }
+                else
+                {
+                    step ("变化点之后每小节长度按新的拍号算（3/4 → 1.5 秒）");
+                }
+            }
+            else
+            {
+                std::printf ("[复现] ✗ 找不到第 2/3/4 小节的拍号方块，无法验证间距\n");
+                rc = 39;
+            }
+
+            // ---- 点方块 → 弹出该小节的拍号设置 ----
+            NSView* popup = findViewByClass (guiView, @"TimeSigPopupView");
+            if (popup && x3 > 0 && [wave respondsToSelector:selCount])
+            {
+                const NSInteger wn = g_hostWindow.windowNumber;
+                // 条在波形视图顶部 0..22px（视图是 flipped，y 向下）→ 取 y = 8
+                const NSPoint pWin = [wave convertPoint:NSMakePoint (x3, 8.0) toView:nil];
+                NSEvent* d = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                location:pWin modifierFlags:0 timestamp:0
+                                            windowNumber:wn context:nil eventNumber:1
+                                              clickCount:1 pressure:1.0];
+                [wave mouseDown:d];
+
+                const BOOL vis = (BOOL) ((BOOL (*) (id, SEL)) objc_msgSend) (guiView, selVisible);
+                if (!vis)
+                {
+                    std::printf ("[复现] ✗ 点拍号条上的方块没有弹出拍号设置\n");
+                    rc = 40;
+                }
+                else
+                {
+                    step ("点第 3 小节的方块 → 弹出该小节的拍号设置");
+
+                    // 分子选 6 → 后端第 3 小节应变成 6/4
+                    NSPoint bp = ((NSPoint (*) (id, SEL, int, int)) objc_msgSend)
+                        (popup, selBtnPt, 0, 6);
+                    const NSPoint bpWin = [popup convertPoint:bp toView:nil];
+                    NSEvent* bd = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                     location:bpWin modifierFlags:0 timestamp:0.01
+                                                 windowNumber:wn context:nil eventNumber:2
+                                                   clickCount:1 pressure:1.0];
+                    [popup mouseDown:bd];
+
+                    const auto& ts = backend.m_tsChanges;
+                    if (ts.size () != 1 || ts.count (3) == 0
+                        || ts.at (3).beats != 6 || ts.at (3).denom != 4)
+                    {
+                        std::printf ("[复现] ✗ 弹层里选「分子 6」没有写进后端"
+                                     "（第 3 小节应为 6/4）\n");
+                        rc = 41;
+                    }
+                    else
+                    {
+                        step ("弹层里选「分子 6」→ 第 3 小节变成 6/4");
+                    }
+
+                    // 再把分子选回 4（= 继承值）→ 等于「这一小节没有变化」，应取消变化点
+                    bp  = ((NSPoint (*) (id, SEL, int, int)) objc_msgSend) (popup, selBtnPt, 0, 4);
+                    const NSPoint bp2Win = [popup convertPoint:bp toView:nil];
+                    NSEvent* bd2 = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                      location:bp2Win modifierFlags:0 timestamp:0.02
+                                                  windowNumber:wn context:nil eventNumber:3
+                                                    clickCount:1 pressure:1.0];
+                    [popup mouseDown:bd2];
+
+                    bool flagOff = false;
+                    {
+                        const int n = (int) ((int (*) (id, SEL)) objc_msgSend) (wave, selCount);
+                        for (int i = 0; i < n; ++i)
+                            if ((int) ((int (*) (id, SEL, int)) objc_msgSend) (wave, selBarAt, i) == 3)
+                                flagOff = !(BOOL) ((BOOL (*) (id, SEL, int)) objc_msgSend) (wave, selChgd, i);
+                    }
+                    if (!backend.m_tsChanges.empty () || !flagOff)
+                    {
+                        std::printf ("[复现] ✗ 把拍号选回继承值没有取消变化点"
+                                     "（会留下一个橙块却毫无几何作用）\n");
+                        rc = 42;
+                    }
+                    else
+                    {
+                        step ("把拍号选回继承值 → 变化点被取消");
+                    }
+
+                    // 点面板空白处 → 关闭弹层
+                    const NSPoint blank = [popup convertPoint:NSMakePoint (4.0, 4.0) toView:nil];
+                    NSEvent* cd = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                                     location:blank modifierFlags:0 timestamp:0.03
+                                                 windowNumber:wn context:nil eventNumber:4
+                                                   clickCount:1 pressure:1.0];
+                    [popup mouseDown:cd];
+                    if ((BOOL) ((BOOL (*) (id, SEL)) objc_msgSend) (guiView, selVisible))
+                    {
+                        std::printf ("[复现] ✗ 点弹层外面没有关掉它\n");
+                        rc = 43;
+                    }
+                    else
+                    {
+                        step ("点弹层外 → 关闭");
+                    }
+                }
+            }
+            else
+            {
+                std::printf ("[复现] ✗ 找不到拍号弹层视图，无法验证点击链\n");
+                rc = 40;
+            }
+
+            // 复原：别让拍号变化 / 网格参数影响后续用例
+            backend.m_tsChanges.clear ();
+            backend.setGridBeatsPerBar (4);
+            backend.setGridBeatDenominator (4);
+            backend.setGridBPM (0.0f);
+            if ([wave respondsToSelector:selFit2])
+                ((void (*) (id, SEL)) objc_msgSend) (wave, selFit2);
         }
 
         // ---- 关窗口不能残留拖动状态 ----
