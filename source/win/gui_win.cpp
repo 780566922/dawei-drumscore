@@ -1645,12 +1645,14 @@ void WinView::layoutTsPopup ()
     const int boxW  = std::max (row1W, row2W) + padX * 2;
     const int boxH  = headH + rowH * 2 + (m_tsPopupHasChange ? px (26) : 0) + px (14);
 
-    const int boxX = std::max (0, (client.right - boxW) / 2);
-    const int boxY = std::max (0, (client.bottom - boxH) / 2);
+    // ⚠️ RECT 的成员是 LONG，不是 int —— 与 int 混用会让 std::max 推导不出模板
+    //    参数（MSVC 报 C2672「no matching overloaded function found」）。显式转回 int。
+    const int boxX = std::max (0, static_cast<int> ((client.right  - boxW) / 2));
+    const int boxY = std::max (0, static_cast<int> ((client.bottom - boxH) / 2));
     m_tsPopupBox = { boxX, boxY, boxX + boxW, boxY + boxH };
 
-    const int startX = m_tsPopupBox.left + padX + labelW + px (6);
-    int y = m_tsPopupBox.top + headH;
+    const int startX = static_cast<int> (m_tsPopupBox.left) + padX + labelW + px (6);
+    int y = static_cast<int> (m_tsPopupBox.top) + headH;
     int x = startX;
     for (int i = 0; i < kTsBeatChoiceCount; ++i)
     {
