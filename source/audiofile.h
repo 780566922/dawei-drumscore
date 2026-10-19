@@ -183,12 +183,26 @@ public:
             fn(*s);
     }
 
-    //---- 当前播放位置（秒，源时间轴）--------------------------------------
+    //---- 当前播放位置（秒，「音频时间轴」）----------------------------------
+    // 返回音频在【音频时间轴】上的位置，与「谱面位置 + 偏移」同一条轴：
+    //   正偏移：= 实际读到的音频秒数。
+    //   负偏移：静音垫还没还清时，音频还在「谱面先走」的负段里，返回负值
+    //           （-m_silenceSecLeft）；静音还清后，返回实际读到的音频秒数。
+    //
+    // ⚠️ 历史教训（「网格向左超过音频 0 秒 → 分家徽标误报」）：
+    //   旧实现直接返回 m_readPos / m_srcSampleRate（纯读位置，不含静音段），
+    //   负偏移下静音段内它从 0 起步，而绿线 (谱面+偏移) 还在负区 —— 两者
+    //   天然差 |offset| 秒，被 kDivergenceWarnSec 误判成「分家」。这里把
+    //   静音段折算进去，保证它和绿线在静音段内也一致。
     double positionSec() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_srcSampleRate) return 0.0;
-        return static_cast<double>(m_readPos) / m_srcSampleRate;
+        const double read = static_cast<double>(m_readPos) / m_srcSampleRate;
+        // 静音垫未还清 → 音频「出声位置」仍在负偏移段里，返回负值。
+        if (m_silenceSecLeft > 0.0)
+            return -m_silenceSecLeft;
+        return read;
     }
 
     /// 音频线程因抢不到锁而【整块丢弃音频】的累计次数（只读，多线程安全）。
@@ -205,6 +219,18 @@ public:
     // 实时线程永不阻塞：锁被 GUI 占用时输出静音并立刻返回。
     uint32_t render(float** outL, float** outR, uint32_t numFrames, double hostSampleRate);
 
+    // 把播放定位到「音频时间轴」上的 sec 秒。参数是带符号的：
+    //   sec >= 0 → 直接读到音频第 sec 秒（正定位，欠的静音作废）。
+    //   sec <  0 → 目标还处在「谱面先走、音频后进」的负偏移静音段里，
+    //              此时音频还没到第 0 秒：读位置回到 0，并【恢复】|sec| 秒静音垫，
+    //              让音频等谱面追上来再从 0 秒出声。
+    //
+    // ⚠️ 历史教训（「网格向左超过音频 0 秒 → 播放鬼分家」）：
+    //   旧实现一律把负值钳到 0 并 m_silenceSecLeft = 0，导致负偏移下只要发生一次
+    //   宿主 seek（拖播放头 / 暂停→恢复），静音垫就被清掉、音频提前 |offset| 秒
+    //   出声，与谱面彻底错位。seekTo 的调用方（「回到播放头」按钮、三端、
+    //   captureHostTimeline 的自动对齐）传的都是 (谱面位置 + 偏移)，负偏移下
+    //   必为负值，因此这里必须按符号恢复静音垫。
     void seekTo(double sec)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -212,12 +238,21 @@ public:
         std::shared_ptr<const AudioData> s = audioSnapshot();
         const double total = s ? static_cast<double>(s->numFrames()) : 0.0;
         if (total <= 0.0) return;
-        // 手动定位就代表「从现在开始听」，负偏移欠的那段静音作废
-        m_silenceSecLeft = 0.0;
-        double p = sec * m_srcSampleRate;
-        if (p < 0.0) p = 0.0;
-        if (p > total - 1.0) p = std::max(0.0, total - 1.0);
-        m_readPos = p;
+
+        if (sec < 0.0)
+        {
+            // 目标仍在负偏移静音段内：音频回到起点，恢复欠的静音。
+            m_readPos = 0.0;
+            m_silenceSecLeft = -sec;
+        }
+        else
+        {
+            // 正定位：从现在开始听，负偏移欠的静音作废。
+            m_silenceSecLeft = 0.0;
+            double p = sec * m_srcSampleRate;
+            if (p > total - 1.0) p = std::max(0.0, total - 1.0);
+            m_readPos = p;
+        }
 
         // 关键：把「当前偏移」记为已生效，并清掉 dirty 标记。
         // 否则 seek 之后紧接着的 render 里 restartFromOffsetLocked() 会因为

@@ -165,6 +165,33 @@ int main()
         auto s5 = renderBlock(p, 64, 44100);
         check("拖动定位后又立刻有声音", near(s5[0], 0.3, 0.01), fmt(s5[0]));
 
+        // ⚠️ 回归（「网格向左超过音频 0 秒 → 播放鬼分家」）：
+        //   负偏移下，宿主 seek / 暂停→恢复 / 「回到播放头」传的 target 是
+        //   (谱面位置 + 偏移)，在静音段内是【负值】。旧实现把负值钳到 0 并清掉
+        //   静音垫 → 音频提前 |offset| 秒出声、与谱面错位。新实现按符号恢复静音垫。
+        Player q;
+        q.setAudio(makeRamp(44100, 2, 10.0));
+        q.setStartOffsetSec(-1.0f);
+        // 模拟「谱面播到 -0.4 秒处发生一次宿主 seek」→ target = -0.4
+        q.seekTo(-0.4);
+        check("负偏移 seek(-0.4)：恢复 0.4 秒静音垫",
+              near(q.pendingSilenceSec(), 0.4, 0.001), fmt(q.pendingSilenceSec()));
+        // 静音垫生效：先 render 0.2 秒，应【全静音】（0.2 < 0.4 还在静音段内）
+        auto s6 = renderBlock(q, 8820, 44100);
+        bool sil6 = true;
+        for (float v : s6) if (v != 0.0f) { sil6 = false; break; }
+        check("负偏移 seek 后：静音垫生效（0.2 秒内全静音）", sil6);
+        // positionSec 在静音段内应返回负值（= -剩余静音）
+        check("负偏移 seek 后：positionSec 反映静音段负值",
+              near(q.positionSec(), -0.2, 0.01), fmt(q.positionSec()));
+        // 再 render 0.3 秒：前 0.2 秒静音 + 后 0.1 秒音频 → 静音还清、从 0 秒出声
+        auto s7 = renderBlock(q, 13230, 44100);
+        bool sil7 = true;
+        for (size_t i = 0; i < 8820 * 2; ++i) if (s7[i] != 0.0f) { sil7 = false; break; }
+        check("负偏移 seek 后：0.3 秒块前 0.2 秒仍静音", sil7);
+        check("负偏移 seek 后：静音还清、音频从 0 秒进入（末值 ≈ 0.01）",
+              near(s7[(13230 - 1) * 2], 0.01, 0.002), fmt(s7[(13230 - 1) * 2]));
+
         // 超出音频长度：静音，不崩溃
         p.setStartOffsetSec(999.0f);
         auto o3 = renderBlock(p, 16, 44100);
