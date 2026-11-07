@@ -276,6 +276,18 @@ public:
 
     PlugView (Backend* backend, BackendResolver resolver = nullptr);
 
+    // 视图若还挂着就把它拆掉。
+    //
+    // 为什么要有这一步：宿主并不保证「先 removed() 再 release()」。直接 release()
+    // 时旧代码把 m_view 指向的平台视图整个漏掉 —— 在 Windows 上等于在宿主的编辑器
+    // 窗口里留下一个活的子窗口，还带着 20Hz 定时器继续回调后端（处理器可能已经
+    // 被销毁）。析构时补一次拆解，把这条路径关死。removed() 本身是幂等的。
+    ~PlugView ()
+    {
+        if (m_view)
+            removed ();
+    }
+
     //---- FUnknown ----
     uint32 PLUGIN_API addRef () override { return ++m_refCount; }
     uint32 PLUGIN_API release () override

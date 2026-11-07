@@ -20,14 +20,17 @@
 //==============================================================================
 #include "audiofile.h"
 #include "ogg_vorbis.h"
+#include "crashguard.h"   // 解码阶段的阶段日志（Windows 上由 InitDll 打开日志文件）
 
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#include <objbase.h>   // CoInitializeEx：Media Foundation 的线程前提
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -58,19 +61,58 @@ std::wstring utf8ToWide (const std::string& s)
 }
 
 //------------------------------------------------------------------------------
+// COM：Media Foundation 只在「本线程已初始化 COM」的前提下可用。
+//
+// 宿主的线程不保证初始化过 COM，尤其「打开工程时恢复插件状态」走的是后台
+// 加载线程。旧版完全没做这一步 —— MFStartup 在那个线程上直接失败，而且失败
+// 结果被 static 缓存住，于是之后用户在正常线程里点「打开音频」也永远得到
+// 「Media Foundation 初始化失败（系统组件缺失）」，插件从此再也出不了声。
+//
+// 用 COINIT_MULTITHREADED：MF 的原生要求是 MTA。若该线程已经是 STA，
+// CoInitializeEx 返回 RPC_E_CHANGED_MODE —— 这说明 COM 已经初始化过，
+// 照样可用（同步 ReadSample 不需要消息泵），只是不要再去 CoUninitialize。
+//------------------------------------------------------------------------------
+class ComScope
+{
+public:
+    ComScope () : m_hr (::CoInitializeEx (nullptr, COINIT_MULTITHREADED)) {}
+    ~ComScope ()
+    {
+        // 只在本对象真正完成初始化时才配套反初始化（RPC_E_CHANGED_MODE 不是我们初始化的）
+        if (SUCCEEDED (m_hr))
+            ::CoUninitialize ();
+    }
+    bool usable () const
+    {
+        return SUCCEEDED (m_hr) || m_hr == RPC_E_CHANGED_MODE || m_hr == S_FALSE;
+    }
+
+private:
+    HRESULT m_hr;
+};
+
+//------------------------------------------------------------------------------
 // Media Foundation 进程内只需启动一次。
 // MFSTARTUP_NOSOCKET：插件不需要网络流，少拉起一个子系统。
+//
+// ⚠️ 只缓存【成功】。旧写法把失败也缓存了（started = true），一次失败的
+//    尝试就等于永久禁用解码 —— 而第一次尝试往往发生在最不利的时机
+//    （宿主恢复状态的后台线程）。
 //------------------------------------------------------------------------------
 bool ensureMfStarted ()
 {
-    static bool started = false;
-    static bool ok = false;
-    if (!started)
+    static std::atomic<int> started {0};   // 0 = 尚未成功，1 = 已成功
+    if (started.load (std::memory_order_acquire) == 1)
+        return true;
+
+    const HRESULT hr = ::MFStartup (MF_VERSION, MFSTARTUP_NOSOCKET);
+    if (SUCCEEDED (hr))
     {
-        started = true;
-        ok = SUCCEEDED (::MFStartup (MF_VERSION, MFSTARTUP_NOSOCKET));
+        started.store (1, std::memory_order_release);
+        return true;
     }
-    return ok;
+    ap::crashLog ("MFStartup 失败（hr=0x%08lx），下次解码时重试", static_cast<unsigned long> (hr));
+    return false;
 }
 
 //------------------------------------------------------------------------------
@@ -171,12 +213,29 @@ bool decodeAudioFile (const std::string& path, AudioData& out, std::string& err)
         return false;
     }
 
+    ap::crashLog ("开始解码: %s", path.c_str ());
+
     // Ogg Vorbis 交给自带的 stb_vorbis。放在 MF 初始化之前：
     // 解 OGG 根本用不到 Media Foundation，不该为它付初始化成本
     //（更要紧的是：MF 那条路必然是失败的，白跑一遍还会覆盖掉我们
     //  更准确的错误提示，比如「这是 Opus 不是 Vorbis」）。
     if (isOggExtension (path))
-        return decodeOggVorbis (path, out, err);
+    {
+        const bool ok = decodeOggVorbis (path, out, err);
+        ap::crashLog ("OGG 解码%s%s%s", ok ? "成功" : "失败",
+                      ok ? ": " : " —— ", ok ? path.c_str () : err.c_str ());
+        return ok;
+    }
+
+    // COM 必须先就绪，否则 MFStartup / SourceReader 都会失败
+    //（宿主的线程不保证初始化过 COM，见 ComScope 的说明）。
+    ComScope com;
+    if (!com.usable ())
+    {
+        err = "无法初始化音频解码所需的系统组件（COM）";
+        ap::crashLog ("COM 初始化失败，放弃解码");
+        return false;
+    }
 
     if (!ensureMfStarted ())
     {
@@ -328,6 +387,10 @@ bool decodeAudioFile (const std::string& path, AudioData& out, std::string& err)
 
     if (tooLong)
         err = "音频超过 2 小时，已截断加载";
+
+    ap::crashLog ("解码完成: %zu 帧, %u Hz, 位深 %u, 源声道 %u",
+                  out.numFrames (), out.sampleRate,
+                  static_cast<unsigned> (bits), static_cast<unsigned> (channels));
 
     return true;
 }

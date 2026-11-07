@@ -30,6 +30,10 @@ static constexpr uint32 kAPlayDistributable = 1 << 0;
 // 插件版本字符串（FULL_VERSION_STR 是 CMake 生成的，这里手写）
 #define APLAY_VERSION_WSTR STR16 ("1.2.8")
 
+// 写进日志的构建标识。排查 Windows 上的问题时，「装的是哪个包」是第一件要知道的
+// 事 —— 版本号 + 编译时间足以把「用户装了旧包」与「新包也崩」区分开。
+#define APLAY_BUILD_TAG "v1.2.8，" __DATE__ " " __TIME__
+
 namespace aplay {
 
 namespace {
@@ -297,11 +301,13 @@ tresult PLUGIN_API APlayProcessor::initialize (FUnknown* context)
         // 本插件只输出、不接收输入（用户拖入音频文件直接播放）
         addAudioOutput (STR16 ("Stereo Out"), SpeakerArr::kStereo);
     }
+    ap::crashLog ("Processor initialize → %s", result == kResultTrue ? "ok" : "失败");
     return result;
 }
 
 tresult PLUGIN_API APlayProcessor::setActive (TBool state)
 {
+    ap::crashLog ("setActive(%d)", state ? 1 : 0);
     if (state)
     {
         m_player.setPlaying (m_playing);
@@ -325,6 +331,8 @@ tresult PLUGIN_API APlayProcessor::setupProcessing (ProcessSetup& setup)
     if (setup.processMode < kRealtime || setup.processMode > kOffline)
         return kResultFalse;
     m_hostSampleRate.store (setup.sampleRate, std::memory_order_relaxed);   // 渲染要用宿主采样率做重采样
+    ap::crashLog ("setupProcessing: 采样率 %.0f，块长上限 %d",
+                  setup.sampleRate, static_cast<int> (setup.maxSamplesPerBlock));
     // 官方基类要求总线全部就绪才返回 ok；本插件只有一个输出总线，
     // 若宿主尚未 activate，这里会返回 kResultFalse —— 不影响渲染。
     const tresult r = AudioEffect::setupProcessing (setup);
@@ -575,12 +583,29 @@ void APlayProcessor::captureHostTimeline (ProcessData& data)
             pos = static_cast<double> (pc->continousTimeSamples) / sr;
     }
 
-    // ---- 跳转跟随：宿主拖播放头 → 音频 seek 到对应位置 ----
-    // 只在拿到有效位置时检测。正常播放时 projectTimeSamples 每块前进约
-    // 「一块的采样数 / sampleRate」秒（几毫秒级），而手动拖拽播放头会造成
-    // 大跳变或回跳。这里在音频线程检测跳变，只写原子量，不直接 seek ——
-    // 真正的 seek 交给 process() 在渲染前执行（见下方 process 实现）。
-    const bool hostPlayingNow = (st & ProcessContext::kPlaying) != 0;
+    // ---- 「宿主到底在不在播」----
+    //
+    // 权威信号是 ProcessContext::kPlaying（MuseScore 实测会置位，见 MEMORY 铁律 4）。
+    // 但「只有一个信号」这件事本身就是个隐患：宿主若没填这一位（不同版本 / 不同
+    // 宿主 / 不同管线），下面的 m_player.setPlaying(false) 会让插件【永远输出
+    // 静音】—— 界面上波形、播放头、跟随全都正常，就是没有声音，且看不出原因。
+    //
+    // 兜底信号：宿主时间轴的位置在前进 ⇔ 宿主正在播放；位置冻结 ⇔ 已暂停。
+    // projectTimeSamples 是规范里 always-valid 的字段，比状态位更不会漏。
+    // 只接受「一小步」的前进（< 0.5 秒）—— 暂停时拖播放头造成的大跳变不会
+    // 被误判成播放。
+    bool hostPlayingNow = (st & ProcessContext::kPlaying) != 0;
+    if (!hostPlayingNow && (pos == pos) && m_hostLastPosValid)
+    {
+        const double adv = pos - m_hostLastPosSec;
+        if (adv > 0.0 && adv < 0.5)
+            hostPlayingNow = true;
+    }
+    if (pos == pos)
+    {
+        m_hostLastPosSec = pos;
+        m_hostLastPosValid = true;
+    }
 
     // ---- 「暂停 → 播放」边沿：恢复播放的瞬间，自动把音频 seek 回谱面位置 ----
     // 这是对齐的兜底：即使暂停期间音频位置因为某种原因漂了，恢复播放时也
@@ -646,6 +671,25 @@ void APlayProcessor::captureHostTimeline (ProcessData& data)
 //------------------------------------------------------------------------------
 tresult PLUGIN_API APlayProcessor::process (ProcessData& data)
 {
+    // 首块诊断（只记一次）。用来把「宿主在播但没声音」分成三种可判定的情况：
+    //   a) 这里没有日志 → process() 压根没被调用（问题在宿主侧的总线/激活）；
+    //   b) 有日志但 state 没有 kPlaying、pos 不前进 → 宿主的 ProcessContext 不完整；
+    //   c) 有日志且 state/pos 正常 → 输出被宿主丢弃，问题在总线连接或下游。
+    // 这是唯一一次在音频线程写文件（exchange 保证只触发一次），之后不再写。
+    if (!m_loggedFirstBlock.exchange (true, std::memory_order_relaxed))
+    {
+        const ProcessContext* pc = data.processContext;
+        const double sr = (pc && pc->sampleRate > 0.0) ? pc->sampleRate : 0.0;
+        ap::crashLog ("首块音频: processContext=%s state=0x%08x pos=%.3f 输出数=%d 声道=%d 帧=%d",
+                      pc ? "有" : "无",
+                      pc ? static_cast<unsigned> (pc->state) : 0u,
+                      (pc && sr > 0.0) ? static_cast<double> (pc->projectTimeSamples) / sr : 0.0,
+                      static_cast<int> (data.numOutputs),
+                      (data.outputs && data.numOutputs > 0)
+                          ? static_cast<int> (data.outputs[0].numChannels) : 0,
+                      static_cast<int> (data.numSamples));
+    }
+
     captureHostTimeline (data);
 
     // ---- 消费待执行的跳转 seek ----
@@ -679,23 +723,15 @@ tresult PLUGIN_API APlayProcessor::process (ProcessData& data)
     // 取一次局部副本：本块渲染期间保持采样率一致
     const double hostSr = m_hostSampleRate.load (std::memory_order_relaxed);
 
-    if (bus.silenceFlags != 0)
-    {
-        // 静音块：确保为零
-        if (bus.channelBuffers32)
-        {
-            for (int32 ch = 0; ch < nCh; ++ch)
-                if (bus.channelBuffers32[ch])
-                    std::memset (bus.channelBuffers32[ch], 0, sizeof (float) * static_cast<size_t> (nFrames));
-        }
-        else if (bus.channelBuffers64)
-        {
-            for (int32 ch = 0; ch < nCh; ++ch)
-                if (bus.channelBuffers64[ch])
-                    std::memset (bus.channelBuffers64[ch], 0, sizeof (double) * static_cast<size_t> (nFrames));
-        }
-        return kResultOk;
-    }
+    // ⚠️ 这里【不能】因为 bus.silenceFlags != 0 就跳过渲染。
+    //
+    // VST3 规范里 silenceFlags 对【输出】总线的语义是「插件告诉宿主这一块是不是
+    // 静音」，由插件写、宿主读；把它当成宿主下达的「你别渲染了」指令是对规范的
+    // 反向理解。有些宿主会先把输出缓冲清零、并把 flags 置位以示「这块本来是空的」，
+    // 于是旧写法的表现是：界面上一切正常（波形、播放头都在动），就是【一点声音都
+    // 没有】，而且只要宿主这么填，插件就永远不出声。
+    //
+    // 现在一律渲染；渲染完再把 flags 清零（= 本块输出的是有效音频）。
 
     if (bus.channelBuffers32)
     {
@@ -720,6 +756,16 @@ tresult PLUGIN_API APlayProcessor::process (ProcessData& data)
                 bus.channelBuffers64[1][i] = static_cast<double> (tmpR[static_cast<size_t> (i)]);
         }
     }
+    else
+    {
+        // 两个缓冲指针都空 = 宿主没给可写缓冲，本块无事可做。
+        return kResultOk;
+    }
+
+    // 本块已经写入有效音频 → 明确告诉宿主「不是静音」。
+    // （这是 silenceFlags 在输出总线上的正确用法；留着宿主的旧值会让宿主
+    //  按静音处理本块，等于白渲染。）
+    bus.silenceFlags = 0;
 
     return kResultOk;
 }
@@ -1193,6 +1239,37 @@ extern "C"
     {
         return true;
     }
+
+#if SMTG_OS_WINDOWS
+    //------------------------------------------------------------------
+    // Windows 的模块入口是 InitDll / ExitDll ——【不是】bundleEntry。
+    //
+    // 见 SDK 的 public.sdk/source/vst/hosting/module_win32.cpp:224
+    //（"InitDll is optional"）以及 JUCE 的 VST3 宿主实现，两者都是
+    // GetProcAddress("InitDll") 后直接调用。也就是说：Windows 上
+    // bundleEntry 永远不会被执行。
+    //
+    // 之前只在 bundleEntry 里装崩溃取证 —— 后果是【Windows 端从来没有过
+    // 日志文件】。用户在 Windows 上遇到宿主直接退出时，README 提到的
+    // %USERPROFILE%\DaweiDrumScore.log 根本不存在，只能靠猜。
+    //
+    // 调用约定必须是 PLUGIN_API：SDK 侧的函数指针类型是
+    //   using InitModuleFunc = bool (PLUGIN_API*) ();
+    // 用 cdecl 导出会在调用时把栈搞坏 —— 那本身就是一次宿主闪退。
+    //------------------------------------------------------------------
+    SMTG_EXPORT_SYMBOL bool PLUGIN_API InitDll ()
+    {
+        ap::installCrashGuard ();
+        ap::crashLog ("--- 插件模块已加载（InitDll，%s）---", APLAY_BUILD_TAG);
+        return true;
+    }
+
+    SMTG_EXPORT_SYMBOL bool PLUGIN_API ExitDll ()
+    {
+        ap::crashLog ("--- 插件模块将卸载（ExitDll）---");
+        return true;
+    }
+#endif // SMTG_OS_WINDOWS
 
 #if SMTG_OS_LINUX
     //------------------------------------------------------------------

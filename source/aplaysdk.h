@@ -127,6 +127,8 @@ private:
     // 宿主采样率：宿主可能在运行中重新配置（切音频设备），
     // 音频线程会读、宿主线程会写 —— 用原子量避免数据竞争。
     std::atomic<double> m_hostSampleRate {44100.0};
+    /// 首块音频的诊断日志只写一次（见 process 开头）。
+    std::atomic<bool> m_loggedFirstBlock {false};
     bool m_setupPending = false;
     ap::Player m_player;
     std::string m_filePath;
@@ -176,6 +178,11 @@ private:
     bool   m_hostSeekSeen = false;        ///< 是否已拿到过有效谱面位置
     double m_hostLastPlayhead = 0.0;      ///< 上一块拿到的谱面位置（秒）
     bool   m_hostWasPlaying = false;      ///< 上一块宿主是否在播放（检测播放边沿）
+    // 上一块的宿主位置（无条件更新，与「是否在播」无关）——用于「位置还在前进
+    // ⇒ 宿主在播」这条兜底判据。与 m_hostLastPlayhead 分开是刻意的：
+    // 后者只在播放中被更新，拿它算前进量永远是自证。
+    double m_hostLastPosSec = 0.0;
+    bool   m_hostLastPosValid = false;
     // 待执行的 seek 目标（音频时间轴，秒）。NaN 表示没有待处理跳转。
     // 用原子量是因为 GUI 线程的「回到谱面」也会写入它，音频线程读。
     std::atomic<double> m_pendingSeekSec {std::numeric_limits<double>::quiet_NaN ()};

@@ -309,6 +309,60 @@ void clampPanelSize (int& w, int& h)
     if (h > maxPanelH ()) h = maxPanelH ();
 }
 
+//------------------------------------------------------------------------------
+// 「稍后再请宿主改尺寸」的私有消息
+//
+// 为什么不能当场调 IPlugFrame::resizeView()：
+//   ① 在 attached() 内部调用 = 宿主还在装配这个视图的过程中被反向调用
+//      （同步重入宿主的窗口/布局代码）—— 部分宿主在这条路径上会直接崩；
+//   ② 在 WM_DPICHANGED 里调用同样处在宿主的消息处理中间。
+// 投递到自己的消息队列，等这一轮处理完再请求，宿主侧就是一次普通的外部调用。
+//------------------------------------------------------------------------------
+const UINT kMsgApplyHostResize = WM_APP + 51;
+
+//------------------------------------------------------------------------------
+// comctl32 v6 专有 API 的动态解析
+//
+// SetWindowSubclass / RemoveWindowSubclass / DefSubclassProc 是 **comctl32 6.0**
+// 才有的导出。进程若加载的是 system32 里的 5.82（应用没有 comctl32 v6 清单就会
+// 这样），这些符号【根本不存在】—— 而我们是在导入表里静态引用它们的：
+// 结果是【整个 .vst3 加载失败】（甚至是宿主在扫描阶段直接退出），
+// 表现为「装上就用不了」，且与本插件功能毫无关系。
+//
+// 因此改成运行时解析：拿不到就跳过「页脚变手型」这一个装饰性效果，
+// 其余功能完全不受影响。稳定胜过好看。
+//------------------------------------------------------------------------------
+using SetWindowSubclassFn    = BOOL (WINAPI*) (HWND, SUBCLASSPROC, UINT_PTR, DWORD_PTR);
+using RemoveWindowSubclassFn = BOOL (WINAPI*) (HWND, SUBCLASSPROC, UINT_PTR);
+using DefSubclassProcFn      = LRESULT (WINAPI*) (HWND, UINT, WPARAM, LPARAM);
+
+struct SubclassApi
+{
+    SetWindowSubclassFn    set    = nullptr;
+    RemoveWindowSubclassFn remove = nullptr;
+    DefSubclassProcFn      def    = nullptr;
+    bool ok () const { return set && remove && def; }
+};
+
+const SubclassApi& subclassApi ()
+{
+    static const SubclassApi api = []
+    {
+        SubclassApi a;
+        if (HMODULE m = ::GetModuleHandleW (L"comctl32.dll"))
+        {
+            a.set    = reinterpret_cast<SetWindowSubclassFn> (
+                           reinterpret_cast<void*> (::GetProcAddress (m, "SetWindowSubclass")));
+            a.remove = reinterpret_cast<RemoveWindowSubclassFn> (
+                           reinterpret_cast<void*> (::GetProcAddress (m, "RemoveWindowSubclass")));
+            a.def    = reinterpret_cast<DefSubclassProcFn> (
+                           reinterpret_cast<void*> (::GetProcAddress (m, "DefSubclassProc")));
+        }
+        return a;
+    }();
+    return api;
+}
+
 } // namespace
 
 namespace ap {
@@ -377,6 +431,11 @@ public:
     void onDpiChanged ();
     /// 绑定宿主侧回调，供 onDpiChanged 请求改窗口尺寸。
     void setOwner (PlugView* o) { m_owner = o; }
+    PlugView* owner () const { return m_owner; }
+    /// 稍后请宿主按首选尺寸调整窗口。
+    /// ⚠️ 必须延后：在 attached() / WM_DPICHANGED 内部同步调 IPlugFrame::resizeView()
+    ///    等于在宿主装配视图的过程中反向重入宿主（见 kMsgApplyHostResize 的说明）。
+    void postHostResize ();
 
     HWND hwnd () const { return m_hwnd; }
     /// 当前窗口尺寸（物理像素）—— getSize 要如实汇报，否则宿主的缩放框架会打架。
@@ -672,8 +731,15 @@ void WinView::onDpiChanged ()
         ::InvalidateRect (m_wave, nullptr, FALSE);
 
     // 面板尺寸变了，请宿主重新调整窗口（宿主不理也没关系，只是面板被裁一点）。
-    if (m_owner)
-        m_owner->requestResizeToPreferred ();
+    // 延后到本轮消息处理完之后（见 kMsgApplyHostResize 的说明）。
+    postHostResize ();
+}
+
+//------------------------------------------------------------------------------
+void WinView::postHostResize ()
+{
+    if (m_hwnd)
+        ::PostMessageW (m_hwnd, kMsgApplyHostResize, 0, 0);
 }
 
 //------------------------------------------------------------------------------
@@ -780,9 +846,11 @@ bool WinView::create (HWND parent, int w, int h)
                         SS_LEFT | SS_NOTIFY, IDC_BRAND);
     // ⭐ 子类化只为把光标切成手型（见 brandSubclassProc 的说明：
     //    STATIC 自己会吞掉 WM_SETCURSOR，父窗口收不到，判坐标无效）。
-    if (m_brand)
-        ::SetWindowSubclass (m_brand, brandSubclassProc, kBrandSubclassId,
-                             reinterpret_cast<DWORD_PTR> (this));
+    // ⚠️ 只在系统真的提供 comctl32 v6 接口时才挂 —— 否则会连累整个 .vst3
+    //    加载失败（见 subclassApi 的说明）。拿不到就放弃这个装饰效果。
+    if (m_brand && subclassApi ().ok ())
+        subclassApi ().set (m_brand, brandSubclassProc, kBrandSubclassId,
+                            reinterpret_cast<DWORD_PTR> (this));
 
     // ⚠️ 使用指南不再是独立窗口（旧版这里创建了一个铺满面板的 kHelpClass 子窗口，
     //    用户实测它被画在主界面下面）。现在指南由主窗口自己整块画，见 setHelp。
@@ -816,9 +884,15 @@ void WinView::destroy ()
         // 之后再 RemoveWindowSubclass 就是在动已释放窗口的子类链了。
         if (m_brand)
         {
-            ::RemoveWindowSubclass (m_brand, brandSubclassProc, kBrandSubclassId);
+            if (subclassApi ().ok ())
+                subclassApi ().remove (m_brand, brandSubclassProc, kBrandSubclassId);
             m_brand = nullptr;
         }
+        // ⚠️ 先把「窗口 → 本对象」的反向指针断开，再销毁窗口。
+        //    否则 DestroyWindow 期间（以及宿主异步投递过来的消息）任何一个
+        //    窗口过程都会拿着即将被 delete 的 this 去访问成员 —— 这一步就是
+        //    崩溃窗口期本身。
+        ::SetWindowLongPtrW (m_hwnd, GWLP_USERDATA, 0);
         ::DestroyWindow (m_hwnd);    // 所有子控件随之销毁
         m_hwnd = nullptr;
     }
@@ -2393,7 +2467,10 @@ static LRESULT CALLBACK brandSubclassProc (HWND hwnd, UINT msg, WPARAM wp, LPARA
         ::SetCursor (::LoadCursorW (nullptr, IDC_HAND));
         return TRUE;
     }
-    return ::DefSubclassProc (hwnd, msg, wp, lp);
+    // 动态解析（见 subclassApi 的说明）：拿不到 v6 的 DefSubclassProc 就退回默认过程
+    if (const SubclassApi& api = subclassApi (); api.def)
+        return api.def (hwnd, msg, wp, lp);
+    return ::DefWindowProcW (hwnd, msg, wp, lp);
 }
 
 /// SetWindowSubclass 的子类 ID 见文件前半的前置声明区（必须在 WinView::create 之前定义）
@@ -2709,6 +2786,13 @@ LRESULT CALLBACK mainProc (HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // 子窗口通常收不到这条消息，收到了就按新 DPI 重建字体与布局。
             if (v) v->onDpiChanged ();
             return 0;
+        case kMsgApplyHostResize:
+            // 自己投递的「稍后请宿主改尺寸」（见 kMsgApplyHostResize 的说明）。
+            // 走到这里时 attached() / WM_DPICHANGED 已经返回，宿主不再处于装配
+            // 过程中 —— 对宿主来说这就是一次普通的外部请求。
+            if (v && v->owner ())
+                v->owner ()->requestResizeToPreferred ();
+            return 0;
         default:
             break;
     }
@@ -2755,6 +2839,11 @@ tresult PLUGIN_API PlugView::attached (void* parent, FIDString type)
     if (!parent || !type || std::strcmp (type, Steinberg::kPlatformTypeHWND) != 0)
         return Steinberg::kResultFalse;
 
+    // 宿主重复 attached 时（例如先挂上去量尺寸、再换一个父窗口），必须先把上一份
+    // 视图拆掉 —— 否则老窗口会留在旧父窗口里，成为带着 20Hz 定时器的孤儿。
+    if (m_view)
+        removed ();
+
     if (!m_backend && m_resolver)
         m_backend = m_resolver ();
 
@@ -2774,8 +2863,11 @@ tresult PLUGIN_API PlugView::attached (void* parent, FIDString type)
 
     // 若宿主是在 attached 之前就调过 getSize（那时还不知道真实 DPI，报的是 96 DPI
     // 下的尺寸），这里主动请宿主按新尺寸重新调整一次窗口。
+    // ⚠️ 必须【延后】到 attached 返回之后：在这里直接调 IPlugFrame::resizeView()
+    //    等于在宿主装配视图的过程中反向重入宿主的窗口代码。高 DPI 屏（125% / 150%
+    //    的笔记本）必然会走到这条路径 —— 症状就是「一打开插件编辑器宿主就退出」。
     if (g_uiScale != scaleBefore)
-        requestResizeToPreferred ();
+        v->postHostResize ();
     return Steinberg::kResultOk;
 }
 

@@ -472,7 +472,12 @@ int main (int argc, char** argv)
         check ("空音频输出静音", L[0] == 0.f);
     }
 
-    // 宿主标记静音时也应安全
+    // 宿主在输出总线上预置 silenceFlags 时，插件【不得】据此跳过渲染。
+    //
+    // VST3 里输出总线的 silenceFlags 是「插件写、宿主读」的方向；有些宿主会先把
+    // 输出缓冲清零并置位 flags 表示「这块本来是空的」。旧实现把它当成「你别渲染」，
+    // 于是只要宿主这么填，插件就永远不出声（界面一切正常，就是没声音）。
+    // 契约改成：照常渲染 + 渲染完把 flags 清零。
     {
         const int32 N = 128;
         std::vector<float> L (N, 1.f), R (N, 1.f);
@@ -482,7 +487,7 @@ int main (int argc, char** argv)
         bufs[0] = L.data ();
         bufs[1] = R.data ();
         out.channelBuffers32 = bufs;
-        out.silenceFlags = 3;   // 两声道都静音
+        out.silenceFlags = 3;   // 宿主预置：两声道都标成静音
 
         ProcessData pd {};
         pd.processMode = kRealtime;
@@ -491,8 +496,12 @@ int main (int argc, char** argv)
         pd.numOutputs = 1;
         pd.outputs = &out;
 
-        check ("静音标记 process 安全", proc->process (pd) == kResultOk);
-        check ("静音标记时缓冲区被清零", L[0] == 0.f);
+        check ("宿主预置 silenceFlags 时 process 安全", proc->process (pd) == kResultOk);
+        check ("process 后插件把 silenceFlags 清零（本块是有效输出）",
+               out.silenceFlags == 0, std::to_string (out.silenceFlags));
+        // 没载入音频 → 输出仍是静音（这一条只验证「没被旧逻辑短路」不会崩、
+        // 也不会把宿主缓冲里的残留留在输出里）
+        check ("无音频时不残留宿主缓冲内容", L[0] == 0.f);
     }
 
     // 无输出总线的极端情况（宿主异常或关闭插件）
